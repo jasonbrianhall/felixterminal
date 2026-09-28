@@ -89,6 +89,72 @@ static void launch_terminal_with_shell(const char *shell) {
 #endif
 }
 
+#ifdef _WIN32
+// Quote one argument per the MSVCRT/CommandLineToArgvW rules so the child's
+// argv gets back exactly this string (spaces, quotes, trailing backslashes).
+static std::string win_quote_arg(const std::string &a) {
+    if (!a.empty() && a.find_first_of(" \t\n\v\"") == std::string::npos) return a;
+    std::string out = "\"";
+    size_t i = 0, n = a.size();
+    while (true) {
+        size_t bs = 0;
+        while (i < n && a[i] == '\\') { ++i; ++bs; }
+        if (i == n) { out.append(bs * 2, '\\'); break; }
+        if (a[i] == '"') { out.append(bs * 2 + 1, '\\'); out += '"'; }
+        else             { out.append(bs, '\\');         out += a[i]; }
+        ++i;
+    }
+    out += '"';
+    return out;
+}
+#endif
+
+void spawn_self_with_args(const std::vector<std::string> &args, const std::string &cwd) {
+#ifdef _WIN32
+    wchar_t self[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+    // Build the command line in UTF-8, then convert (paths may be non-ASCII)
+    std::string cmd;
+    {
+        int n = WideCharToMultiByte(CP_UTF8, 0, self, -1, nullptr, 0, nullptr, nullptr);
+        std::string self8(n > 0 ? n - 1 : 0, '\0');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, self, -1, &self8[0], n, nullptr, nullptr);
+        cmd = win_quote_arg(self8);
+    }
+    for (const std::string &a : args) cmd += " " + win_quote_arg(a);
+    auto widen = [](const std::string &s) {
+        int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::wstring w(n > 0 ? n : 1, L'\0');
+        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+        return w;   // includes terminating NUL
+    };
+    std::wstring wcmd = widen(cmd);
+    std::wstring wcwd = cwd.empty() ? std::wstring() : widen(cwd);
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(nullptr, &wcmd[0], nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE,
+                       nullptr, cwd.empty() ? nullptr : wcwd.c_str(), &si, &pi)) {
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+#else
+    char self[512] = {};
+    ssize_t n = readlink("/proc/self/exe", self, sizeof(self)-1);
+    if (n <= 0) return;
+    self[n] = '\0';
+    std::vector<char *> argv;
+    argv.push_back(self);
+    for (const std::string &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) { /* keep inherited cwd */ }
+        execv(self, argv.data());
+        _exit(1);
+    }
+#endif
+}
+
 void action_new_terminal_custom(int idx) {
     if (idx < 0 || idx >= (int)g_available_terminals.size()) return;
     const TerminalOption &opt = g_available_terminals[idx];
@@ -390,6 +456,7 @@ static_assert(sizeof(RENDER_MODE_NAMES)/sizeof(RENDER_MODE_NAMES[0]) == RENDER_M
 
 const MenuItem MENU_ITEMS[] = {
     { "New Terminal  >", false },
+    { "Duplicate Session", false },
     { nullptr,           true  },
     { "Copy as Rich Text", false },
     { "Copy as HTML",    false },
@@ -414,6 +481,9 @@ const MenuItem MENU_ITEMS[] = {
     { "Quit",            false },
 };
 const int MENU_COUNT = (int)(sizeof(MENU_ITEMS)/sizeof(MENU_ITEMS[0]));
+// MENU_ID_* in term_ui.h are indices into MENU_ITEMS; catch them drifting apart
+static_assert(MENU_ID_QUIT == (int)(sizeof(MENU_ITEMS)/sizeof(MENU_ITEMS[0])) - 1,
+              "MENU_ID_* constants out of sync with MENU_ITEMS");
 
 ContextMenu g_menu = {};
 

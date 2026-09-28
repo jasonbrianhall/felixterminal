@@ -68,21 +68,23 @@ void handle_key(Terminal *t, SDL_Keysym ks, const char *text);
 // CONTEXT MENU
 // ============================================================================
 
+// Indices into MENU_ITEMS (term_ui.cpp) — separators count as entries
 #define MENU_ID_NEW_TERMINAL  0
-#define MENU_ID_COPY          2
-#define MENU_ID_COPY_HTML     3
-#define MENU_ID_COPY_ANSI     4
-#define MENU_ID_PASTE         5
-#define MENU_ID_RESET         7
-#define MENU_ID_THEMES        9
-#define MENU_ID_OPACITY      10
-#define MENU_ID_RENDER_MODE  11
-#define MENU_ID_ENTERTAINMENT 12
-#define MENU_ID_SELECT_ALL   14
-#define MENU_ID_FONTS        16
-#define MENU_ID_ADV_OPTIONS  18
-#define MENU_ID_HELP         20
-#define MENU_ID_QUIT         22
+#define MENU_ID_DUPLICATE     1
+#define MENU_ID_COPY          3
+#define MENU_ID_COPY_HTML     4
+#define MENU_ID_COPY_ANSI     5
+#define MENU_ID_PASTE         6
+#define MENU_ID_RESET         8
+#define MENU_ID_THEMES       10
+#define MENU_ID_OPACITY      11
+#define MENU_ID_RENDER_MODE  12
+#define MENU_ID_ENTERTAINMENT 13
+#define MENU_ID_SELECT_ALL   15
+#define MENU_ID_FONTS        17
+#define MENU_ID_ADV_OPTIONS  19
+#define MENU_ID_HELP         21
+#define MENU_ID_QUIT         23
 
 // New Terminal submenu item indices
 #define NEW_TERM_IDX_LOCAL   0
@@ -133,6 +135,11 @@ extern std::vector<TerminalOption> g_available_terminals;
 void detect_available_terminals();
 void action_new_terminal();
 void action_new_ssh_session();
+
+// Start another Felix Terminal window (this same executable) with the given
+// arguments. cwd = working directory for the new process ("" = inherit).
+// Arguments are passed through intact (quoted per MSVCRT rules on Windows).
+void spawn_self_with_args(const std::vector<std::string> &args, const std::string &cwd = "");
 void action_new_telnet_session();
 void action_new_serial_session();
 void action_new_terminal_custom(int idx);

@@ -84,6 +84,50 @@ static inline bool _term_read_dispatch(bool ssh, bool tnet, bool ser, Terminal *
 #define TERM_WRITE(buf, n)  term_write(&term, (buf), (n))
 
 // ============================================================================
+// SSH TARGET PARSING — shared by the command line and the in-window prompt
+// ============================================================================
+
+// Parse "[user@]host[:port]" into cfg. User is optional (prompted if missing).
+// IPv6 literals: [addr] or [addr]:port; a bare address with several colons
+// (e.g. ::1) is taken as a host with no port.
+static void parse_ssh_target(const std::string &target, SshConfig &cfg) {
+    std::string hostpart = target;
+    size_t at = target.rfind('@');
+    if (at != std::string::npos) {
+        cfg.user = target.substr(0, at);
+        hostpart = target.substr(at + 1);
+    }
+    std::string port_str;
+    if (!hostpart.empty() && hostpart[0] == '[') {
+        size_t close = hostpart.find(']');
+        if (close != std::string::npos) {
+            if (close + 1 < hostpart.size() && hostpart[close + 1] == ':')
+                port_str = hostpart.substr(close + 2);
+            hostpart = hostpart.substr(1, close - 1);
+        }
+    } else if (hostpart.find(':') != std::string::npos &&
+               hostpart.find(':') == hostpart.rfind(':')) {
+        size_t colon = hostpart.find(':');
+        port_str = hostpart.substr(colon + 1);
+        hostpart = hostpart.substr(0, colon);
+    }
+    cfg.host = hostpart;
+    if (!port_str.empty()) {
+        cfg.port = atoi(port_str.c_str());
+        if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 22;
+    }
+}
+
+// Format host:port for a command line, bracketing IPv6 literals
+static std::string format_ssh_target(const SshConfig &cfg) {
+    std::string t;
+    if (!cfg.user.empty()) t = cfg.user + "@";
+    t += (cfg.host.find(':') != std::string::npos) ? "[" + cfg.host + "]" : cfg.host;
+    t += ":" + std::to_string(cfg.port);
+    return t;
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -183,36 +227,7 @@ int main(int argc, char **argv) {
             // actually crash, disable it specifically when the remote shell
             // is inside a multiplexer, not for SSH as a whole.
             if (i + 1 < argc && argv[i+1][0] != '-') {
-                const char *target = argv[++i];
-                // [user@]host[:port] — user optional (prompted if missing).
-                // IPv6 literals: [addr] or [addr]:port; a bare address with
-                // several colons (e.g. ::1) is taken as a host with no port.
-                const char *at = strrchr(target, '@');
-                const char *host_start = target;
-                if (at) {
-                    ssh_cfg.user = std::string(target, at - target);
-                    host_start = at + 1;
-                }
-                std::string hostpart = host_start;
-                std::string port_str;
-                if (!hostpart.empty() && hostpart[0] == '[') {
-                    size_t close = hostpart.find(']');
-                    if (close != std::string::npos) {
-                        if (close + 1 < hostpart.size() && hostpart[close + 1] == ':')
-                            port_str = hostpart.substr(close + 2);
-                        hostpart = hostpart.substr(1, close - 1);
-                    }
-                } else if (hostpart.find(':') != std::string::npos &&
-                           hostpart.find(':') == hostpart.rfind(':')) {
-                    size_t colon = hostpart.find(':');
-                    port_str = hostpart.substr(colon + 1);
-                    hostpart = hostpart.substr(0, colon);
-                }
-                ssh_cfg.host = hostpart;
-                if (!port_str.empty()) {
-                    ssh_cfg.port = atoi(port_str.c_str());
-                    if (ssh_cfg.port <= 0 || ssh_cfg.port > 65535) ssh_cfg.port = 22;
-                }
+                parse_ssh_target(argv[++i], ssh_cfg);
             }
             // Missing user/host will be prompted in the GL window
             continue;
@@ -512,6 +527,12 @@ int main(int argc, char **argv) {
     // renders it, collects the password, and posts the response back.
 #ifdef USESSH
     enum class SshPhase { IDLE, SETUP, CONNECTING, PROMPTING, ACTIVE, FAILED };
+    // Host given on the command line: apply ~/.ssh/config for it (User, Port,
+    // IdentityFile) the same way the in-window prompt does. Explicit values
+    // from the command line win; config only fills what's missing.
+    if (use_ssh && !ssh_cfg.host.empty())
+        ssh_config_load(ssh_cfg.host.c_str(), ssh_cfg);
+
     // Start in SETUP if any required fields are missing, otherwise go straight to CONNECTING
     SshPhase ssh_phase = use_ssh
         ? (ssh_cfg.host.empty() || ssh_cfg.user.empty()
@@ -1094,25 +1115,10 @@ int main(int argc, char **argv) {
                         if (ssh_phase == SshPhase::SETUP) {
                             // Store the typed value into the right field
                             if (ssh_cfg.host.empty()) {
-                                // User entered host — check if it contains username@host format
-                                const char *at = strchr(ssh_field_input.c_str(), '@');
-                                if (at) {
-                                    // Parse "username@host[:port]" format
-                                    ssh_cfg.user = std::string(ssh_field_input.c_str(), at - ssh_field_input.c_str());
-                                    const char *host_start = at + 1;
-                                    const char *colon = strrchr(host_start, ':');
-                                    if (colon) {
-                                        ssh_cfg.host = std::string(host_start, colon - host_start);
-                                        ssh_cfg.port = atoi(colon + 1);
-                                        if (ssh_cfg.port <= 0 || ssh_cfg.port > 65535) ssh_cfg.port = 22;
-                                    } else {
-                                        ssh_cfg.host = host_start;
-                                    }
-                                } else {
-                                    // Just a hostname, will prompt for user later
-                                    ssh_cfg.host = ssh_field_input;
-                                }
-                                
+                                // [user@]host[:port] — same rules as the command line;
+                                // a missing user is prompted for next
+                                parse_ssh_target(ssh_field_input, ssh_cfg);
+
                                 // Try to load SSH config for this host alias
                                 ssh_config_load(ssh_cfg.host.c_str(), ssh_cfg);
                             } else if (ssh_cfg.user.empty())
@@ -1913,6 +1919,49 @@ int main(int argc, char **argv) {
                                 TERM_WRITE("reset\n",6);
 #endif
                                 break;
+                            case MENU_ID_DUPLICATE: {
+                                // Open a new window connected the same way as this one.
+                                // Not carried over: port forwards and the web server
+                                // (their ports would clash) and any password (the new
+                                // window prompts, like PuTTY's Duplicate Session).
+                                std::vector<std::string> dup;
+                                std::string dup_cwd;
+                                if (use_serial) {
+                                    toast_show("Serial sessions can't be duplicated",
+                                               "The port is already open in this window",
+                                               0.95f, 0.65f, 0.25f);
+                                    break;
+                                } else if (use_ssh) {
+                                    dup.push_back("--ssh");
+                                    if (!ssh_cfg.host.empty()) dup.push_back(format_ssh_target(ssh_cfg));
+                                    if (!ssh_cfg.key_path.empty())         { dup.push_back("-i"); dup.push_back(ssh_cfg.key_path); }
+                                    if (!ssh_cfg.known_hosts_path.empty()) { dup.push_back("--ssh-known-hosts"); dup.push_back(ssh_cfg.known_hosts_path); }
+                                    if (!ssh_cfg.x11_forward)              dup.push_back("--no-x11");
+                                    if (!ssh_cfg.command.empty())          { dup.push_back("-c"); dup.push_back(ssh_cfg.command); }
+                                } else if (use_telnet) {
+                                    dup.push_back("--telnet");
+                                    if (!telnet_cfg.host.empty())
+                                        dup.push_back(telnet_cfg.host + ":" + std::to_string(telnet_cfg.port));
+                                    if (!telnet_cfg.ttype.empty()) { dup.push_back("--telnet-ttype"); dup.push_back(telnet_cfg.ttype); }
+                                    if (telnet_cfg.raw_mode) dup.push_back("--raw");
+                                    if (telnet_cfg.use_ssl)  dup.push_back("--ssl");
+                                } else {
+                                    // Local shell: same shell, and on Linux the same
+                                    // working directory as the shell in this window
+                                    if (shell && *shell) dup.push_back(shell);
+#ifndef _WIN32
+                                    if (term.child > 0) {
+                                        char link[64], dir[4096];
+                                        snprintf(link, sizeof(link), "/proc/%d/cwd", (int)term.child);
+                                        ssize_t n = readlink(link, dir, sizeof(dir) - 1);
+                                        if (n > 0) { dir[n] = '\0'; dup_cwd = dir; }
+                                    }
+#endif
+                                }
+                                if (g_term_type && *g_term_type) { dup.push_back("--term"); dup.push_back(g_term_type); }
+                                spawn_self_with_args(dup, dup_cwd);
+                                break;
+                            }
                             case MENU_ID_SELECT_ALL: term_select_all(&term); break;
                             case MENU_ID_HELP:
                                 g_iv.visible = false;
