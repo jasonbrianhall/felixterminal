@@ -1,4 +1,5 @@
 #include "glyph_atlas.h"
+#include FT_BITMAP_H      // FT_Bitmap_Convert
 #include "ft_font.h"      // s_emoji_face
 #include "sdl_renderer.h" // g_use_sdl_renderer
 #include <SDL2/SDL.h>
@@ -129,7 +130,8 @@ const GlyphEntry *GlyphAtlas::get(FT_Face face, uint32_t cp, int font_px, int em
     float glyph_scale = 1.0f;
     float cell_offset_x = 0.f, cell_offset_y = 0.f;
 
-    if (face->num_fixed_sizes > 0) {
+    const bool strikes = ft_face_uses_strikes(face);
+    if (strikes) {
         int best = 0;
         int best_diff = abs(face->available_sizes[0].height - emoji_px);
         for (int si = 1; si < face->num_fixed_sizes; si++) {
@@ -144,8 +146,10 @@ const GlyphEntry *GlyphAtlas::get(FT_Face face, uint32_t cp, int font_px, int em
     }
 
     int load_flags = FT_LOAD_RENDER;
-    if (face->num_fixed_sizes > 0 || face == s_emoji_face)
+    if (strikes || face == s_emoji_face)
         load_flags |= FT_LOAD_COLOR;
+    else if (FT_IS_SCALABLE(face))
+        load_flags |= FT_LOAD_NO_BITMAP;   // skip embedded 1-bit strikes, render outlines
 
     FT_UInt gi = FT_Get_Char_Index(face, cp);
     if (!gi) return nullptr;
@@ -161,6 +165,25 @@ const GlyphEntry *GlyphAtlas::get(FT_Face face, uint32_t cp, int font_px, int em
         e.color        = false;
         cache[key] = e;
         return &cache[key];
+    }
+
+    // Bitmap-only fonts can still hand back 1/2/4-bit glyphs. Convert them to
+    // 8-bit coverage so the copy loops below (which read one byte per pixel)
+    // don't misread packed bits as garbage.
+    FT_Bitmap converted;
+    FT_Bitmap_Init(&converted);
+    if (bm->pixel_mode == FT_PIXEL_MODE_MONO  ||
+        bm->pixel_mode == FT_PIXEL_MODE_GRAY2 ||
+        bm->pixel_mode == FT_PIXEL_MODE_GRAY4) {
+        if (FT_Bitmap_Convert(slot->library, bm, &converted, 1) == 0) {
+            int levels = converted.num_grays > 1 ? converted.num_grays - 1 : 1;
+            for (unsigned r = 0; r < converted.rows; r++) {
+                uint8_t *row = converted.buffer + r * converted.pitch;
+                for (unsigned c = 0; c < converted.width; c++)
+                    row[c] = (uint8_t)(row[c] * 255 / levels);
+            }
+            bm = &converted;
+        }
     }
 
     int dst_w = (int)ceilf(bm->width  * glyph_scale);
@@ -281,6 +304,7 @@ const GlyphEntry *GlyphAtlas::get(FT_Face face, uint32_t cp, int font_px, int em
     e.cell_offset_x = cell_offset_x;
     e.cell_offset_y = cell_offset_y;
 
+    FT_Bitmap_Done(slot->library, &converted);
     cache[key] = e;
     return &cache[key];
 }

@@ -22,6 +22,14 @@
 #include <unordered_map>
 #include <vector>
 
+// True only for real bitmap fonts (e.g. CBDT colour emoji): fixed strikes and
+// no outlines. Scalable fonts that merely *contain* embedded strikes — MS
+// Gothic, SimSun, Gulim and most Windows CJK fonts ship 1-bit strikes for
+// small sizes — are rendered from their outlines instead.
+static inline bool ft_face_uses_strikes(FT_Face f) {
+    return f->num_fixed_sizes > 0 && !FT_IS_SCALABLE(f);
+}
+
 // ── Texture dimensions ────────────────────────────────────────────────────────
 static constexpr int ATLAS_W       = 2048;
 static constexpr int ATLAS_H       = 2048;

@@ -321,7 +321,7 @@ float draw_glyph(FT_Face face, uint32_t cp, float cx, float baseline_y,
     const GlyphEntry *e = g_atlas.get(face, cp, font_px, emoji_px);
     if (!e) return 0.f;
 
-    bool is_bitmap = (face->num_fixed_sizes > 0);
+    bool is_bitmap = ft_face_uses_strikes(face);
     float tr = r, tg = g, tb = b;
     // Grayscale emoji (non-color NotoEmoji entries) render white so the tint
     // colours them; colour BGRA entries ignore tint rgb anyway.
@@ -374,7 +374,7 @@ float draw_text(const char *text, float x, float y, int font_px, int emoji_px,
         }
 
         float tr = r, tg = g, tb = b;
-        bool is_bitmap = (face->num_fixed_sizes > 0);
+        bool is_bitmap = ft_face_uses_strikes(face);
         bool is_gray_emoji = (face == s_emoji_face && !is_bitmap);
         if (is_gray_emoji) { tr = 1.f; tg = 1.f; tb = 1.f; }
 
