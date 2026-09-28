@@ -27,6 +27,9 @@
 
 #ifndef _WIN32
 #  include <sys/un.h>
+#  include <pwd.h>
+#else
+#  include <direct.h>   // _mkdir
 #endif
 
 #ifndef _WIN32
@@ -128,17 +131,58 @@ static int tcp_connect(const std::string &host, int port) {
     return fd;
 }
 
+// ============================================================================
+// HOME DIRECTORY + USER-FACING ERRORS
+// ============================================================================
+
+// The user's home directory ("" if it truly can't be determined).
+// Windows: %USERPROFILE% (same place Windows' own OpenSSH client uses).
+static std::string ssh_home_dir() {
+#ifdef _WIN32
+    const char *p = getenv("USERPROFILE");
+    if (p && *p) return p;
+    const char *d = getenv("HOMEDRIVE"), *h = getenv("HOMEPATH");
+    if (d && *d && h && *h) return std::string(d) + h;
+    return "";
+#else
+    const char *h = getenv("HOME");
+    if (h && *h) return h;
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && *pw->pw_dir) return pw->pw_dir;
+    return "";
+#endif
+}
+
+static std::string ssh_dir_path(const char *file) {
+    std::string home = ssh_home_dir();
+    if (home.empty()) return "";
+#ifdef _WIN32
+    return home + "\\.ssh\\" + file;
+#else
+    return home + "/.ssh/" + file;
+#endif
+}
+
+// Reason for the last connection failure, worded for the user; the UI shows
+// it above "Connection failed". Set from the connect thread, read by the UI.
+static std::mutex  s_user_error_mtx;
+static std::string s_user_error;
+static void set_user_error(const std::string &msg) {
+    std::lock_guard<std::mutex> lock(s_user_error_mtx);
+    s_user_error = msg;
+}
+std::string ssh_last_user_error() {
+    std::lock_guard<std::mutex> lock(s_user_error_mtx);
+    return s_user_error;
+}
+
 // Build default SSH key paths to try (~/.ssh/id_rsa, id_ed25519, etc.)
 static std::vector<std::string> get_default_key_paths() {
     std::vector<std::string> keys;
     
-#ifndef _WIN32
-    const char *home = getenv("HOME");
-    if (!home) home = "/root";  // fallback
-#else
-    const char *home = getenv("USERPROFILE");
-    if (!home) home = "C:\\Users\\DefaultAccount";
-#endif
+    std::string home_str = ssh_home_dir();
+    if (home_str.empty()) return keys;
+    const char *home = home_str.c_str();
     
     std::string ssh_dir = home;
     ssh_dir += "/.ssh";
@@ -161,102 +205,143 @@ static std::vector<std::string> get_default_key_paths() {
 
 // Parse ~/.ssh/config for a given host alias
 // Supports: Host, HostName, User, Port, IdentityFile, ProxyCommand, etc.
+// OpenSSH-style glob: '*' and '?', case-insensitive (host names are)
+static bool ssh_glob_match(const char *pat, const char *str) {
+    while (*pat) {
+        if (*pat == '*') {
+            while (*pat == '*') pat++;
+            if (!*pat) return true;
+            for (; *str; str++)
+                if (ssh_glob_match(pat, str)) return true;
+            return false;
+        }
+        if (!*str) return false;
+        if (*pat != '?' && tolower((unsigned char)*pat) != tolower((unsigned char)*str))
+            return false;
+        pat++; str++;
+    }
+    return *str == '\0';
+}
+
+// A "Host" line: whitespace-separated patterns; a match on any positive
+// pattern selects the block, a match on any !negated pattern rejects it.
+static bool ssh_host_line_matches(const std::string &patterns, const char *host) {
+    bool matched = false;
+    size_t i = 0, n = patterns.size();
+    while (i < n) {
+        while (i < n && isspace((unsigned char)patterns[i])) i++;
+        size_t j = i;
+        while (j < n && !isspace((unsigned char)patterns[j])) j++;
+        if (j > i) {
+            std::string pat = patterns.substr(i, j - i);
+            bool neg = pat[0] == '!';
+            if (neg) pat.erase(0, 1);
+            if (ssh_glob_match(pat.c_str(), host)) {
+                if (neg) return false;
+                matched = true;
+            }
+        }
+        i = j;
+    }
+    return matched;
+}
+
+// Parse ~/.ssh/config the way OpenSSH does: every block whose Host patterns
+// match the name as typed is applied, top to bottom, and the FIRST value found
+// for each setting wins (so put specific hosts above "Host *" defaults).
+// Values given on the command line win over the file. Supported: HostName
+// (with %h), User, Port, IdentityFile (accumulates, ~ expanded). Match and
+// Include blocks are skipped.
 bool ssh_config_load(const char *alias, SshConfig &cfg) {
-#ifndef _WIN32
-    const char *home = getenv("HOME");
-    if (!home) home = "/root";
-#else
-    const char *home = getenv("USERPROFILE");
-    if (!home) home = "C:\\Users\\DefaultAccount";
-#endif
-    
-    std::string config_path = home;
-    config_path += "/.ssh/config";
-    
+    std::string home = ssh_home_dir();
+    std::string config_path = ssh_dir_path("config");
+    if (config_path.empty()) return false;
+
     FILE *f = fopen(config_path.c_str(), "r");
     if (!f) {
         SDL_Log("[SSH] no ~/.ssh/config found\n");
         return false;
     }
-    
+
+    const std::string name = alias ? alias : "";
+    bool set_host = false;
+    bool set_user = !cfg.user.empty();
+    bool set_port = cfg.port != 22;     // a non-default port came from the command line
+    bool in_block = true;               // lines before the first Host apply to everyone
     bool found_host = false;
-    bool in_host_block = false;
-    char line[512];
-    
+    char line[1024];
+
     while (fgets(line, sizeof(line), f)) {
-        // Strip leading/trailing whitespace and comments
         char *p = line;
-        while (*p && isspace(*p)) p++;
+        while (*p && isspace((unsigned char)*p)) p++;
         if (!*p || *p == '#') continue;
-        
-        char *eol = strchr(p, '\n');
-        if (eol) *eol = 0;
-        eol = strchr(p, '\r');
-        if (eol) *eol = 0;
-        
-        // Remove trailing whitespace
-        int len = strlen(p);
-        while (len > 0 && isspace(p[len-1])) p[--len] = 0;
-        
-        // Parse key value pairs
-        char *space = strchr(p, ' ');
-        if (!space) continue;
-        
-        // Null-terminate key and skip to value
-        *space = 0;
-        char *key = p;
-        char *value = space + 1;
-        while (*value && isspace(*value)) value++;
-        
-        // Case-insensitive key comparison (SSH config is case-insensitive for keys)
-        // Convert to lowercase for comparison
-        char key_lower[64];
-        snprintf(key_lower, sizeof(key_lower), "%s", key);
-        for (char *k = key_lower; *k; k++) *k = tolower(*k);
-        
-        if (strcmp(key_lower, "host") == 0) {
-            // New Host block — check if this matches our alias
-            if (found_host) break;  // Already found and processed our host
-            
-            // Host can have wildcards, but for simplicity we do exact match
-            if (strcmp(value, alias) == 0 || strcmp(value, "*") == 0) {
-                in_host_block = true;
-                found_host = true;
-            } else {
-                in_host_block = false;
+        size_t len = strlen(p);
+        while (len > 0 && isspace((unsigned char)p[len - 1])) p[--len] = 0;
+
+        // Key, then whitespace and/or '=', then value
+        char *k_end = p;
+        while (*k_end && !isspace((unsigned char)*k_end) && *k_end != '=') k_end++;
+        std::string key(p, k_end - p);
+        char *v = k_end;
+        while (*v && isspace((unsigned char)*v)) v++;
+        if (*v == '=') { v++; while (*v && isspace((unsigned char)*v)) v++; }
+        std::string value = v;
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+            value = value.substr(1, value.size() - 2);
+        for (char &c : key) c = (char)tolower((unsigned char)c);
+
+        if (key == "host") {
+            in_block = ssh_host_line_matches(value, name.c_str());
+            if (in_block) found_host = true;
+            continue;
+        }
+        if (key == "match") {
+            SDL_Log("[SSH] ~/.ssh/config: 'Match' blocks are not supported, skipping\n");
+            in_block = false;
+            continue;
+        }
+        if (key == "include") {
+            SDL_Log("[SSH] ~/.ssh/config: 'Include' is not supported, skipping '%s'\n", value.c_str());
+            continue;
+        }
+        if (!in_block || value.empty()) continue;
+
+        if (key == "hostname" && !set_host) {
+            std::string h;
+            for (size_t i = 0; i < value.size(); i++) {      // %h = the name as typed
+                if (value[i] == '%' && i + 1 < value.size() && value[i + 1] == 'h') { h += name; i++; }
+                else if (value[i] == '%' && i + 1 < value.size() && value[i + 1] == '%') { h += '%'; i++; }
+                else h += value[i];
             }
-        } else if (in_host_block) {
-            // Apply config directives to our host block
-            if (strcmp(key_lower, "hostname") == 0) {
-                if (cfg.host.empty()) cfg.host = value;
-            } else if (strcmp(key_lower, "user") == 0) {
-                if (cfg.user.empty()) cfg.user = value;
-            } else if (strcmp(key_lower, "port") == 0) {
-                if (cfg.port == 22) {  // default port — override if config specifies
-                    int p = atoi(value);
-                    if (p > 0 && p <= 65535) cfg.port = p;
-                }
-            } else if (strcmp(key_lower, "identityfile") == 0) {
-                // IdentityFile can appear multiple times — collect all of them
-                // Expand ~ to home
-                std::string expanded = value;
-                if (expanded[0] == '~') {
-                    expanded = home + expanded.substr(1);
-                }
-                cfg.config_key_paths.push_back(expanded);
+            if (!h.empty() && h != cfg.host) {
+                if (cfg.alias.empty()) cfg.alias = name;     // keep what the user typed
+                cfg.host = h;
             }
+            set_host = true;
+        } else if (key == "user" && !set_user) {
+            cfg.user = value;
+            set_user = true;
+        } else if (key == "port" && !set_port) {
+            int port = atoi(value.c_str());
+            if (port > 0 && port <= 65535) cfg.port = port;
+            set_port = true;
+        } else if (key == "identityfile") {
+            std::string path = value;
+            if (!path.empty() && path[0] == '~' && !home.empty())
+                path = home + path.substr(1);
+            bool dup = false;
+            for (const std::string &existing : cfg.config_key_paths) dup |= (existing == path);
+            if (!dup) cfg.config_key_paths.push_back(path);
         }
     }
-    
     fclose(f);
-    
+
     if (found_host) {
         SDL_Log("[SSH] loaded config for host '%s': hostname=%s user=%s port=%d\n",
-                alias, cfg.host.c_str(), cfg.user.c_str(), cfg.port);
+                name.c_str(), cfg.host.c_str(), cfg.user.c_str(), cfg.port);
         return true;
     }
-    
-    SDL_Log("[SSH] host '%s' not found in ~/.ssh/config\n", alias);
+    SDL_Log("[SSH] host '%s' not found in ~/.ssh/config\n", name.c_str());
     return false;
 }
 
@@ -514,29 +599,25 @@ static std::string hostkey_fingerprint() {
 
 // Verify the server's host key against the known_hosts file.
 // Returns true if the key is trusted, false if it should be rejected.
-// If the key is unknown and cfg.prompt_host_key is set, interactively asks
-// the user whether to trust it (mirroring OpenSSH's first-connection prompt)
-// and, if accepted, persists it to known_hosts.
+// Fails closed: if known_hosts can't be located, the connection is refused.
+// An unknown key is shown to the user (OpenSSH-style prompt) and, if accepted
+// with "yes" or by pasting the fingerprint, APPENDED to known_hosts — the
+// file is never rewritten, so entries libssh2 can't parse (@revoked,
+// @cert-authority, newer key types, comments) are left untouched.
 static bool verify_host_key(const SshConfig &cfg) {
     const std::string &host = cfg.host;
     int port = cfg.port;
-    // Build default path if not provided
-    std::string kh_path = cfg.known_hosts_path;
-    if (kh_path.empty()) {
-#ifndef _WIN32
-        const char *home = getenv("HOME");
-        if (home)
-            kh_path = std::string(home) + "/.ssh/known_hosts";
-#else
-        // Windows: skip host key verification for now (return true to allow connection)
-        return true;
-#endif
-    }
+    // OpenSSH records non-default ports as "[host]:port"
+    const std::string kh_name = (port == 22) ? host : "[" + host + "]:" + std::to_string(port);
 
-    // If path is still empty, allow the connection
+    std::string kh_path = cfg.known_hosts_path.empty() ? ssh_dir_path("known_hosts")
+                                                       : cfg.known_hosts_path;
     if (kh_path.empty()) {
-        SDL_Log("[SSH] no known_hosts path, skipping host key verification\n");
-        return true;
+        SDL_Log("[SSH] cannot locate known_hosts (no home directory) — refusing to connect\n");
+        set_user_error("Can't verify the server's identity: no home directory was found for "
+                       "known_hosts.\r\nSet HOME (Linux) or USERPROFILE (Windows), or pass "
+                       "--ssh-known-hosts <file>.\r\n");
+        return false;
     }
 
     LIBSSH2_KNOWNHOSTS *kh = libssh2_knownhost_init(s_session);
@@ -549,18 +630,15 @@ static bool verify_host_key(const SshConfig &cfg) {
     if (readrc < 0)
         SDL_Log("[SSH] no existing known_hosts at '%s' (or unreadable) — treating as empty\n", kh_path.c_str());
 
-    // Get the host key from the server
     size_t hkey_len = 0;
     int hkey_type = 0;
     const char *hkey = libssh2_session_hostkey(s_session, &hkey_len, &hkey_type);
-
     if (!hkey) {
         SDL_Log("[SSH] cannot retrieve host key from session\n");
         libssh2_knownhost_free(kh);
         return false;
     }
 
-    // Check the host key
     int check_flags = LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW;
     check_flags |= hostkey_type_to_knownhost_flag(hkey_type);
 
@@ -568,70 +646,116 @@ static bool verify_host_key(const SshConfig &cfg) {
     int checkrc = libssh2_knownhost_checkp(kh, host.c_str(), port, hkey, hkey_len,
                                             check_flags, &store);
 
+    const std::string fp      = hostkey_fingerprint();
+    const char       *keyname = hostkey_type_name(hkey_type);
+    char where[64];
+    if (port == 22) where[0] = '\0';
+    else snprintf(where, sizeof(where), " (port %d)", port);
+
     bool trusted = false;
     switch (checkrc) {
     case LIBSSH2_KNOWNHOST_CHECK_MATCH:
         SDL_Log("[SSH] host key verified: %s:%d\n", host.c_str(), port);
         trusted = true;
         break;
+
     case LIBSSH2_KNOWNHOST_CHECK_NOTFOUND: {
         SDL_Log("[SSH] WARNING: host key not in known_hosts: %s:%d\n", host.c_str(), port);
-
         if (!cfg.prompt_host_key) {
-            trusted = false;
+            set_user_error("The server's host key isn't in known_hosts and can't be confirmed "
+                           "here.\r\nConnect once interactively to review and accept it.\r\n");
             break;
         }
-
         std::string ip         = get_peer_ip();
         std::string host_field = ip.empty() ? host : (host + " (" + ip + ")");
-        std::string fp         = hostkey_fingerprint();
-        const char *keyname    = hostkey_type_name(hkey_type);
-
         char prompt[1024];
         snprintf(prompt, sizeof(prompt),
-                 "The authenticity of host '%s' can't be established.\r\n"
+                 "The authenticity of host '%s'%s can't be established.\r\n"
                  "%s key fingerprint is: %s\r\n"
-                 "This key is not known by any other names.\r\n"
                  "Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
-                 host_field.c_str(), keyname, fp.c_str());
+                 host_field.c_str(), where, keyname, fp.c_str());
 
         std::string answer = cfg.prompt_host_key(prompt);
-        for (char &c : answer) c = (char)tolower((unsigned char)c);
+        while (!answer.empty() && isspace((unsigned char)answer.back())) answer.pop_back();
+        while (!answer.empty() && isspace((unsigned char)answer.front())) answer.erase(0, 1);
+        std::string lower = answer;
+        for (char &c : lower) c = (char)tolower((unsigned char)c);
 
-        if (answer == "yes") {
-            // Best-effort: ~/.ssh may not exist yet on a fresh machine.
-#ifndef _WIN32
-            std::string dir = kh_path.substr(0, kh_path.find_last_of('/'));
-            if (!dir.empty()) mkdir(dir.c_str(), 0700);
-#endif
-            struct libssh2_knownhost *added = nullptr;
-            int addrc = libssh2_knownhost_addc(kh, host.c_str(), nullptr, hkey, hkey_len,
-                                                nullptr, 0, check_flags, &added);
-            if (addrc == 0 &&
-                libssh2_knownhost_writefile(kh, kh_path.c_str(),
-                                             LIBSSH2_KNOWNHOST_FILE_OPENSSH) == 0) {
-                SDL_Log("[SSH] host key permanently added for '%s' to known_hosts\n", host.c_str());
-            } else {
-                SDL_Log("[SSH] WARNING: could not persist host key to '%s'\n", kh_path.c_str());
-            }
-            trusted = true;
-        } else {
+        // "yes", or the exact fingerprint (base64 is case-sensitive, so no lowercasing)
+        bool accepted = (lower == "yes") || (!fp.empty() && answer == fp);
+        if (!accepted) {
             SDL_Log("[SSH] host key not trusted by user, aborting connection\n");
-            trusted = false;
+            set_user_error(lower.rfind("sha256:", 0) == 0
+                ? "That fingerprint doesn't match the server's key — connection cancelled.\r\n"
+                : "Host key not accepted — connection cancelled.\r\n");
+            break;
+        }
+        trusted = true;
+
+        // Append just this host's line (never rewrite the whole file)
+        struct libssh2_knownhost *added = nullptr;
+        char kline[8192];
+        size_t klen = 0;
+        if (libssh2_knownhost_addc(kh, kh_name.c_str(), nullptr, hkey, hkey_len,
+                                   nullptr, 0, check_flags, &added) == 0 && added &&
+            libssh2_knownhost_writeline(kh, added, kline, sizeof(kline), &klen,
+                                        LIBSSH2_KNOWNHOST_FILE_OPENSSH) == 0) {
+            std::string entry(kline, klen);
+            while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) entry.pop_back();
+
+            size_t slash = kh_path.find_last_of("/\\");
+            if (slash != std::string::npos) {                // ~/.ssh may not exist yet
+                std::string dir = kh_path.substr(0, slash);
+#ifdef _WIN32
+                _mkdir(dir.c_str());
+#else
+                mkdir(dir.c_str(), 0700);
+#endif
+            }
+            bool needs_newline = false;                      // don't glue onto a last line
+            if (FILE *rf = fopen(kh_path.c_str(), "rb")) {
+                if (fseek(rf, -1, SEEK_END) == 0) needs_newline = (fgetc(rf) != '\n');
+                fclose(rf);
+            }
+            FILE *af = fopen(kh_path.c_str(), "ab");
+            if (af) {
+                if (needs_newline) fputc('\n', af);
+                fprintf(af, "%s\n", entry.c_str());
+                fclose(af);
+                SDL_Log("[SSH] host key for '%s' added to %s\n", kh_name.c_str(), kh_path.c_str());
+            } else {
+                SDL_Log("[SSH] WARNING: could not write host key to '%s'\n", kh_path.c_str());
+            }
+        } else {
+            SDL_Log("[SSH] WARNING: could not format host key entry for '%s'\n", kh_name.c_str());
         }
         break;
     }
-    case LIBSSH2_KNOWNHOST_CHECK_MISMATCH:
+
+    case LIBSSH2_KNOWNHOST_CHECK_MISMATCH: {
         SDL_Log("[SSH] ERROR: host key mismatch (possible MITM): %s:%d\n", host.c_str(), port);
-        trusted = false;
+        char msg[2048];
+        snprintf(msg, sizeof(msg),
+                 "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
+                 "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n"
+                 "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n"
+                 "IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n"
+                 "The %s key for '%s'%s does not match the one saved in\r\n"
+                 "%s\r\n"
+                 "Someone could be intercepting this connection, or the server's\r\n"
+                 "key was changed. The server now presents:\r\n"
+                 "  %s\r\n"
+                 "If you're sure the change is legitimate, remove the old entry for\r\n"
+                 "'%s' from that file and connect again.\r\n",
+                 keyname, host.c_str(), where, kh_path.c_str(), fp.c_str(), kh_name.c_str());
+        set_user_error(msg);
         break;
+    }
+
     case LIBSSH2_KNOWNHOST_CHECK_FAILURE:
-        SDL_Log("[SSH] host key check failure\n");
-        trusted = false;
-        break;
     default:
-        SDL_Log("[SSH] unknown host key check result: %d\n", checkrc);
-        trusted = false;
+        SDL_Log("[SSH] host key check failure (rc=%d)\n", checkrc);
+        set_user_error("The server's host key couldn't be checked — connection refused.\r\n");
         break;
     }
 
@@ -834,6 +958,7 @@ static void ssh_write_bridge(Terminal *t, const char *s, int n) {
 // ============================================================================
 
 bool ssh_connect(const SshConfig &cfg, Terminal *t) {
+    set_user_error("");
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

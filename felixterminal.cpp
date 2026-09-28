@@ -122,7 +122,10 @@ static void parse_ssh_target(const std::string &target, SshConfig &cfg) {
 static std::string format_ssh_target(const SshConfig &cfg) {
     std::string t;
     if (!cfg.user.empty()) t = cfg.user + "@";
-    t += (cfg.host.find(':') != std::string::npos) ? "[" + cfg.host + "]" : cfg.host;
+    // Use the name the user typed (an ~/.ssh/config alias) so the new window
+    // re-reads the same config block, keys included
+    const std::string &h = cfg.alias.empty() ? cfg.host : cfg.alias;
+    t += (h.find(':') != std::string::npos) ? "[" + h + "]" : h;
     t += ":" + std::to_string(cfg.port);
     return t;
 }
@@ -362,7 +365,8 @@ int main(int argc, char **argv) {
             SDL_Log("  --ssh-key <path>            Private key file for public key auth\n");
             SDL_Log("  --ssh-key-pub <path>        Public key file (derived from key path if omitted)\n");
             SDL_Log("  --ssh-password <pass>       Password auth (prefer agent or key)\n");
-            SDL_Log("  --ssh-known-hosts <path>    Known hosts file (default: ~/.ssh/known_hosts)\n");
+            SDL_Log("  --ssh-known-hosts <path>    Known hosts file (default: ~/.ssh/known_hosts;\n"
+                    "                              Windows: %%USERPROFILE%%\\.ssh\\known_hosts)\n");
             SDL_Log("  --no-x11                    Disable X11 forwarding\n");
             SDL_Log("  -c <command>                Execute remote command (alias: --ssh-command)\n");
             SDL_Log("  -L local_port:remote_host:remote_port   Local port forward\n");
@@ -956,6 +960,12 @@ int main(int argc, char **argv) {
                     needs_render = true;
                 } else {
                     ssh_phase = SshPhase::FAILED;
+                    // Specific reason first (e.g. changed host key), then the generic line
+                    std::string why = ssh_last_user_error();
+                    if (!why.empty()) {
+                        std::string block = "\r\n" + why;
+                        term_feed(&term, block.c_str(), (int)block.size());
+                    }
                     const char *msg = "\r\nConnection failed. Press any key to close.\r\n";
                     term_feed(&term, msg, (int)strlen(msg));
                     SDL_StopTextInput();

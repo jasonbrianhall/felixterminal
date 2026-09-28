@@ -75,7 +75,7 @@ To make this the default, add `set term sixelgd truecolor scroll` to `~/.gnuplot
 - Built-in SSH client via **libssh2** — no external SSH binary required
 - Authentication: SSH agent (including **Pageant** on Windows), public key file, and password
 - **CAC/PIV smart card support** via Pageant — works out of the box with standard DoD/government PKCS#11 middleware (e.g. OpenSC feeding keys into Pageant)
-- Host key verification against `~/.ssh/known_hosts`
+- Host key verification against `~/.ssh/known_hosts` on Linux and Windows (`%USERPROFILE%\.ssh\known_hosts`), with an OpenSSH-style prompt for new hosts (answer `yes` or paste the fingerprint) and a loud warning if a known host's key changes. New keys are appended; the file is never rewritten, so `@revoked`/`@cert-authority` lines are preserved
 - Ed25519, ECDSA, and RSA host key types supported
 - Keepalive to prevent server-side idle disconnect
 - PTY resize forwarded to remote on window resize
@@ -309,7 +309,7 @@ All `--ssh-*` flags also accept a single-dash form (e.g. `-ssh-key`).
 | `--ssh-key <path>` | Private key file for public key authentication. |
 | `--ssh-key-pub <path>` | Public key file. Derived from `--ssh-key` path (appending `.pub`) if omitted. |
 | `--ssh-password <pass>` | Password. Not recommended — prefer agent or key auth. |
-| `--ssh-known-hosts <path>` | Known hosts file. Default: `~/.ssh/known_hosts`. Set to empty string to skip host verification (insecure). |
+| `--ssh-known-hosts <path>` | Known hosts file. Default: `~/.ssh/known_hosts` (`%USERPROFILE%\.ssh\known_hosts` on Windows — shared with Windows' built-in `ssh`). Host keys are always verified; there is no option to skip the check. |
 | `--no-x11` | Disable X11 forwarding. |
 | `-c <command>` | Run a remote shell or command instead of the login shell (alias: `--ssh-command`). It runs with a terminal attached, so `-c /bin/sh` or `-c "tmux new -A -s main"` is fully interactive. In the launcher this is the **Remote shell** field on the SSH tab. |
 | `-L local_port:remote_host:remote_port` | Local port forward. |

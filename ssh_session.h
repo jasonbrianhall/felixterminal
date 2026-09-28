@@ -43,9 +43,10 @@
 #include <functional>
 
 struct SshConfig {
-    std::string host;
+    std::string host;           // real host to connect to (after ~/.ssh/config HostName)
     int         port        = 22;
     std::string user;
+    std::string alias;          // name as typed when ~/.ssh/config HostName replaced it ("" otherwise)
     // Authentication: tried in order —
     //   1. Explicit key_path (command-line -i flag)
     //   2. config_key_paths (IdentityFile entries from ~/.ssh/config)
@@ -101,6 +102,10 @@ bool ssh_connect(const SshConfig &cfg, Terminal *t);
 // Merges config file settings with existing cfg values (command-line takes precedence).
 // Returns true if config was found and parsed, false if file doesn't exist or parse failed.
 bool ssh_config_load(const char *alias, SshConfig &cfg);
+
+// Why the last ssh_connect() failed, worded for the user (e.g. a changed host
+// key warning). Empty if there's nothing more specific than "failed".
+std::string ssh_last_user_error();
 
 // Non-blocking read from the SSH channel into the terminal parser.
 // Returns true if any data was received (caller should set needs_render).
