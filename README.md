@@ -53,7 +53,7 @@ Felix Terminal is a standalone OpenGL terminal emulator for Linux and MS Windows
 - **F1** help screen listing every shortcut
 - **F7** WOPR Terminal — a hidden retro mainframe with chess, checkers, Zork, Wizard's Castle, minesweeper, tic-tac-toe and more
 
-## SSH Support (build with `make linux`)
+## SSH Support
 
 - Built-in SSH client via **libssh2** — no external SSH binary required
 - Authentication: SSH agent (including **Pageant** on Windows), public key file, and password
@@ -92,7 +92,7 @@ F2, F3, F4, F6 and the remote half of F8 require a session opened with the built
 - Binds to `127.0.0.1` by default — reachable from the local machine only, so there's nothing to expose or firewall
 - Works on IPv6 and IPv4-only systems: it uses a dual-stack socket when IPv6 is available and falls back to IPv4 when it isn't
 - If port `53716` is already in use, it automatically tries the next port up (to `53815`) — check the debug log (**F12**) for the actual port if it had to fall back
-- Browse directories, sort by name/type/size/modified, and upload/download files straight from a browser tab — handy for quick access without opening the F2/F3 panels
+- **Read-only**: browse directories, sort by name/type/size/modified, and download files straight from a browser tab — handy for quick access without opening the F2/F3 panels. Nothing can be uploaded, changed or deleted through it; use F2/F3 for transfers
 - Each browser request runs on its own thread against its own SFTP subsystem, so a large transfer through the web browser won't block the terminal or the F4 console
 - "Open in new window" checkbox in the browser UI controls whether clicking a file opens a new tab or navigates the current one — persisted as a cookie
 - Shuts down automatically when the SSH session ends
@@ -127,11 +127,11 @@ Required:
 - OpenSSL
 - GMP
 - wxWidgets 3.x (for the `FelixTerminalGUI` launcher)
+- libssh2 (SSH, SFTP, port forwarding, key manager and remote web browser)
 - `xxd` (used at build time to embed the web UI; usually in the `vim-common` or `xxd` package)
 
 Optional:
 
-- libssh2 — SSH, SFTP, port forwarding, key manager and remote web browser)
 - libxmp, mpg123, opus/opusfile, libvorbis, FLAC — extra audio formats in Felix Chirp (auto-detected)
 
 On Debian/Ubuntu (tested on Ubuntu 24.04):
@@ -164,12 +164,7 @@ Run `make check-deps` to see which libraries were found.
 
 ## Building
 
-Linux, with SSH/SFTP support (recommended):
-```
-make linux
-```
-
-Linux without SSH:
+Linux:
 ```
 make
 ```
