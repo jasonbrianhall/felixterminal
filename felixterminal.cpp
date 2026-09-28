@@ -184,21 +184,34 @@ int main(int argc, char **argv) {
             // is inside a multiplexer, not for SSH as a whole.
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 const char *target = argv[++i];
-                const char *at = strchr(target, '@');
+                // [user@]host[:port] — user optional (prompted if missing).
+                // IPv6 literals: [addr] or [addr]:port; a bare address with
+                // several colons (e.g. ::1) is taken as a host with no port.
+                const char *at = strrchr(target, '@');
+                const char *host_start = target;
                 if (at) {
                     ssh_cfg.user = std::string(target, at - target);
-                    const char *host_start = at + 1;
-                    const char *colon = strrchr(host_start, ':');
-                    if (colon) {
-                        ssh_cfg.host = std::string(host_start, colon - host_start);
-                        ssh_cfg.port = atoi(colon + 1);
-                        if (ssh_cfg.port <= 0 || ssh_cfg.port > 65535) ssh_cfg.port = 22;
-                    } else {
-                        ssh_cfg.host = host_start;
+                    host_start = at + 1;
+                }
+                std::string hostpart = host_start;
+                std::string port_str;
+                if (!hostpart.empty() && hostpart[0] == '[') {
+                    size_t close = hostpart.find(']');
+                    if (close != std::string::npos) {
+                        if (close + 1 < hostpart.size() && hostpart[close + 1] == ':')
+                            port_str = hostpart.substr(close + 2);
+                        hostpart = hostpart.substr(1, close - 1);
                     }
-                } else {
-                    // No '@' — treat entire token as host, prompt for user
-                    ssh_cfg.host = target;
+                } else if (hostpart.find(':') != std::string::npos &&
+                           hostpart.find(':') == hostpart.rfind(':')) {
+                    size_t colon = hostpart.find(':');
+                    port_str = hostpart.substr(colon + 1);
+                    hostpart = hostpart.substr(0, colon);
+                }
+                ssh_cfg.host = hostpart;
+                if (!port_str.empty()) {
+                    ssh_cfg.port = atoi(port_str.c_str());
+                    if (ssh_cfg.port <= 0 || ssh_cfg.port > 65535) ssh_cfg.port = 22;
                 }
             }
             // Missing user/host will be prompted in the GL window

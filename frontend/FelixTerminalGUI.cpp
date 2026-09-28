@@ -23,6 +23,63 @@
 #define FLT_EXECUTABLE "./flt"
 #endif
 
+// ── Argument quoting ─────────────────────────────────────────────────────────
+// Values typed by the user (key paths, custom shells, SSH commands, web roots)
+// often contain spaces — e.g. "C:\Users\Jane Doe\.ssh\id_ed25519" or
+// "C:\Program Files\Git\bin\bash.exe". Each one must reach flt as a single
+// argument, so arguments are kept as a list and quoted only when displayed or
+// (on Windows) when joined into the command line CreateProcess expects.
+
+// Windows: quote per the MSVCRT/CommandLineToArgvW rules, so flt's argv sees
+// exactly the original string (backslashes are literal unless they precede ").
+static wxString WinQuoteArg(const wxString &a) {
+    if (!a.empty() && a.find_first_of(" \t\n\v\"") == wxString::npos)
+        return a;
+    wxString out = "\"";
+    size_t i = 0;
+    const size_t n = a.length();
+    while (true) {
+        size_t backslashes = 0;
+        while (i < n && a[i] == '\\') { ++i; ++backslashes; }
+        if (i == n) {                       // double trailing backslashes before closing quote
+            out.Append('\\', backslashes * 2);
+            break;
+        }
+        if (a[i] == '"') {                  // escape the backslashes and the quote
+            out.Append('\\', backslashes * 2 + 1);
+            out += '"';
+        } else {
+            out.Append('\\', backslashes);
+            out += a[i];
+        }
+        ++i;
+    }
+    out += "\"";
+    return out;
+}
+
+// POSIX shells: single-quote anything that isn't plainly safe (display only —
+// on Linux/macOS the arguments are passed to flt as an array, not a string).
+static wxString PosixQuoteArg(const wxString &a) {
+    if (!a.empty() && a.find_first_of(" \t\n'\"\\$`!*?[]{}()<>|&;#~") == wxString::npos)
+        return a;
+    wxString out = "'";
+    for (wxUniChar c : a) {
+        if (c == '\'') out += "'\\''";
+        else            out += c;
+    }
+    out += "'";
+    return out;
+}
+
+static wxString QuoteArgForDisplay(const wxString &a) {
+#ifdef __WXMSW__
+    return WinQuoteArg(a);
+#else
+    return PosixQuoteArg(a);
+#endif
+}
+
 struct SessionConfig {
     wxString name;
     int connType = 0;
@@ -666,80 +723,83 @@ private:
         UpdatePreview();
     }
 
-    void UpdatePreview() {
-        wxString cmd = FLT_EXECUTABLE;
-        cmd += " ";
-        
+    // Build flt's arguments (without the executable) from the current UI state.
+    std::vector<wxString> BuildArgs() {
+        std::vector<wxString> args;
+        auto add = [&](const wxString &a) { args.push_back(a); };
+
         int connType = m_connTypeChoice->GetSelection();
-        
+
         switch (connType) {
             case 0: { // Local Shell
                 wxString shell;
                 int selection = m_localShellChoice->GetSelection();
-                if (selection == m_localShellChoice->GetCount() - 1) {
-                    // Custom option is the last one
+                if (selection == (int)m_localShellChoice->GetCount() - 1) {
+                    // Custom option is the last one. Passed through as ONE argument:
+                    // on Windows flt hands it to CreateProcess as a full command line,
+                    // so it may contain arguments ("wsl -d Ubuntu") or a quoted path
+                    // with spaces:  "C:\Program Files\Git\bin\bash.exe" --login
                     shell = m_localShellCustomCtrl->GetValue();
+                    shell.Trim(true).Trim(false);
                 } else {
                     // Extract the shell path from the choice string (everything before the space/paren)
                     wxString choice = m_localShellChoice->GetStringSelection();
                     int spacePos = choice.Find(' ');
-                    if (spacePos != wxNOT_FOUND) {
-                        shell = choice.Left(spacePos);
-                    } else {
-                        shell = choice;
-                    }
+                    shell = (spacePos != wxNOT_FOUND) ? choice.Left(spacePos) : choice;
                 }
-                if (!shell.empty()) {
-                    cmd += "--local " + shell;
-                }
-                if (!m_termTypeCtrl->GetValue().empty()) {
-                    cmd += " --term " + m_termTypeCtrl->GetValue();
-                }
+                // flt takes the shell as a plain positional argument
+                if (!shell.empty()) add(shell);
+                if (!m_termTypeCtrl->GetValue().empty()) { add("--term"); add(m_termTypeCtrl->GetValue()); }
                 break;
             }
             case 1: // Telnet
-                cmd += "--telnet " + m_telnetHostCtrl->GetValue() + ":" + wxString::Format("%d", m_telnetPortSpin->GetValue());
-                if (m_telnetRawCheck->GetValue()) cmd += " --raw";
-                if (m_telnetSSLCheck->GetValue()) cmd += " --ssl";
+                add("--telnet");
+                add(m_telnetHostCtrl->GetValue() + ":" + wxString::Format("%d", m_telnetPortSpin->GetValue()));
+                if (m_telnetRawCheck->GetValue()) add("--raw");
+                if (m_telnetSSLCheck->GetValue()) add("--ssl");
                 break;
             case 2: // Serial
-                cmd += "--serial " + m_serialPortCtrl->GetValue();
-                cmd += " --serial-baud " + m_serialBaudChoice->GetStringSelection();
+                add("--serial");      add(m_serialPortCtrl->GetValue());
+                add("--serial-baud"); add(m_serialBaudChoice->GetStringSelection());
                 break;
             case 3: // SSH
-                cmd += "--ssh " + m_sshUserCtrl->GetValue() + "@" + m_sshHostCtrl->GetValue() + ":" + wxString::Format("%d", m_sshPortSpin->GetValue());
+                add("--ssh");
+                {
+                    // No user -> leave "user@" off so flt prompts for it
+                    wxString user = m_sshUserCtrl->GetValue();
+                    user.Trim(true).Trim(false);
+                    add((user.empty() ? wxString() : user + "@") + m_sshHostCtrl->GetValue() + ":" +
+                        wxString::Format("%d", m_sshPortSpin->GetValue()));
+                }
                 if (m_sshAuthChoice->GetSelection() == 1 && !m_sshKeyCtrl->GetValue().empty()) {
-                    cmd += " -i " + m_sshKeyCtrl->GetValue();
+                    add("-i"); add(m_sshKeyCtrl->GetValue());
                 }
-                if (!m_sshX11Check->GetValue()) cmd += " --no-x11";
+                if (!m_sshX11Check->GetValue()) add("--no-x11");
                 if (!m_sshCommandCtrl->GetValue().empty()) {
-                    cmd += " -c " + m_sshCommandCtrl->GetValue();
+                    add("-c"); add(m_sshCommandCtrl->GetValue());   // whole command = one argument
                 }
-                if (!m_termTypeCtrl->GetValue().empty()) {
-                    cmd += " --term " + m_termTypeCtrl->GetValue();
-                }
-                
+                if (!m_termTypeCtrl->GetValue().empty()) { add("--term"); add(m_termTypeCtrl->GetValue()); }
+
                 // Port forwarding
-                for (const auto &pf : m_localPFEntries) {
-                    cmd += " -L " + pf;
-                }
-                for (const auto &pf : m_remotePFEntries) {
-                    cmd += " -R " + pf;
-                }
-                for (const auto &sock : m_socksEntries) {
-                    cmd += " -D " + sock;
-                }
+                for (const auto &pf : m_localPFEntries)  { add("-L"); add(pf); }
+                for (const auto &pf : m_remotePFEntries) { add("-R"); add(pf); }
+                for (const auto &sock : m_socksEntries)  { add("-D"); add(sock); }
                 break;
         }
-        
+
         // Web server
         if (m_webServerEnabledCheck->GetValue()) {
-            cmd += " --webserver " + m_webServerAddrCtrl->GetValue() + ":" + wxString::Format("%d", m_webServerPortSpin->GetValue());
-            if (m_webRootDirCtrl->GetValue() != "/") {
-                cmd += " --web-root " + m_webRootDirCtrl->GetValue();
-            }
+            add("--webserver");
+            add(m_webServerAddrCtrl->GetValue() + ":" + wxString::Format("%d", m_webServerPortSpin->GetValue()));
+            if (m_webRootDirCtrl->GetValue() != "/") { add("--web-root"); add(m_webRootDirCtrl->GetValue()); }
         }
-        
+        return args;
+    }
+
+    void UpdatePreview() {
+        wxString cmd = FLT_EXECUTABLE;
+        for (const wxString &a : BuildArgs())
+            cmd += " " + QuoteArgForDisplay(a);
         m_cmdPreview->SetValue(cmd);
     }
 
@@ -935,11 +995,24 @@ private:
         }
     #endif
 
-        // Swap the placeholder executable in the preview for the resolved, quoted path
-        wxString cmdLine = m_cmdPreview->GetValue();
-        cmdLine = "\"" + fltPath + "\"" + cmdLine.Mid(wxStrlen(FLT_EXECUTABLE));
+        std::vector<wxString> args = BuildArgs();
+        wxString cmdLine = QuoteArgForDisplay(fltPath);
+        for (const wxString &a : args) cmdLine += " " + QuoteArgForDisplay(a);
 
+    #ifdef __WXMSW__
+        // Windows passes one command line to CreateProcess; each argument is
+        // quoted by WinQuoteArg so flt's argv gets back the exact values.
         long pid = wxExecute(cmdLine, wxEXEC_ASYNC);
+    #else
+        // Unix: hand over an argument array, so no quoting/splitting is involved.
+        std::vector<wxWCharBuffer> bufs;
+        bufs.push_back(fltPath.wc_str());
+        for (const wxString &a : args) bufs.push_back(a.wc_str());
+        std::vector<wchar_t *> argv;
+        for (wxWCharBuffer &b : bufs) argv.push_back(b.data());
+        argv.push_back(nullptr);
+        long pid = wxExecute(argv.data(), wxEXEC_ASYNC);
+    #endif
         if (pid == 0) {
             wxMessageBox("Failed to launch Felix Terminal:\n\n" + cmdLine,
                          "Launch Failed", wxOK | wxICON_ERROR);
