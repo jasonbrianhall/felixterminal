@@ -440,6 +440,22 @@ void sixel_clear(Terminal *t) {
     it->second.placements.clear();
 }
 
+// ED 2 (clear screen): drop images that are on the visible part of the
+// current screen, the same as their text. Images already scrolled up into
+// the scrollback stay until ED 3 or until they fall off the buffer.
+void sixel_erase_screen(Terminal *t) {
+    auto it = s_terms.find(t);
+    if (it == s_terms.end()) return;
+    auto &pv = it->second.placements;
+    bool alt = t->in_alt_screen;
+    int rows = t->rows;
+    pv.erase(std::remove_if(pv.begin(), pv.end(), [alt, rows](SixelPlacement &pl) {
+        if (pl.alt != alt) return false;
+        if (pl.y_cell + pl.rows > 0 && pl.y_cell < rows) { free_sixel_image(pl.img); return true; }
+        return false;
+    }), pv.end());
+}
+
 void sixel_scroll(Terminal *t, int lines) {
     auto it = s_terms.find(t);
     if (it == s_terms.end()) return;

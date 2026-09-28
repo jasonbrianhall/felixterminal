@@ -1268,6 +1268,28 @@ std::vector<KittyHtmlImage> kitty_get_html_images(Terminal *t, int row_start, in
     return result;
 }
 
+// ED 2 (clear screen): drop placements on the visible part of the current
+// screen, the same as their text. Placements already in the scrollback stay
+// until ED 3 or until they fall off the buffer. Image data is kept, since
+// other placements may still reference it (same as kitty_clear).
+void kitty_erase_screen(Terminal *t) {
+    auto it = s_terms.find(t);
+    if (it == s_terms.end()) return;
+    auto &pv = it->second.placements;
+    bool alt = t->in_alt_screen;
+    pv.erase(std::remove_if(pv.begin(), pv.end(),
+        [&](const KittyPlacement &pl) {
+            if (pl.alt != alt) return false;
+            int h = pl.rows;
+            if (!h) {
+                auto iit = s_images.find(pl.image_id);
+                int ph = (iit != s_images.end()) ? iit->second.ph : 0;
+                h = (ph > 0 && t->cell_h > 0) ? (int)((ph + (int)t->cell_h - 1) / (int)t->cell_h) : 1;
+            }
+            return pl.y_cell + h > 0 && pl.y_cell < t->rows;
+        }), pv.end());
+}
+
 void kitty_scroll(Terminal *t, int lines) {
     auto it = s_terms.find(t);
     if (it == s_terms.end()) return;

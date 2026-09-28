@@ -527,6 +527,8 @@ static void dispatch_csi(Terminal *t) {
         } else if (n==2) {
             for(int r=0;r<t->rows;r++) for(int c=0;c<t->cols;c++) CELL(t,r,c)={' ',t->cur_fg,t->cur_bg,0,{0,0,0}};
             t->cur_row=t->cur_col=0;
+            kitty_erase_screen(t);   // images on screen go with their text
+            sixel_erase_screen(t);
             term_dirty_all(t);
         } else if(n==1) {
             // Start of screen through the cursor, inclusive

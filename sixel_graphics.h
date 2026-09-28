@@ -38,6 +38,9 @@ void sixel_clear(Terminal *t);
 // removing any that scroll off the top. Mirrors kitty_scroll().
 void sixel_scroll(Terminal *t, int lines);
 
+// Remove images on the visible part of the current screen (ED 2 / clear)
+void sixel_erase_screen(Terminal *t);
+
 // For rich clipboard copy: sixel images whose top row falls within
 // [row_start, row_end] (virtual rows, matching the selection), as PNG bytes.
 // Reuses the KittyPngImage struct so both kinds can be merged by the caller.

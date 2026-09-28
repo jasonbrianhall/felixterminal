@@ -57,6 +57,9 @@ bool kitty_encode_png(const uint8_t *rgba, int w, int h, int stride, std::vector
 // Drop all images associated with this terminal (e.g. on reset / alt-screen swap).
 void kitty_clear(Terminal *t);
 
+// Remove placements on the visible part of the current screen (ED 2 / clear)
+void kitty_erase_screen(Terminal *t);
+
 // Called by scroll_up() — shift all placement y_cells up by `lines`,
 // removing any that scroll off the top.
 void kitty_scroll(Terminal *t, int lines);
