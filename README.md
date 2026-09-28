@@ -53,7 +53,7 @@ Felix Terminal is a standalone OpenGL terminal emulator for Linux and MS Windows
 - **F1** help screen listing every shortcut
 - **F7** WOPR Terminal — a hidden retro mainframe with chess, checkers, Zork, Wizard's Castle, minesweeper, tic-tac-toe and more
 
-## SSH Support (build with `make linux SSH=1`)
+## SSH Support (build with `make linux`)
 
 - Built-in SSH client via **libssh2** — no external SSH binary required
 - Authentication: SSH agent (including **Pageant** on Windows), public key file, and password
@@ -131,7 +131,7 @@ Required:
 
 Optional:
 
-- libssh2 — SSH, SFTP, port forwarding, key manager and remote web browser (`SSH=1`)
+- libssh2 — SSH, SFTP, port forwarding, key manager and remote web browser)
 - libxmp, mpg123, opus/opusfile, libvorbis, FLAC — extra audio formats in Felix Chirp (auto-detected)
 
 On Debian/Ubuntu (tested on Ubuntu 24.04):
@@ -166,7 +166,7 @@ Run `make check-deps` to see which libraries were found.
 
 Linux, with SSH/SFTP support (recommended):
 ```
-make linux SSH=1
+make linux
 ```
 
 Linux without SSH:
@@ -176,7 +176,7 @@ make
 
 Windows (cross-compiled with mingw64):
 ```
-make windows SSH=1
+make windows
 ```
 
 Output goes to `build/linux/` (or `build/windows/`):
@@ -186,7 +186,7 @@ Output goes to `build/linux/` (or `build/windows/`):
 | `flt` / `flt.exe` | Felix Terminal |
 | `FelixTerminalGUI` | wxWidgets launcher for picking connection options |
 
-Debug builds: `make debug SSH=1` (output in `build/linux_debug/`).
+Debug builds: `make debug` (output in `build/linux_debug/`).
 
 The fonts are embedded as base64-encoded headers — no external font files required.
 
