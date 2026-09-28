@@ -301,7 +301,7 @@ private:
     wxTextCtrl *m_sshKeyCtrl;
     wxButton *m_browseSshKeyBtn;
     wxCheckBox *m_sshX11Check;
-    wxTextCtrl *m_sshCommandCtrl;  // SSH command to execute
+    wxComboBox *m_sshCommandCtrl;  // remote shell / command (-c); empty = login shell
 
     // Port Forwarding
     wxListBox *m_localPFList;
@@ -512,9 +512,24 @@ private:
         sshBox->Add(m_sshX11Check, 0, wxALL, 8);
         
         wxBoxSizer *cmdSizer = new wxBoxSizer(wxHORIZONTAL);
-        cmdSizer->Add(new wxStaticText(scrollPanel, wxID_ANY, "Command:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-        m_sshCommandCtrl = new wxTextCtrl(scrollPanel, wxID_ANY, "");
+        cmdSizer->Add(new wxStaticText(scrollPanel, wxID_ANY, "Remote shell:"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        // Editable: pick a preset or type any command. Runs with a terminal
+        // attached (flt -c), so shells and full-screen programs are interactive.
+        wxArrayString remoteShells;
+        remoteShells.Add("/bin/sh");
+        remoteShells.Add("/bin/bash");
+        remoteShells.Add("/bin/zsh");
+        remoteShells.Add("bash --norc --noprofile");
+        remoteShells.Add("tmux new -A -s main");
+        remoteShells.Add("screen -xR");
+        m_sshCommandCtrl = new wxComboBox(scrollPanel, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                          remoteShells, wxCB_DROPDOWN);
+        m_sshCommandCtrl->SetHint("Default login shell");
+        m_sshCommandCtrl->SetToolTip("Shell or command to run on the server instead of your login shell.\n"
+                                     "Leave empty for the default. Examples: /bin/sh, bash --norc,\n"
+                                     "tmux new -A -s main (reattach to a persistent session).");
         m_sshCommandCtrl->Bind(wxEVT_TEXT, &FelixTerminalFrame::OnUpdatePreview, this);
+        m_sshCommandCtrl->Bind(wxEVT_COMBOBOX, &FelixTerminalFrame::OnUpdatePreview, this);
         cmdSizer->Add(m_sshCommandCtrl, 1, wxEXPAND);
         sshBox->Add(cmdSizer, 0, wxEXPAND | wxALL, 8);
         
@@ -1019,7 +1034,6 @@ private:
             return;
         }
 
-        wxMessageBox("Felix Terminal launched!", "Success", wxOK | wxICON_INFORMATION);
     }
 
     void OnClear(wxCommandEvent &event) {
