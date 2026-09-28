@@ -12,7 +12,7 @@
 #define FONT_SIZE_DEFAULT  16
 #define FONT_SIZE_MIN      6
 #define FONT_SIZE_MAX      72
-#define WIN_TITLE          "GL Terminal"
+#define WIN_TITLE          "Felix Terminal"
 #define MAX_VERTS          400000
 
 // ============================================================================

@@ -1558,7 +1558,7 @@ void help_render(int win_w, int win_h) {
     float ty = (float)oy + HELP_PAD;
     draw_rect((float)ox+1, ty, (float)total_w-2, (float)HELP_HDR_H, 0.18f, 0.25f, 0.45f, 1.f);
 
-    const char *title = "GL Terminal — Help";
+    const char *title = "Felix Terminal — Help";
     draw_text_menu(title,
                    (float)(ox + total_w/2) - (float)(strlen(title) * MENU_FONT_SIZE * 0.3f),
                    ty + HELP_HDR_H * 0.72f,

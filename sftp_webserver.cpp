@@ -2080,6 +2080,119 @@ static void handle_http_request(int client_socket, int tunnel_id) {
 // Web Server Thread
 // ============================================================================
 
+// Portable last-socket-error helpers (Winsock doesn't set errno)
+#ifdef _WIN32
+static int  ws_last_error()        { return WSAGetLastError(); }
+static bool ws_err_addr_unusable(int e) { return e == WSAEADDRNOTAVAIL || e == WSAEAFNOSUPPORT; }
+#else
+static int  ws_last_error()        { return errno; }
+static bool ws_err_addr_unusable(int e) { return e == EADDRNOTAVAIL || e == EAFNOSUPPORT; }
+#endif
+
+// Create a listening socket of the given family (AF_INET6 or AF_INET) bound
+// to g_webserver_bind_addr, walking ports if auto-port is enabled.
+// Returns the socket and sets *out_port on success, INVALID_SOCKET on failure.
+// *out_family_unavailable is set when the family itself can't be used (e.g.
+// IPv6 disabled or not compiled into the OS), so the caller can fall back.
+static int webserver_open_listen_socket(int family, int *out_port, bool *out_family_unavailable) {
+    *out_family_unavailable = false;
+
+    const std::string &bind_addr = g_webserver_bind_addr;
+    bool bind_is_v6 = bind_addr.find(':') != std::string::npos;
+
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    socklen_t ss_len;
+    struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+    struct sockaddr_in  *a4 = (struct sockaddr_in  *)&ss;
+
+    if (family == AF_INET6) {
+        // Accept plain IPv4 bind addresses (e.g. "0.0.0.0", "127.0.0.1") by
+        // mapping them into IPv6 form so one dual-stack socket serves both.
+        std::string bind_str = bind_addr;
+        if (!bind_is_v6) {
+            bind_str = (bind_str == "0.0.0.0") ? "::" : ("::ffff:" + bind_str);
+        }
+        a6->sin6_family = AF_INET6;
+        if (inet_pton(AF_INET6, bind_str.c_str(), &a6->sin6_addr) <= 0) {
+            SDL_Log("[WebServer] Invalid bind address: %s", bind_addr.c_str());
+            return INVALID_SOCKET;
+        }
+        ss_len = sizeof(struct sockaddr_in6);
+    } else {
+        if (bind_is_v6) {
+            SDL_Log("[WebServer] IPv6 bind address %s requested but IPv6 is unavailable",
+                    bind_addr.c_str());
+            return INVALID_SOCKET;
+        }
+        a4->sin_family = AF_INET;
+        if (inet_pton(AF_INET, bind_addr.c_str(), &a4->sin_addr) <= 0) {
+            SDL_Log("[WebServer] Invalid bind address: %s", bind_addr.c_str());
+            return INVALID_SOCKET;
+        }
+        ss_len = sizeof(struct sockaddr_in);
+    }
+
+    int sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET || sock < 0) {
+        SDL_Log("[WebServer] socket(%s) failed: %s",
+                family == AF_INET6 ? "IPv6" : "IPv4", strerror(ws_last_error()));
+        *out_family_unavailable = true;
+        return INVALID_SOCKET;
+    }
+
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+
+    if (family == AF_INET6) {
+        // Dual-stack: accept IPv4 connections on the same IPv6 socket (Linux/BSD
+        // default to v6-only unless told otherwise; Windows defaults to dual-stack
+        // already, but we set this explicitly either way).
+        int v6only = 0;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
+    }
+
+    // Try to bind to configured port, optionally incrementing if auto-port is enabled
+    int port = g_webserver_configured_port;
+    int bind_result = -1;
+    int bind_errno = 0;
+    int max_attempts = g_webserver_use_auto_port ? 100 : 1;
+
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        if (family == AF_INET6) a6->sin6_port = htons(port);
+        else                    a4->sin_port  = htons(port);
+        bind_result = bind(sock, (struct sockaddr *)&ss, ss_len);
+        if (bind_result == 0) break;
+        bind_errno = ws_last_error();
+        // An address the stack can't use at all won't get better on another port
+        if (ws_err_addr_unusable(bind_errno)) break;
+        if (!g_webserver_use_auto_port) break;
+        port++;
+    }
+
+    if (bind_result < 0) {
+        if (family == AF_INET6 && ws_err_addr_unusable(bind_errno)) {
+            // IPv6 socket exists but the stack is disabled (e.g. disable_ipv6=1)
+            *out_family_unavailable = true;
+        }
+        if (g_webserver_use_auto_port) {
+            SDL_Log("[WebServer] bind() (%s) failed on ports %d-%d: %s",
+                    family == AF_INET6 ? "IPv6" : "IPv4",
+                    g_webserver_configured_port, g_webserver_configured_port + 99,
+                    strerror(bind_errno));
+        } else {
+            SDL_Log("[WebServer] bind() (%s) failed on %s:%d: %s",
+                    family == AF_INET6 ? "IPv6" : "IPv4",
+                    bind_addr.c_str(), g_webserver_configured_port, strerror(bind_errno));
+        }
+        closesocket(sock);
+        return INVALID_SOCKET;
+    }
+
+    *out_port = port;
+    return sock;
+}
+
 static void webserver_thread_func() {
 #ifdef _WIN32
     WSADATA wsa_data;
@@ -2089,69 +2202,25 @@ static void webserver_thread_func() {
     }
 #endif
 
-    g_listen_socket = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    // Prefer a dual-stack IPv6 socket; fall back to plain IPv4 on systems
+    // where IPv6 is disabled or unavailable (common on locked-down machines).
+    int port = 0;
+    bool v6_unavailable = false;
+    g_listen_socket = webserver_open_listen_socket(AF_INET6, &port, &v6_unavailable);
+    if (g_listen_socket == INVALID_SOCKET && v6_unavailable) {
+        SDL_Log("[WebServer] IPv6 unavailable, falling back to IPv4");
+        bool v4_unavailable = false;
+        g_listen_socket = webserver_open_listen_socket(AF_INET, &port, &v4_unavailable);
+    }
     if (g_listen_socket == INVALID_SOCKET) {
-        SDL_Log("[WebServer] socket() failed: %s", strerror(errno));
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return;
     }
 
-    int reuse = 1;
-    setsockopt(g_listen_socket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
-
-    // Dual-stack: accept IPv4 connections on the same IPv6 socket (Linux/BSD
-    // default to v6-only unless told otherwise; Windows defaults to dual-stack
-    // already, but we set this explicitly either way).
-    int v6only = 0;
-    setsockopt(g_listen_socket, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
-
-    struct sockaddr_in6 addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin6_family = AF_INET6;
-
-    // Accept plain IPv4 bind addresses (e.g. "0.0.0.0", "127.0.0.1") by
-    // mapping them into IPv6 form, since the listen socket is now AF_INET6.
-    std::string bind_str = g_webserver_bind_addr;
-    if (bind_str.find(':') == std::string::npos) {
-        bind_str = (bind_str == "0.0.0.0") ? "::" : ("::ffff:" + bind_str);
-    }
-
-    // Parse bind address
-    if (inet_pton(AF_INET6, bind_str.c_str(), &addr.sin6_addr) <= 0) {
-        SDL_Log("[WebServer] Invalid bind address: %s", g_webserver_bind_addr.c_str());
-        closesocket(g_listen_socket);
-        return;
-    }
-
-    // Try to bind to configured port, optionally incrementing if auto-port is enabled
-    int port = g_webserver_configured_port;
-    int bind_result = -1;
-    int max_attempts = g_webserver_use_auto_port ? 100 : 1;
-    
-    for (int attempt = 0; attempt < max_attempts; attempt++) {
-        addr.sin6_port = htons(port);
-        bind_result = bind(g_listen_socket, (struct sockaddr *)&addr, sizeof(addr));
-        if (bind_result == 0) {
-            g_webserver_port = port;  // Store the port we're using
-            SDL_Log("[WebServer] Starting on %s:%d", g_webserver_bind_addr.c_str(), port);
-            break;
-        }
-        if (!g_webserver_use_auto_port) {
-            break;  // Don't retry if auto-port is disabled
-        }
-        port++;
-    }
-
-    if (bind_result < 0) {
-        if (g_webserver_use_auto_port) {
-            SDL_Log("[WebServer] bind() failed on ports %d-%d: %s", 
-                    g_webserver_configured_port, g_webserver_configured_port + 99, strerror(errno));
-        } else {
-            SDL_Log("[WebServer] bind() failed on %s:%d: %s", 
-                    g_webserver_bind_addr.c_str(), g_webserver_configured_port, strerror(errno));
-        }
-        closesocket(g_listen_socket);
-        return;
-    }
+    g_webserver_port = port;  // Store the port we're using
+    SDL_Log("[WebServer] Starting on %s:%d", g_webserver_bind_addr.c_str(), port);
 
     if (listen(g_listen_socket, 5) < 0) {
         SDL_Log("[WebServer] listen() failed: %s", strerror(errno));
