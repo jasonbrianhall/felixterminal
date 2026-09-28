@@ -2,10 +2,7 @@
 # Cross-compile for Windows with: make windows
 # Native Linux build with:        make linux
 #
-# SSH support (libssh2) — opt-in via SSH=1:
-#   make linux   SSH=1
-#   make windows SSH=1
-#   make debug   SSH=1
+# SSH/SFTP support (libssh2) is always built in.
 
 # Compiler settings
 CXX_LINUX = g++
@@ -49,7 +46,7 @@ GLEW_CFLAGS_WIN   := $(shell $(PKG_CONFIG_WIN) --cflags glew 2>/dev/null || echo
 GLEW_LIBS_WIN     := $(shell $(PKG_CONFIG_WIN) --libs   glew 2>/dev/null || echo "-lglew32")
 
 # ============================================================================
-# LIBSSH2  (only pulled in when SSH=1)
+# LIBSSH2  (SSH/SFTP — always built in)
 # ============================================================================
 SSH2_CFLAGS_LINUX := $(shell $(PKG_CONFIG_LINUX) --cflags libssh2 2>/dev/null || echo "")
 SSH2_LIBS_LINUX   := $(shell $(PKG_CONFIG_LINUX) --libs   libssh2 2>/dev/null || echo "-lssh2")
@@ -90,6 +87,7 @@ WX_LIBS_WIN     := -L/usr/x86_64-w64-mingw32/sys-root/mingw/lib \
 FRONTEND_LINUX      = $(BUILD_DIR_LINUX)/FelixTerminalGUI
 FRONTEND_WIN        = $(BUILD_DIR_WIN)/FelixTerminalGUI.exe
 
+# SSH (always enabled)
   SSH_SRCS         = ssh_session.cpp port_forward.cpp pf_overlay.cpp
   SSH_DEFINE       = -DUSESSH
   SSH_CFLAGS_LINUX = $(SSH2_CFLAGS_LINUX)
@@ -539,10 +537,8 @@ flt-collect-dlls: $(BUILD_DIR_WIN)/$(EXECUTABLE_WIN)
 	else \
 		echo "Tip: write collect_dlls.sh or copy manually:"; \
 		echo "  SDL2.dll, glew32.dll, freetype.dll, libwinpthread-1.dll,"; \
-		echo "  libgcc_s_seh-1.dll, libstdc++-6.dll"; \
-		if [ "$(SSH)" = "1" ]; then \
-			echo "  (SSH build) libssh2.dll, libssl-*.dll, libcrypto-*.dll"; \
-		fi \
+		echo "  libgcc_s_seh-1.dll, libstdc++-6.dll,"; \
+		echo "  libssh2.dll, libssl-*.dll, libcrypto-*.dll"; \
 	fi
 
 # ============================================================================
@@ -603,14 +599,14 @@ check-deps:
 	@$(PKG_CONFIG_LINUX) --exists sdl2      && echo "✓ sdl2"      || echo "✗ sdl2"
 	@$(PKG_CONFIG_LINUX) --exists glew      && echo "✓ glew"      || echo "✗ glew"
 	@$(PKG_CONFIG_LINUX) --exists gstreamer-1.0 && echo "✓ gstreamer-1.0" || echo "✗ gstreamer-1.0 (video playback)"
-	@$(PKG_CONFIG_LINUX) --exists libssh2   && echo "✓ libssh2"   || echo "✗ libssh2 (optional, needed for SSH=1)"
+	@$(PKG_CONFIG_LINUX) --exists libssh2   && echo "✓ libssh2"   || echo "✗ libssh2 (required)"
 	@$(PKG_CONFIG_LINUX) --exists libavformat libavcodec libavutil && echo "✓ ffmpeg" || echo "✗ ffmpeg (for audio conversion: libavformat, libavcodec, libavutil)"
 	@echo "=== Windows (mingw64) ==="
 	@$(PKG_CONFIG_WIN) --exists freetype2 && echo "✓ freetype2" || echo "✗ freetype2"
 	@$(PKG_CONFIG_WIN) --exists sdl2      && echo "✓ sdl2"      || echo "✗ sdl2"
 	@$(PKG_CONFIG_WIN) --exists glew      && echo "✓ glew"      || echo "✗ glew"
 	@$(PKG_CONFIG_WIN) --exists gstreamer-1.0 && echo "✓ gstreamer-1.0" || echo "✗ gstreamer-1.0 (video playback)"
-	@$(PKG_CONFIG_WIN) --exists libssh2   && echo "✓ libssh2"   || echo "✗ libssh2 (optional, needed for SSH=1)"
+	@$(PKG_CONFIG_WIN) --exists libssh2   && echo "✓ libssh2"   || echo "✗ libssh2 (required)"
 
 clean:
 	find $(BUILD_DIR) -type f \( -name "*.o" -o -name "*.d" \) -delete 2>/dev/null || true

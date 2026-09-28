@@ -45,13 +45,30 @@ Felix Terminal is a standalone OpenGL terminal emulator for Linux and MS Windows
 - Configurable themes and window opacity
 - Spawn additional terminal windows
 - Works with /bin/bash, cmd.exe, powershell, and many more
-- Kitty Graphics Support with Animated GIF Support e.g. timg icon.png — Windows support untested
+- Inline graphics: **Sixel** and **Kitty** graphics protocols, including animated GIFs — see [Inline Graphics](#inline-graphics)
+- **Copy as Rich Text** — paste terminal output into Word or LibreOffice with colors, formatting and images intact
 - URL detection with Ctrl+Click to open in browser
 - System font selection from any installed monospace font
 - Includes Felix BASIC
 - Built-in **SSH**, **Telnet** (with optional SSL/TLS) and **serial/RS-232** connections — see [Usage](#usage)
 - **F1** help screen listing every shortcut
 - **F7** WOPR Terminal — a hidden retro mainframe with chess, checkers, Zork, Wizard's Castle, minesweeper, tic-tac-toe and more
+
+## Inline Graphics
+
+Felix Terminal displays images inline using both the **Sixel** and **Kitty** graphics protocols, including animated GIFs. Works with tools such as `timg`, `img2sixel` and gnuplot. Images scroll with the text, stay in the scrollback, and are removed by `clear` along with the text around them. *(Kitty graphics on Windows is untested.)*
+
+**Copy as Rich Text** (right-click menu, or `Ctrl+C` with a selection) puts the selection on the clipboard as HTML with colors, bold/italic and inline images embedded, so it pastes into Word, LibreOffice Writer or an email with graphics intact. **Copy as HTML** and **Copy as ANSI** are also available.
+
+### gnuplot tip
+
+gnuplot's sixel terminal defaults to `anchor` mode, which moves the cursor to the top-left of the screen before drawing, so the plot lands on top of existing text. Use `scroll` to draw it at the cursor instead:
+
+```
+gnuplot -p -e "set term sixelgd truecolor scroll; plot sin(x)"
+```
+
+To make this the default, add `set term sixelgd truecolor scroll` to `~/.gnuplot`.
 
 ## SSH Support
 
