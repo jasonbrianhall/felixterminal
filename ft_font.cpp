@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 #include <string>
 #include <vector>
 
@@ -95,65 +96,218 @@ void ft_init(void) {
 
 // ============================================================================
 // CJK FALLBACK — none of the embedded fonts cover Chinese/Japanese/Korean,
-// and embedding one would add 15+ MB, so borrow one from the system.
-// Order: $FELIX_CJK_FONT, then fontconfig (Linux), then well-known paths.
+// and embedding them would add 15+ MB, so borrow fonts from the system.
+//
+// One face per script, because no single stock font covers everything well:
+// MS Gothic has no Hangul, Malgun Gothic has almost no kanji, and Chinese
+// text drawn with a Japanese font uses the wrong letterforms.
+//   - Kana            -> Japanese face
+//   - Hangul          -> Korean face
+//   - Bopomofo        -> Traditional Chinese face
+//   - Han ideographs, CJK punctuation, full-width forms -> the face for the
+//     user's locale (ja / ko / zh-Hans / zh-Hant), Japanese if not CJK
+// If the preferred face lacks a character, any other loaded CJK face is used.
+//
+// Overrides:
+//   FELIX_CJK_FONT=/path/font   tried first for every CJK character
+//   FELIX_CJK_PREFER=ja|ko|zh-hans|zh-hant   which face draws Han characters
 // ============================================================================
 
-static bool try_cjk_face(const char *path, long index) {
-    if (!path || !*path) return false;
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>   // GetUserDefaultUILanguage
+#endif
+
+enum CjkScript { CJK_JA = 0, CJK_KO, CJK_ZH_HANS, CJK_ZH_HANT, CJK_COUNT };
+static const char *const CJK_NAMES[CJK_COUNT] = { "Japanese", "Korean", "Chinese (Simplified)",
+                                                  "Chinese (Traditional)" };
+// A character each face must contain to count as covering its script
+static const uint32_t CJK_PROBE[CJK_COUNT] = { 0x3042 /* あ */, 0xD55C /* 한 */,
+                                               0x4E2D /* 中 */, 0x4E2D /* 中 */ };
+
+struct CjkLoaded { std::string path; long index; FT_Face face; };
+static std::vector<CjkLoaded> s_cjk_loaded;        // owns every CJK face (deduplicated)
+static FT_Face  s_cjk_by_script[CJK_COUNT] = {};
+static FT_Face  s_cjk_override = nullptr;          // FELIX_CJK_FONT
+static CjkScript s_han_pref = CJK_JA;
+
+// Open (or reuse) a face; returns nullptr if it can't be opened or lacks probe
+static FT_Face open_cjk_face(const std::string &path, long index, uint32_t probe) {
+    if (path.empty()) return nullptr;
+    for (const CjkLoaded &l : s_cjk_loaded)
+        if (l.path == path && l.index == index)
+            return FT_Get_Char_Index(l.face, probe) ? l.face : nullptr;
     FT_Face f = nullptr;
-    if (FT_New_Face(s_ft_lib, path, index, &f) != 0) return false;
-    // Must actually contain CJK (fc-match falls back to anything)
-    if (!FT_Get_Char_Index(f, 0x4E2D) || !FT_Get_Char_Index(f, 0x3042)) {  // 中, あ
-        FT_Done_Face(f);
-        return false;
-    }
-    s_cjk_face = f;
-    SDL_Log("[Font] CJK fallback: %s %s (%s)\n", f->family_name, f->style_name, path);
-    return true;
+    if (FT_New_Face(s_ft_lib, path.c_str(), index, &f) != 0) return nullptr;
+    if (!FT_Get_Char_Index(f, probe)) { FT_Done_Face(f); return nullptr; }
+    s_cjk_loaded.push_back({ path, index, f });
+    return f;
 }
 
-static void load_cjk_fallback(void) {
-    if (try_cjk_face(getenv("FELIX_CJK_FONT"), 0)) return;
+static CjkScript cjk_pref_from_tag(const char *tag) {
+    if (!tag || !*tag) return CJK_COUNT;
+    std::string t(tag);
+    for (char &c : t) c = (char)tolower((unsigned char)c);
+    if (t.compare(0, 2, "ja") == 0) return CJK_JA;
+    if (t.compare(0, 2, "ko") == 0) return CJK_KO;
+    if (t.compare(0, 2, "zh") == 0) {
+        if (t.find("hant") != std::string::npos || t.find("tw") != std::string::npos ||
+            t.find("hk")   != std::string::npos || t.find("mo") != std::string::npos)
+            return CJK_ZH_HANT;
+        return CJK_ZH_HANS;
+    }
+    return CJK_COUNT;
+}
 
-#if !defined(_WIN32) && !defined(__APPLE__)
-    // Ask fontconfig without linking it: fc-match prints file and face index
-    if (FILE *fp = popen("fc-match -f '%{file}\\n%{index}' 'monospace:lang=ja' 2>/dev/null", "r")) {
-        char file[1024] = {0}, idx[32] = {0};
-        if (fgets(file, sizeof(file), fp)) {
-            file[strcspn(file, "\r\n")] = 0;
-            if (!fgets(idx, sizeof(idx), fp)) idx[0] = 0;
+static CjkScript detect_han_preference(void) {
+    CjkScript p = cjk_pref_from_tag(getenv("FELIX_CJK_PREFER"));
+    if (p != CJK_COUNT) return p;
+#ifdef _WIN32
+    LANGID lang = GetUserDefaultUILanguage();
+    switch (PRIMARYLANGID(lang)) {
+    case LANG_JAPANESE: return CJK_JA;
+    case LANG_KOREAN:   return CJK_KO;
+    case LANG_CHINESE:
+        switch (SUBLANGID(lang)) {
+        case SUBLANG_CHINESE_TRADITIONAL: case SUBLANG_CHINESE_HONGKONG:
+        case SUBLANG_CHINESE_MACAU:       return CJK_ZH_HANT;
+        default:                          return CJK_ZH_HANS;
         }
-        pclose(fp);
-        if (try_cjk_face(file, atol(idx))) return;
+    }
+#else
+    for (const char *var : { "LC_ALL", "LC_CTYPE", "LANG" }) {
+        const char *v = getenv(var);
+        if (v && *v) { p = cjk_pref_from_tag(v); if (p != CJK_COUNT) return p; break; }
     }
 #endif
+    return CJK_JA;   // non-CJK locale: keep the previous default
+}
 
-    std::vector<std::string> paths;
+#if !defined(_WIN32) && !defined(__APPLE__)
+// Ask fontconfig without linking it: fc-match prints file and face index
+static bool fc_match(const char *pattern, std::string &file, long &index) {
+    std::string cmd = std::string("fc-match -f '%{file}\\n%{index}' '") + pattern + "' 2>/dev/null";
+    FILE *fp = popen(cmd.c_str(), "r");
+    if (!fp) return false;
+    char f[1024] = {0}, idx[32] = {0};
+    if (fgets(f, sizeof(f), fp)) {
+        f[strcspn(f, "\r\n")] = 0;
+        if (!fgets(idx, sizeof(idx), fp)) idx[0] = 0;
+    }
+    pclose(fp);
+    file = f; index = atol(idx);
+    return !file.empty();
+}
+#endif
+
+static void load_cjk_fallback(void) {
+    s_han_pref = detect_han_preference();
+
+    if (const char *ov = getenv("FELIX_CJK_FONT")) {
+        // Accept any CJK-looking font here: kana, Hangul or Han
+        for (uint32_t probe : { 0x4E2Du, 0x3042u, 0xD55Cu })
+            if ((s_cjk_override = open_cjk_face(ov, 0, probe))) break;
+        if (s_cjk_override)
+            SDL_Log("[Font] CJK override: %s %s (%s)\n", s_cjk_override->family_name,
+                    s_cjk_override->style_name, ov);
+    }
+
+    struct Cand { std::string path; long index; };
+    std::vector<Cand> cands[CJK_COUNT];
 #ifdef _WIN32
     const char *windir = getenv("WINDIR");
-    std::string fonts = std::string(windir ? windir : "C:\\Windows") + "\\Fonts\\";
-    for (const char *n : { "msgothic.ttc", "YuGothM.ttc", "msyh.ttc", "simsun.ttc", "malgun.ttf" })
-        paths.push_back(fonts + n);
+    const std::string fonts = std::string(windir ? windir : "C:\\Windows") + "\\Fonts\\";
+    auto W = [&](const char *n) { return fonts + n; };
+    cands[CJK_JA]      = { { W("msgothic.ttc"), 0 }, { W("YuGothM.ttc"), 0 }, { W("meiryo.ttc"), 0 } };
+    cands[CJK_KO]      = { { W("malgun.ttf"), 0 },   { W("gulim.ttc"), 0 } };
+    cands[CJK_ZH_HANS] = { { W("msyh.ttc"), 0 },     { W("simsun.ttc"), 0 } };
+    cands[CJK_ZH_HANT] = { { W("msjh.ttc"), 0 },     { W("mingliu.ttc"), 0 } };
 #elif defined(__APPLE__)
-    paths = { "/System/Library/Fonts/Hiragino Sans GB.ttc",
-              "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-              "/Library/Fonts/Arial Unicode.ttf" };
+    cands[CJK_JA]      = { { "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc", 0 } };
+    cands[CJK_KO]      = { { "/System/Library/Fonts/AppleSDGothicNeo.ttc", 0 } };
+    cands[CJK_ZH_HANS] = { { "/System/Library/Fonts/Hiragino Sans GB.ttc", 0 },
+                           { "/Library/Fonts/Arial Unicode.ttf", 0 } };
+    cands[CJK_ZH_HANT] = { { "/Library/Fonts/Arial Unicode.ttf", 0 } };
 #else
-    paths = { "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-              "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-              "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-              "/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc",
-              "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-              "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
-              "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-              "/usr/share/fonts/google-droid/DroidSansFallbackFull.ttf" };
+    // Noto CJK .ttc collections: index 0 = JP, 1 = KR, 2 = SC, 3 = TC
+    static const char *const noto[] = {
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc" };
+    static const char *const generic[] = {
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/google-droid/DroidSansFallbackFull.ttf" };
+    for (int s = 0; s < CJK_COUNT; s++) {
+        for (const char *n : noto)    cands[s].push_back({ n, (long)s });
+        for (const char *g : generic) cands[s].push_back({ g, 0 });
+    }
+    static const char *const fc_lang[CJK_COUNT] = { "monospace:lang=ja", "monospace:lang=ko",
+                                                   "monospace:lang=zh-cn", "monospace:lang=zh-tw" };
+    static std::string fc_file[CJK_COUNT];
 #endif
-    for (const std::string &p : paths)
-        if (try_cjk_face(p.c_str(), 0)) return;
 
-    SDL_Log("[Font] no CJK font found — CJK text will show as boxes "
-            "(install Noto Sans CJK, or set FELIX_CJK_FONT=/path/to/font)\n");
+    for (int s = 0; s < CJK_COUNT; s++) {
+        FT_Face f = nullptr;
+#if !defined(_WIN32) && !defined(__APPLE__)
+        long idx = 0;
+        if (fc_match(fc_lang[s], fc_file[s], idx))
+            f = open_cjk_face(fc_file[s], idx, CJK_PROBE[s]);
+#endif
+        for (const Cand &c : cands[s]) {
+            if (f) break;
+            f = open_cjk_face(c.path, c.index, CJK_PROBE[s]);
+        }
+        s_cjk_by_script[s] = f;
+        if (f)
+            SDL_Log("[Font] CJK %s: %s %s\n", CJK_NAMES[s], f->family_name, f->style_name);
+    }
+
+    // Primary face (kept for compatibility): the one that draws Han characters
+    s_cjk_face = s_cjk_by_script[s_han_pref];
+    for (int s = 0; !s_cjk_face && s < CJK_COUNT; s++) s_cjk_face = s_cjk_by_script[s];
+    if (!s_cjk_face) s_cjk_face = s_cjk_override;
+
+    if (s_cjk_face)
+        SDL_Log("[Font] Han characters use the %s face\n", CJK_NAMES[s_han_pref]);
+    else
+        SDL_Log("[Font] no CJK font found — CJK text will show as boxes "
+                "(install Noto Sans CJK, or set FELIX_CJK_FONT=/path/to/font)\n");
+}
+
+// Which script's face should draw this code point (CJK_COUNT = locale default)
+static CjkScript cjk_script_of(uint32_t cp) {
+    if ((cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x3130 && cp <= 0x318F) ||
+        (cp >= 0xA960 && cp <= 0xA97F) || (cp >= 0xAC00 && cp <= 0xD7FF) ||
+        (cp >= 0xFFA0 && cp <= 0xFFDC))
+        return CJK_KO;                                   // Hangul
+    if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF) ||
+        (cp >= 0xFF66 && cp <= 0xFF9F) || (cp >= 0x1B000 && cp <= 0x1B16F))
+        return CJK_JA;                                   // Hiragana, Katakana
+    if ((cp >= 0x3100 && cp <= 0x312F) || (cp >= 0x31A0 && cp <= 0x31BF))
+        return CJK_ZH_HANT;                              // Bopomofo
+    return CJK_COUNT;
+}
+
+// Best loaded CJK face that has this character, or nullptr
+FT_Face ft_cjk_face_for(uint32_t cp) {
+    if (s_cjk_override && FT_Get_Char_Index(s_cjk_override, cp)) return s_cjk_override;
+    CjkScript sc = cjk_script_of(cp);
+    CjkScript want = (sc == CJK_COUNT) ? s_han_pref : sc;
+    FT_Face f = s_cjk_by_script[want];
+    if (f && FT_Get_Char_Index(f, cp)) return f;
+    for (int s = 0; s < CJK_COUNT; s++) {
+        f = s_cjk_by_script[s];
+        if (f && FT_Get_Char_Index(f, cp)) return f;
+    }
+    return nullptr;
 }
 
 void ft_shutdown(void) {
@@ -163,7 +317,11 @@ void ft_shutdown(void) {
         if (s_symbols_face->generic.data) free(s_symbols_face->generic.data);
         FT_Done_Face(s_symbols_face); s_symbols_face = nullptr;
     }
-    if (s_cjk_face)      { FT_Done_Face(s_cjk_face); s_cjk_face = nullptr; }
+    for (CjkLoaded &l : s_cjk_loaded) FT_Done_Face(l.face);   // each face exactly once
+    s_cjk_loaded.clear();
+    for (FT_Face &f : s_cjk_by_script) f = nullptr;
+    s_cjk_face = nullptr;
+    s_cjk_override = nullptr;
     if (s_emoji_face)    FT_Done_Face(s_emoji_face);
     if (s_ft_face_bobl)  FT_Done_Face(s_ft_face_bobl);
     if (s_ft_face_obl)   FT_Done_Face(s_ft_face_obl);
@@ -383,8 +541,10 @@ float draw_text(const char *text, float x, float y, int font_px, int emoji_px,
 
         // CJK comes before the emoji/symbol fallbacks — the embedded fonts
         // have no CJK at all, so this is the only face that can supply it.
-        if (!e && s_cjk_face && face != s_cjk_face && !is_emoji_codepoint(cp))
-            e = g_atlas.get(s_cjk_face, cp, font_px, font_px);
+        if (!e && !is_emoji_codepoint(cp)) {
+            FT_Face cjk = ft_cjk_face_for(cp);
+            if (cjk && cjk != face) e = g_atlas.get(cjk, cp, font_px, font_px);
+        }
 
         // Fallback chain — same order as original draw_text
         if (!e && face != s_emoji_face && s_emoji_face)

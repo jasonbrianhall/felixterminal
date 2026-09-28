@@ -16,7 +16,12 @@ extern FT_Face    s_ft_face_obl;  // Oblique
 extern FT_Face    s_ft_face_bobl; // BoldOblique
 extern FT_Face    s_emoji_face;
 extern FT_Face    s_symbols_face;
-extern FT_Face    s_cjk_face;     // system CJK fallback (nullptr if none found)
+extern FT_Face    s_cjk_face;     // system CJK fallback for Han characters (nullptr if none found)
+
+// Best system CJK face for a code point: picks the Japanese, Korean or Chinese
+// face by script (Han characters follow the user's locale), falling back to
+// any other loaded CJK face that has the glyph. nullptr if none does.
+FT_Face ft_cjk_face_for(uint32_t cp);
 
 // ============================================================================
 // API
