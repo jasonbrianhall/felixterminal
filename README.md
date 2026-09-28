@@ -14,6 +14,8 @@ This installs directly from the Microsoft Store listing above via winget's `msst
 
 **Linux:** build from source — see [Building](#building) below.
 
+> Felix Terminal was previously called **GL Terminal**. Some source files (e.g. `gl_terminal.h`) and the repository name still carry the old name.
+
 
 ![Felix the Lovebird](icon.png)
 
@@ -27,7 +29,7 @@ Rest easy, Felix. 🐦
 
 ---
 
-A standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback for rendering (some shaders in SDL are CPU rendered so they are slow). Renders text using FreeType triangles via OpenGL 3.3 — no GTK, no Qt, no desktop toolkit dependency.
+Felix Terminal is a standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback for rendering (some shaders in SDL are CPU rendered so they are slow). Renders text using FreeType triangles via OpenGL 3.3 — no GTK, no Qt, no desktop toolkit dependency.
 
 ## Features
 
@@ -47,8 +49,11 @@ A standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback
 - URL detection with Ctrl+Click to open in browser
 - System font selection from any installed monospace font
 - Includes Felix BASIC
+- Built-in **SSH**, **Telnet** (with optional SSL/TLS) and **serial/RS-232** connections — see [Usage](#usage)
+- **F1** help screen listing every shortcut
+- **F7** WOPR Terminal — a hidden retro mainframe with chess, checkers, Zork, Wizard's Castle, minesweeper, tic-tac-toe and more
 
-## SSH Support (build with `-DUSESSH`)
+## SSH Support (build with `make linux SSH=1`)
 
 - Built-in SSH client via **libssh2** — no external SSH binary required
 - Authentication: SSH agent (including **Pageant** on Windows), public key file, and password
@@ -58,6 +63,7 @@ A standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback
 - Keepalive to prevent server-side idle disconnect
 - PTY resize forwarded to remote on window resize
 - Password prompt rendered natively inside the terminal window (no external dialog)
+- X11 forwarding (disable with `--no-x11`)
 - Launch with `--ssh [user@host[:port]]` or via the **New Terminal → SSH Session** context menu item
 
 ## SFTP File Transfer
@@ -65,9 +71,10 @@ A standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback
 - Integrated graphical SFTP browser — no separate client needed, old-school dual-pane "Norton Commander"-style file copy screen (no drag-and-drop — you navigate each pane and select what to transfer)
 - **F2** — Upload: left panel browses local files, right panel browses remote destination
 - **F3** — Download: right panel browses remote files, left panel selects local destination
-- **F4** — SFTP Console
-- **F5** — Eye of Felix (let's you view remote and local image and listen to audio, including Karaoke CD+G files)
-- **F6** — Local and remote port fowarding console
+- **F4** — SFTP Console (interactive command-line SFTP; type `help` for commands)
+- **F5** — Felix Chirp (view remote and local images and listen to audio, including Karaoke CD+G files)
+- **F6** — Port forwarding console: add local (`L`), remote (`R`) and SOCKS5 dynamic (`D`) forwards
+- **F8** — SSH Key Manager: generate, copy and delete local keys, and manage the remote `authorized_keys`
 - Tab switches focus between panels; Enter opens directories; Backspace navigates up; Space transfers
 - Real-time progress bar with bytes transferred / total during upload and download
 - Transfers run on a background thread — terminal remains responsive during large file transfers
@@ -75,16 +82,20 @@ A standalone OpenGL terminal emulator for Linux and MS Windows with SDL fallback
 - Downloads saved to user-chosen local directory (defaults to `~/Downloads/FelixTerminal`)
 - SFTP subsystem shares the existing SSH session — no second connection or re-authentication
 
-### SFTP Web Browser (F12, from within the F4 console)
+F2, F3, F4, F6 and the remote half of F8 require a session opened with the built-in SSH client (`--ssh` or **New Terminal → SSH Session**); they don't apply to an `ssh` command typed into a local shell.
 
-- **F12** — while inside the **F4** SFTP Console, starts a local web server exposing the remote filesystem as a browsable file listing at `http://localhost:53716`. F12 does nothing outside of the F4 console.
+### Felix Stargate Web File Browser (F9)
+
+- **F9** — toggles a web file browser at `http://localhost:53716`. In a built-in SSH session it serves the **remote** filesystem over SFTP; otherwise it serves **local** files. Press F9 again to stop it.
+- Can also be started from the command line with `--webserver [address:port]` (and `--web-root <dir>` for local mode)
 - Port `53716` spells **FELIX**: F→5, E→3, L→7 (upside-down L), I→1, X→6
-- Binds to `127.0.0.1` only — it's reachable from the local machine, not other devices on the network, so there's nothing to expose or firewall
-- If port `53716` is already in use, it automatically tries the next port up (to `53815`) — check the terminal log output for the actual port if it had to fall back
+- Binds to `127.0.0.1` by default — reachable from the local machine only, so there's nothing to expose or firewall
+- Works on IPv6 and IPv4-only systems: it uses a dual-stack socket when IPv6 is available and falls back to IPv4 when it isn't
+- If port `53716` is already in use, it automatically tries the next port up (to `53815`) — check the debug log (**F12**) for the actual port if it had to fall back
 - Browse directories, sort by name/type/size/modified, and upload/download files straight from a browser tab — handy for quick access without opening the F2/F3 panels
 - Each browser request runs on its own thread against its own SFTP subsystem, so a large transfer through the web browser won't block the terminal or the F4 console
 - "Open in new window" checkbox in the browser UI controls whether clicking a file opens a new tab or navigates the current one — persisted as a cookie
-- Shuts down automatically when the SSH session ends or the F4 console is closed
+- Shuts down automatically when the SSH session ends
 
 ## GL Render Modes
 
@@ -98,69 +109,130 @@ Post-process effects applied after terminal rendering — multiple modes can be 
 | VHS | Noise, chroma bleed, and tracking artifacts |
 | Focus | Vignette darkening outside the active row |
 | C64 | Commodore 64 palette and chunky pixel look |
-| Composite | NTSC composite color bleeding |
+| Bad Composite | NTSC composite color bleeding |
+| Bloom | Glow around bright text |
+| Ghosting | Phosphor persistence trails |
+| Wireframe | Grid overlay |
 
 ## Dependencies
 
-- SDL2
-- OpenGL / GLEW
+Required:
+
+- SDL2 and SDL2_mixer
+- OpenGL 3.3 / GLEW
 - FreeType2
-- libssh2 *(optional — required for SSH and SFTP support)*
+- GStreamer 1.0 (+ plugins-base, for video playback in Felix Chirp)
+- FFmpeg libraries (libavformat, libavcodec, libavutil, libswresample)
+- libpng, libjpeg, libwebp, libtiff, giflib, zlib
+- OpenSSL
+- GMP
+- wxWidgets 3.x (for the `FelixTerminalGUI` launcher)
+- `xxd` (used at build time to embed the web UI; usually in the `vim-common` or `xxd` package)
+
+Optional:
+
+- libssh2 — SSH, SFTP, port forwarding, key manager and remote web browser (`SSH=1`)
+- libxmp, mpg123, opus/opusfile, libvorbis, FLAC — extra audio formats in Felix Chirp (auto-detected)
+
+On Debian/Ubuntu (tested on Ubuntu 24.04):
+```
+sudo apt install build-essential pkg-config xxd \
+    libsdl2-dev libsdl2-mixer-dev libglew-dev libfreetype-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+    libpng-dev libjpeg-dev libwebp-dev libtiff-dev libgif-dev zlib1g-dev \
+    libssl-dev libgmp-dev libwxgtk3.2-dev \
+    libssh2-1-dev
+# optional audio codecs
+sudo apt install libxmp-dev libmpg123-dev libopus-dev libopusfile-dev libvorbis-dev libflac-dev
+```
 
 On Fedora/RHEL:
 ```
-sudo dnf install SDL2-devel glew-devel freetype-devel libssh2-devel
+sudo dnf install gcc-c++ make pkgconf xxd \
+    SDL2-devel SDL2_mixer-devel glew-devel freetype-devel \
+    gstreamer1-devel gstreamer1-plugins-base-devel \
+    ffmpeg-free-devel \
+    libpng-devel libjpeg-turbo-devel libwebp-devel libtiff-devel giflib-devel zlib-devel \
+    openssl-devel gmp-devel wxGTK-devel \
+    libssh2-devel
+# optional audio codecs
+sudo dnf install libxmp-devel mpg123-devel opus-devel opusfile-devel libvorbis-devel flac-devel
 ```
 
-On Debian/Ubuntu:
-```
-sudo apt install libsdl2-dev libglew-dev libfreetype-dev libssh2-1-dev
-```
+Run `make check-deps` to see which libraries were found.
 
 ## Building
 
+Linux, with SSH/SFTP support (recommended):
+```
+make linux SSH=1
+```
+
+Linux without SSH:
 ```
 make
 ```
 
-SSH/SFTP support (recommended):
+Windows (cross-compiled with mingw64):
 ```
-make USESSH=1
+make windows SSH=1
 ```
 
-or for Windows (requires mingw):
+Output goes to `build/linux/` (or `build/windows/`):
 
-```
-make windows
-```
+| File | Description |
+|---|---|
+| `flt` / `flt.exe` | Felix Terminal |
+| `FelixTerminalGUI` | wxWidgets launcher for picking connection options |
+
+Debug builds: `make debug SSH=1` (output in `build/linux_debug/`).
 
 The fonts are embedded as base64-encoded headers — no external font files required.
 
 ## Usage
 
 ```
-./gl_terminal [command]
+./build/linux/flt [command]
 ```
 
 Optionally pass a command to run instead of the default shell:
 
 ```
-./gl_terminal htop
+./build/linux/flt htop
 ```
 
 SSH session (opens connection dialog if host/user not specified):
 
 ```
-./gl_terminal --ssh
-./gl_terminal --ssh user@host
-./gl_terminal --ssh user@host:2222
-./gl_terminal --ssh-key ~/.ssh/id_ed25519 --ssh user@host
+flt --ssh
+flt --ssh user@host
+flt --ssh user@host:2222
+flt --ssh-key ~/.ssh/id_ed25519 --ssh user@host
+flt --ssh user@host -L 8080:localhost:80      # with a local port forward
 ```
+
+Telnet:
+
+```
+flt --telnet host[:port]
+flt --telnet host --ssl                       # Telnet over SSL/TLS
+```
+
+Serial / RS-232 console (prompts for port and settings if omitted):
+
+```
+flt --serial /dev/ttyUSB0 --serial-baud 115200
+flt --serial COM3 --serial-baud 9600          # Windows
+```
+
+Run `flt --help` for the full list of options.
 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
+| `F1` | Help screen |
 | `Ctrl+C` (with selection) | Copy selection |
 | `Ctrl+Shift+C` (with selection) | Copy selection as HTML |
 | `Ctrl+V` | Paste |
@@ -169,10 +241,16 @@ SSH session (opens connection dialog if host/user not specified):
 | `Ctrl+Shift+Scroll` | Increase / decrease font size (4× step) |
 | `Ctrl+Click` | Open URL in browser |
 | `Shift+PageUp / Shift+PageDown` | Scroll scrollback buffer |
-| `F2` | Open SFTP upload browser *(SSH sessions only)* |
-| `F3` | Open SFTP download browser *(SSH sessions only)* |
-| `F12` | Start SFTP web browser at `localhost:53716` *(inside F4 SFTP Console only)* |
+| `F2` | SFTP upload browser *(built-in SSH sessions only)* |
+| `F3` | SFTP download browser *(built-in SSH sessions only)* |
+| `F4` | SFTP console *(built-in SSH sessions only)* |
+| `F5` | Felix Chirp image / audio / karaoke viewer |
+| `F6` | Port forwarding console *(built-in SSH sessions only)* |
+| `F7` | WOPR Terminal |
+| `F8` | SSH Key Manager |
+| `F9` | Toggle web file browser at `localhost:53716` |
 | `F11` | Toggle full screen |
+| `F12` | Debug log |
 
 
 ## Mouse
@@ -217,6 +295,11 @@ All `--ssh-*` flags also accept a single-dash form (e.g. `-ssh-key`).
 | `--ssh-key-pub <path>` | Public key file. Derived from `--ssh-key` path (appending `.pub`) if omitted. |
 | `--ssh-password <pass>` | Password. Not recommended — prefer agent or key auth. |
 | `--ssh-known-hosts <path>` | Known hosts file. Default: `~/.ssh/known_hosts`. Set to empty string to skip host verification (insecure). |
+| `--no-x11` | Disable X11 forwarding. |
+| `-c <command>` | Run a remote command (alias: `--ssh-command`). |
+| `-L local_port:remote_host:remote_port` | Local port forward. |
+| `-R remote_port:local_host:local_port` | Remote port forward. |
+| `-D local_port` | SOCKS5 dynamic port forward. |
 
 ## Themes
 
@@ -259,3 +342,13 @@ Compile-time defaults are defined at the top of `gl_terminal.h`:
 | `NotoEmoji.h` | Noto Emoji (grayscale fallback) |
 
 To regenerate a font header, base64-encode the TTF and wrap it with the expected macro name and size constant (see any existing `.h` for the format).
+
+## Troubleshooting
+
+Felix Terminal needs OpenGL 3.3. On older hardware or a Raspberry Pi (Mesa/VC4), if it fails to start, try:
+
+```
+MESA_GL_VERSION_OVERRIDE=3.3 MESA_GLSL_VERSION_OVERRIDE=330 flt
+```
+
+Add both variables to `~/.profile` to make this permanent.
