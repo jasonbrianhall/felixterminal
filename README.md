@@ -222,6 +222,8 @@ flt --ssh user@host
 flt --ssh user@host:2222
 flt --ssh-key ~/.ssh/id_ed25519 --ssh user@host
 flt --ssh user@host -L 8080:localhost:80      # with a local port forward
+flt --ssh user@host -c /bin/sh                # use a specific remote shell
+flt --ssh user@host -c "tmux new -A -s main"  # attach to (or start) a persistent tmux session
 ```
 
 Telnet:
@@ -280,6 +282,7 @@ Run `flt --help` for the full list of options.
 
 - **New Terminal** — spawn a new local terminal window
 - **New Terminal → SSH Session** — open a new SSH session window
+- **Duplicate Session** — open another window connected the same way (same host, user, port, key and remote shell for SSH; same host for Telnet; same shell and working directory for a local terminal). Port forwards and the web server aren't duplicated, and SSH asks for the password again unless a key or agent is used. Serial sessions can't be duplicated, since the port is already in use.
 - **Copy** — copy selection as plain text
 - **Copy as HTML** — copy with color and style markup
 - **Copy as ANSI** — copy with ANSI escape codes
@@ -301,14 +304,14 @@ All `--ssh-*` flags also accept a single-dash form (e.g. `-ssh-key`).
 
 | Flag | Description |
 |:---|:---|
-| `--ssh [user@host[:port]]` | Connect via SSH. Host and user are prompted inside the window if omitted. Port defaults to 22. |
+| `--ssh [user@host[:port]]` | Connect via SSH. Host and user are prompted inside the window if omitted. Port defaults to 22. IPv6 addresses go in brackets: `user@[::1]:22`. `User`, `Port` and `IdentityFile` from `~/.ssh/config` are applied for the host when not given on the command line. |
 | `-i <path>` | Private key file (same as `--ssh-key`, matches standard `ssh` convention). |
 | `--ssh-key <path>` | Private key file for public key authentication. |
 | `--ssh-key-pub <path>` | Public key file. Derived from `--ssh-key` path (appending `.pub`) if omitted. |
 | `--ssh-password <pass>` | Password. Not recommended — prefer agent or key auth. |
 | `--ssh-known-hosts <path>` | Known hosts file. Default: `~/.ssh/known_hosts`. Set to empty string to skip host verification (insecure). |
 | `--no-x11` | Disable X11 forwarding. |
-| `-c <command>` | Run a remote command (alias: `--ssh-command`). |
+| `-c <command>` | Run a remote shell or command instead of the login shell (alias: `--ssh-command`). It runs with a terminal attached, so `-c /bin/sh` or `-c "tmux new -A -s main"` is fully interactive. In the launcher this is the **Remote shell** field on the SSH tab. |
 | `-L local_port:remote_host:remote_port` | Local port forward. |
 | `-R remote_port:local_host:local_port` | Remote port forward. |
 | `-D local_port` | SOCKS5 dynamic port forward. |
