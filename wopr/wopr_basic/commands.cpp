@@ -1432,7 +1432,7 @@ static void byref_return(int fi) {
         } else {
             Var *cv = var_get(b->caller);
             if (var_is_str_name(b->caller)) {
-                const char *val = (pv->kind == VAR_STR && pv->str) ? pv->str : "";
+                char *val = (pv->kind == VAR_STR && pv->str) ? pv->str : "";
                 char *dup = str_dup(val);
                 if (cv->kind == VAR_STR) free(cv->str);
                 cv->kind = VAR_STR; cv->str = dup;

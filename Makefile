@@ -150,6 +150,7 @@ CXXFLAGS_LINUX = $(CXXFLAGS_COMMON) \
                  $(GSTREAMER_CFLAGS_LINUX) $(FFMPEG_CFLAGS_LINUX) \
                  $(SSH_CFLAGS_LINUX) \
                  -Iwopr \
+                 -fpermissive \
                  -DLINUX $(SSH_DEFINE) -O2 -ffunction-sections -fdata-sections -flto -DDONTUSEGMP
 
 LDFLAGS_LINUX  = $(SDL2_LIBS_LINUX) $(GLEW_LIBS_LINUX) $(FREETYPE_LIBS_LINUX) \
@@ -166,6 +167,7 @@ CXXFLAGS_LINUX_DEBUG = $(CXXFLAGS_COMMON) \
                        -Iwopr \
                        -DLINUX $(SSH_DEFINE) -DDEBUG -g -O0 -fno-omit-frame-pointer \
                        -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=address,undefined \
+                       -fpermissive \
                        -DDONTUSEGMP
 
 LDFLAGS_LINUX_DEBUG  = $(SDL2_LIBS_LINUX) $(GLEW_LIBS_LINUX) $(FREETYPE_LIBS_LINUX) \
@@ -187,6 +189,7 @@ CXXFLAGS_WIN = $(CXXFLAGS_COMMON) \
                $(GSTREAMER_CFLAGS_WIN) \
                $(SSH_CFLAGS_WIN) \
                -Iwopr \
+               -fpermissive \
                -DWIN32 -D_WIN32 -D_WIN32_WINNT=0x0A00 \
                $(SSH_DEFINE) $(FELIXBASIC_DEFINE) -O2 -ffunction-sections -fdata-sections -flto -DDONTUSEGMP
 
@@ -205,6 +208,7 @@ CXXFLAGS_WIN_DEBUG = $(CXXFLAGS_COMMON) \
                      $(SSH_CFLAGS_WIN) \
                      -Iwopr \
                      -DWIN32 -D_WIN32 -D_WIN32_WINNT=0x0A00 \
+                     -fpermissive \
                      $(SSH_DEFINE) $(FELIXBASIC_DEFINE) -DDEBUG -g -O0 -DDONTUSEGMP
 
 CFLAGS_WIN         = $(CFLAGS_COMMON) -DWIN32 -D_WIN32 -O2
