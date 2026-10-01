@@ -77,6 +77,45 @@ static void install_sigint(void) {
 }
 
 /* ================================================================
+ * Typed program lines
+ * ================================================================ */
+/* Split a typed line at its top-level colons into one statement per
+ * g_lines entry, the way load() stores a program read from a file: the
+ * interpreter runs one statement per entry, so a typed
+ * "10 A = 1: PRINT A" would otherwise run only "A = 1". REM, ' and IF
+ * keep the rest of the line together, as in load(). */
+static int typed_line_segments(char *p, char *segs[], int max) {
+    int n = 0;
+    while (isspace((unsigned char)*p)) p++;
+    if ((strncasecmp(p, "IF", 2) == 0 && !isalnum((unsigned char)p[2]) && p[2] != '_') ||
+        (strncasecmp(p, "REM", 3) == 0 && !isalnum((unsigned char)p[3]) && p[3] != '_') ||
+        *p == '\'') {
+        segs[n++] = p;
+        return n;
+    }
+    char *seg = p;
+    int in_str = 0;
+    for (char *c = p; *c; c++) {
+        if (*c == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (*c == '\'') { *c = '\0'; break; }
+        if (*c != ':') continue;
+        *c = '\0';
+        if (*seg && n < max) segs[n++] = seg;
+        seg = c + 1;
+        while (isspace((unsigned char)*seg)) seg++;
+        if ((strncasecmp(seg, "REM", 3) == 0 && !isalnum((unsigned char)seg[3]) && seg[3] != '_') || *seg == '\'') {
+            seg = NULL;
+            break;
+        }
+        if (strncasecmp(seg, "IF", 2) == 0 && !isalnum((unsigned char)seg[2]) && seg[2] != '_') break;
+        c = seg - 1;
+    }
+    if (seg && *seg && n < max) segs[n++] = seg;
+    return n;
+}
+
+/* ================================================================
  * Interpreter run loop
  * ================================================================ */
 void run(void) { run_from(0); }
@@ -342,7 +381,9 @@ return 0;
             if (!d) { perror("opendir"); continue; }
 
             /* Collect entries into two sorted lists: dirs and files */
+            #ifndef MAX_DIR_ENTRIES
             #define MAX_DIR_ENTRIES 2048
+            #endif
             // static, not stack: these are 512KB each. As plain locals they get
             // reserved as part of basic_main()'s single stack frame the moment the
             // function is entered (even if FILES/DIR/LS is never typed), and under
@@ -628,25 +669,29 @@ return 0;
             }
             g_nlines = w;
             if (*p) {
-                if (g_nlines >= MAX_LINES) { display_print("Too many lines\n"); continue; }
+                char *segs[256];
+                int nseg = typed_line_segments(p, segs, 256);
+                if (g_nlines + nseg > MAX_LINES) { display_print("Too many lines\n"); continue; }
                 int ins = g_nlines;
                 for (int i = 0; i < g_nlines; i++)
                     if (g_lines[i].linenum > num) { ins = i; break; }
-                memmove(&g_lines[ins+1], &g_lines[ins], (g_nlines-ins)*sizeof(Line));
-                g_lines[ins].linenum = num;
-                g_lines[ins].text = bstrdup(p);
-                g_nlines++;
+                memmove(&g_lines[ins+nseg], &g_lines[ins], (g_nlines-ins)*sizeof(Line));
+                for (int k = 0; k < nseg; k++) {
+                    g_lines[ins+k].linenum = num;
+                    g_lines[ins+k].text = bstrdup(segs[k]);
+                }
+                g_nlines += nseg;
             }
             suppress_ok = 1; continue;  /* no Ok prompt */
 
         } else {
-            /* Immediate execution */
+            /* Immediate execution (every statement of "COLOR 14, 1: CLS") */
             Interp ip = { .pc=0, .running=1 };
             extern jmp_buf g_parse_error_jmp;
             extern int g_parse_error_active;
             g_parse_error_active = 1;
             if (setjmp(g_parse_error_jmp) == 0) {
-                dispatch_one(&ip, p, p);
+                dispatch_multi(&ip, p);
             }
             g_parse_error_active = 0;
             continue;

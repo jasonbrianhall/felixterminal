@@ -1,0 +1,13 @@
+# The repository's top-level .gitignore admits only a few file types;
+# the bare-metal build also needs these. (git add -f this file once.)
+!.gitignore
+!*.hpp
+!*.S
+!*.ld
+!*.py
+!*.sh
+!*.cfg
+build/
+*.img
+*.elf
+*.iso

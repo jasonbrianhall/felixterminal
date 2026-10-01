@@ -67,11 +67,19 @@ BASIC_NS_BEGIN
 /* ================================================================
  * Configuration constants
  * ================================================================ */
+#ifndef CTRL_STACK_MAX
 #define CTRL_STACK_MAX    16384
+#endif
 #define DEFAULT_PREC     128
 #define DEFAULT_BUFFER  4096
 #define MAX_ARRAY_DIMS     2
+/* Every variable carries MAX_ARRAY_SIZE array slots, so MAX_VARS x
+ * MAX_ARRAY_SIZE sets the memory footprint; builds with little RAM (the
+ * bare-metal kernel) pass smaller values for these and for CTRL_STACK_MAX
+ * and MAX_VARNAME (the control stack and the label/type tables) with -D. */
+#ifndef MAX_ARRAY_SIZE
 #define MAX_ARRAY_SIZE  4096
+#endif
 #define MAX_DATA_ITEMS  4096
 #define MAX_DEF_FN        32
 #define MAX_FILE_HANDLES  16
@@ -81,8 +89,12 @@ BASIC_NS_BEGIN
                                     allocated dynamically to the actual string length; this is
                                     just a sanity cap used when reading/validating input */
 #define MAX_STMTS       16384
+#ifndef MAX_VARNAME
 #define MAX_VARNAME     1024    /* upper bound for identifiers — same story, see above */
+#endif
+#ifndef MAX_VARS
 #define MAX_VARS        16384
+#endif
 #define PRINT_DIGITS      60
 
 /* Small strdup helper — avoids relying on POSIX strdup() (not guaranteed
