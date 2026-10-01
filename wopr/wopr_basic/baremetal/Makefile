@@ -46,7 +46,7 @@ ARCHFLAGS := -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -msse2
 # Every variable carries its own array slots (../basic.h): 256 x 4096 is
 # 16 MB, so BASIC runs in 32 MB. (The desktop build's 16384 x 4096 would
 # be a gigabyte.)
-LIMITS   := -DMAX_VARS=256 -DMAX_ARRAY_SIZE=4096 -DCTRL_STACK_MAX=4096 -DMAX_VARNAME=256
+LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=65536 -DCTRL_STACK_MAX=1024 -DMAX_VARNAME=128 -DMAX_DIR_ENTRIES=512
 else ifeq ($(ARCH),i386)
 MFLAG    := -m32
 SUFFIX   := -i386
@@ -62,7 +62,7 @@ ARCHFLAGS := -fno-pic -fno-pie -march=i386 -mtune=i486 -mfpmath=387 -mno-sse
 # 200 variables x 1024-element arrays (about 2.5 MB), 512-deep FOR/GOSUB
 # nesting, 63-character names and 256-entry FILES listings: BASIC fits in
 # an 8 MB machine.
-LIMITS   := -DMAX_VARS=200 -DMAX_ARRAY_SIZE=1024 -DCTRL_STACK_MAX=512 -DMAX_VARNAME=64 -DMAX_DIR_ENTRIES=256
+LIMITS   := -DMAX_VARS=512 -DMAX_ARRAY_SIZE=32768 -DCTRL_STACK_MAX=512 -DMAX_VARNAME=64 -DMAX_DIR_ENTRIES=256
 else
 $(error ARCH must be x86_64 or i386)
 endif

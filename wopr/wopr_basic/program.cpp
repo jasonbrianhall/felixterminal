@@ -662,29 +662,8 @@ void clear_program(void) {
         if (v->kind == VAR_STR && v->str) {
             free(v->str);
             v->str = nullptr;
-        } else if (v->kind == VAR_ARRAY_NUM) {
-            /* Arrays are now static in Var struct, just clear the mpf_t values */
-            int size = 0;
-            if (v->ndim == 1) size = v->dim[0];
-            else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-            else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-            for (int j = 0; j < size; j++) {
-                mpf_clear(v->arr_num[j]);
-            }
-        } else if (v->kind == VAR_ARRAY_STR) {
-            /* Arrays are now static, just free the individual string elements */
-            int size = 0;
-            if (v->ndim == 1) size = v->dim[0];
-            else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-            else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-            /* Free each string in the array */
-            for (int j = 0; j < size; j++) {
-                if (v->arr_str[j]) {
-                    free(v->arr_str[j]);
-                    v->arr_str[j] = nullptr;
-                }
-            }
         }
+        var_free_arrays(v);
         mpf_clear(v->num);
     }
 

@@ -519,18 +519,18 @@ extern "C" void kmain() {
     if (!video_init(&info)) { printf("No usable framebuffer found\n"); return; }
     video_ready = true;
     // The interpreter's constructors allocate its variable table (MAX_VARS
-    // variables, each with room for MAX_ARRAY_SIZE elements) and don't
+    // variables; arrays come from the heap at DIM) and don't
     // survive running out: check first, with room for the rest.
-#ifdef __x86_64__
-    size_t need = sizeof(StandaloneBasic::Var) * MAX_VARS + (6u << 20);   // + room for graphics pages
-#else
-    size_t need = sizeof(StandaloneBasic::Var) * MAX_VARS + (2u << 20);
-#endif
+    // Room for that and the interpreter's other tables, with 1 MB to spare
+    // for the program; arrays and graphics pages that don't fit give
+    // "Out of memory" (a 640x480 page is 1.2 MB).
+    size_t need = sizeof(StandaloneBasic::Var) * MAX_VARS + (1u << 20);
     if (heap_free_bytes() < need) {
         static char l2[96];
+        size_t base = (1u << 20) + (size_t)(__kernel_end - __kernel_start);   // below 1 MB, the kernel
         snprintf(l2, sizeof l2, "Felix BASIC needs %u MB of RAM; this PC has %u MB.",
-                 (unsigned)((need + (1u << 20) + (__kernel_end - __kernel_start)) >> 20) + 1,
-                 (unsigned)((heap_free_bytes() + (2u << 20)) >> 20));
+                 (unsigned)((need + base + (1u << 20) - 1) >> 20),
+                 (unsigned)((heap_free_bytes() + base + (512u << 10)) >> 20));
         halt_screen("NOT ENOUGH MEMORY", l2);
     }
     for (auto f = __init_array_start; f != __init_array_end; f++) (*f)();

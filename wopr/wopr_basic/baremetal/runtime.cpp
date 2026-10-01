@@ -134,6 +134,19 @@ void heap_add(void* p, size_t n) {
 size_t heap_free_bytes(void) { return heap_total - heap_used; }
 size_t heap_peak_bytes(void) { return heap_peak; }
 
+// The biggest block malloc could hand out now (free neighbours merge).
+size_t heap_largest_free(void) {
+    size_t best = 0;
+    for (Block* b = heap_head; b; b = b->next) {
+        if (!b->free) continue;
+        size_t run = b->size;
+        for (Block* c = b; c->next && c->next->free && adjacent(c, c->next); c = c->next)
+            run += sizeof(Block) + c->next->size;
+        if (run > best) best = run;
+    }
+    return best;
+}
+
 void* malloc(size_t n) {
     n = (n + 15) & ~(size_t)15;
     if (!n) n = 16;
@@ -209,8 +222,18 @@ int __gxx_personality_v0() { return 0; }
 
 } // extern "C"
 
-void* operator new(size_t n) { return malloc(n); }
-void* operator new[](size_t n) { return malloc(n); }
+// new can't return null (nothing checks), so running out there ends the
+// program: BASIC restarts at its prompt, as on an unrecoverable error.
+// The big allocations (arrays, graphics pages) check first and report
+// "Out of memory" without getting here.
+extern "C" void exit(int) noexcept;
+static void* new_or_restart(size_t n) {
+    void* p = malloc(n);
+    if (!p) { printf("Out of memory\n"); exit(7); }
+    return p;
+}
+void* operator new(size_t n) { return new_or_restart(n); }
+void* operator new[](size_t n) { return new_or_restart(n); }
 void operator delete(void* p) noexcept { free(p); }
 void operator delete[](void* p) noexcept { free(p); }
 void operator delete(void* p, size_t) noexcept { free(p); }

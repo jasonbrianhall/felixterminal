@@ -1584,6 +1584,10 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         char *pp = ps->p;
         while ((isalnum((unsigned char)*pp) || *pp == '_') && fi2 < MAX_VARNAME - 1)
             fname[fi2++] = (char)toupper((unsigned char)*pp++);
+        /* The type sigil is part of the name (FUNCTION GetNum#), as the
+         * program loader registers it. */
+        if ((*pp == '#' || *pp == '!' || *pp == '%' || *pp == '&') && fi2 < MAX_VARNAME - 1)
+            fname[fi2++] = *pp++;
         fname[fi2] = '\0';
         char *after_name = pp;
         while (isspace((unsigned char)*after_name)) after_name++;
@@ -1603,6 +1607,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                 if (strncasecmp(sp, "FUNCTION", 8) == 0) sp = sk(sp + 8);
                 else if (strncasecmp(sp, "SUB", 3) == 0) sp = sk(sp + 3);
                 while (isalnum((unsigned char)*sp) || *sp == '_') sp++;
+                if (*sp == '#' || *sp == '!' || *sp == '%' || *sp == '&') sp++;
                 sp = sk(sp);
                 if (*sp == '(') {
                     sp = sk(sp + 1);
@@ -1666,6 +1671,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
 
             /* Push GOSUB frame and run the function body */
             if (g_ctrl_top < CTRL_STACK_MAX) {
+                int call_frame = g_ctrl_top;
                 CtrlFrame *fr = &g_ctrl[g_ctrl_top++];
                 strcpy(fr->varname, "\x01" "GOSUB");
                 fr->line_idx = g_current_pc + 1;  /* return address */
@@ -1687,17 +1693,22 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                     Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
                     int jumped = dispatch(&tmp_ip, line);
                     if (!tmp_ip.running) break;
+                    if (jumped < 0) break;   /* an error (already reported) ends the call */
                     pc = jumped ? tmp_ip.pc : pc + 1;
-                    /* If RETURN was hit, the GOSUB frame will be popped */
-                    if (g_ctrl_top == 0 ||
-                        strcmp(g_ctrl[g_ctrl_top-1].varname, "\x01""GOSUB") != 0) break;
+                    /* EXIT FUNCTION (or a RETURN) pops the call's frame. Loops
+                     * in the body push frames above it, and keep running. */
+                    if (g_ctrl_top <= call_frame ||
+                        strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") != 0) break;
                 }
-                /* Pop GOSUB frame if still there */
-                if (g_ctrl_top > 0 &&
-                    strcmp(g_ctrl[g_ctrl_top-1].varname, "\x01""GOSUB") == 0) {
-                    mpf_clear(g_ctrl[g_ctrl_top-1].limit);
-                    mpf_clear(g_ctrl[g_ctrl_top-1].step);
-                    g_ctrl_top--;
+                /* Reached END FUNCTION: pop the call's frame, and any loop
+                 * the body left (a GOTO out of a FOR) above it. */
+                if (g_ctrl_top > call_frame &&
+                    strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") == 0) {
+                    while (g_ctrl_top > call_frame) {
+                        g_ctrl_top--;
+                        mpf_clear(g_ctrl[g_ctrl_top].limit);
+                        mpf_clear(g_ctrl[g_ctrl_top].step);
+                    }
                 }
                 g_current_pc = saved_pc;
             }

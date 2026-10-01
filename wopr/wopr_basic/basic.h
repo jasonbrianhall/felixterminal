@@ -73,12 +73,12 @@ BASIC_NS_BEGIN
 #define DEFAULT_PREC     128
 #define DEFAULT_BUFFER  4096
 #define MAX_ARRAY_DIMS     2
-/* Every variable carries MAX_ARRAY_SIZE array slots, so MAX_VARS x
- * MAX_ARRAY_SIZE sets the memory footprint; builds with little RAM (the
- * bare-metal kernel) pass smaller values for these and for CTRL_STACK_MAX
- * and MAX_VARNAME (the control stack and the label/type tables) with -D. */
+/* The largest single array DIM accepts (elements). Arrays are allocated
+ * at DIM, sized to what was asked for. Builds with little RAM (the
+ * bare-metal kernel) pass smaller values for MAX_VARS, CTRL_STACK_MAX and
+ * MAX_VARNAME (the control stack and the label/type tables) with -D. */
 #ifndef MAX_ARRAY_SIZE
-#define MAX_ARRAY_SIZE  4096
+#define MAX_ARRAY_SIZE  65536
 #endif
 #define MAX_DATA_ITEMS  4096
 #define MAX_DEF_FN        32
@@ -151,11 +151,12 @@ typedef struct {
     /* scalar */
     mpf_t   num;
     char   *str;
-    /* array (up to 2D) - statically allocated to avoid heap fragmentation */
+    /* array (up to 2D), allocated by DIM: arr_len elements of one kind */
     int     dim[MAX_ARRAY_DIMS];
     int     ndim;
-    mpf_t   arr_num[MAX_ARRAY_SIZE];  /* Static allocation instead of dynamic */
-    char   *arr_str[MAX_ARRAY_SIZE];  /* Array of string pointers (strings are still malloc'd) */
+    int     arr_len;
+    mpf_t  *arr_num;
+    char  **arr_str;                  /* the strings themselves are malloc'd too */
 } Var;
 
 extern Var* g_vars;
@@ -166,6 +167,8 @@ Var    *var_find(char *name);
 Var    *var_create(char *name);
 Var    *var_get(char *name);
 mpf_t  *arr_num_elem(Var *v, int i, int j);
+void    var_free_arrays(Var *v);      /* release an array's elements and storage */
+bool    var_alloc_array(Var *v, int total, int is_str);
 char  **arr_str_elem(Var *v, int i, int j);
 
 /* ================================================================

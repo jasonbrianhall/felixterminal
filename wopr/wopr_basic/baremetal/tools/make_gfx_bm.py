@@ -360,19 +360,47 @@ s = sub(s, '''    s_text_rows = TEXT_ROWS_DEF;
 
 # ---- pixel pages: allocate page 0 now and the others when SCREEN first
 # selects them (four 640x480 pages would be 5 MB; most programs use one)
+# A page that doesn't fit gives "Out of memory": a mode that doesn't fit
+# leaves the screen in text mode, a page that doesn't fit isn't selected.
+s = sub(s, '''void gfx_screen_tc(int w, int h) {''', '''extern "C" size_t heap_largest_free(void);
+BASIC_NS_BEGIN int basic_stderr(const char *fmt, ...); BASIC_NS_END
+static bool page_fits(int w, int h) {
+    return heap_largest_free() >= (size_t)w * (size_t)h * sizeof(Uint32) + 4096;
+}
+static void free_pages() {
+    for (int i = 0; i < GFX_MAX_PAGES; i++) std::vector<Uint32>().swap(s_pages[i]);
+}
+static void screen_out_of_memory() {
+    free_pages();
+    s_gfx_active = false;
+    s_gfx_w = s_gfx_h = 0;
+    s_apage = s_vpage = 0;
+    s_text_cols = TEXT_COLS_DEF; s_text_rows = TEXT_ROWS_DEF;
+    layout();
+    s_needs_render = true;
+    BASIC_NS::basic_stderr("Out of memory\\n");
+}
+
+void gfx_screen_tc(int w, int h) {''')
 s = sub(s, '''        // Allocate all pages
         for (int i = 0; i < GFX_MAX_PAGES; i++)
-            s_pages[i].assign((size_t)(gw * gh), color_to_pixel(0));''', '''        // Page 0 now; the others when first selected (below)
-        s_pages[0].assign((size_t)(gw * gh), color_to_pixel(0));
-        for (int i = 1; i < GFX_MAX_PAGES; i++) std::vector<Uint32>().swap(s_pages[i]);''')
+            s_pages[i].assign((size_t)(gw * gh), color_to_pixel(0));''', '''        // Page 0 now; the others when first selected (below). The old
+        // pages go first, so the new one can have their memory.
+        free_pages();
+        if (!page_fits(gw, gh)) { screen_out_of_memory(); return; }
+        s_pages[0].assign((size_t)(gw * gh), color_to_pixel(0));''')
 s = sub(s, '''    if (vpage >= 0 && vpage < GFX_MAX_PAGES) s_vpage = vpage;
 ''', '''    if (vpage >= 0 && vpage < GFX_MAX_PAGES) s_vpage = vpage;
-    for (int pg : {s_apage, s_vpage})
-        if (s_pages[pg].size() != (size_t)(gw * gh)) s_pages[pg].assign((size_t)(gw * gh), color_to_pixel(0));
+    for (int *pg : {&s_apage, &s_vpage}) {
+        if (s_pages[*pg].size() == (size_t)(gw * gh)) continue;
+        if (page_fits(gw, gh)) s_pages[*pg].assign((size_t)(gw * gh), color_to_pixel(0));
+        else { *pg = 0; BASIC_NS::basic_stderr("Out of memory\\n"); }
+    }
 ''')
 s = sub(s, '''    for (int i = 0; i < GFX_MAX_PAGES; i++) s_pages[i].assign((size_t)(w * h), 0xFF000000u);''',
-           '''    s_pages[0].assign((size_t)(w * h), 0xFF000000u);
-    for (int i = 1; i < GFX_MAX_PAGES; i++) std::vector<Uint32>().swap(s_pages[i]);
+           '''    free_pages();
+    if (!page_fits(w, h)) { s_truecolor = false; screen_out_of_memory(); return; }
+    s_pages[0].assign((size_t)(w * h), 0xFF000000u);
     s_apage = s_vpage = 0;''')
 
 s = sub(s, '''        for (int i = 0; i < GFX_MAX_PAGES; i++) s_pages[i].clear();''',

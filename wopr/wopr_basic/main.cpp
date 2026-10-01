@@ -138,10 +138,35 @@ static void print_stacktrace(void) {
     }
 }
 
-void run_from(int start_pc) {
+/* A line typed without a number runs as temporary program lines appended
+ * after the program (linenum IMMEDIATE_LINE, which no GOTO can name), so
+ * FOR/NEXT, WHILE/WEND and GOSUB work on it as they do in a program. A
+ * GOTO from it into the program runs until the program ends, not on into
+ * the typed line. */
+#define IMMEDIATE_LINE (-1)
+static int   g_imm_base = -1;     /* index of the typed line's first segment */
+static char *g_imm_text = NULL;   /* its text: still there unless the program was replaced */
+
+static int imm_lines_present(void) {
+    return g_imm_base >= 0 && g_imm_base < g_nlines &&
+           g_lines[g_imm_base].linenum == IMMEDIATE_LINE &&
+           g_lines[g_imm_base].text == g_imm_text;
+}
+
+/* Stop when the program falls (or jumps) from its own lines into the typed ones. */
+static int ran_into_immediate(int old_pc, int pc) {
+    /* Off the end of the program lands on the typed line's first segment; a
+     * RETURN to it (GOSUB from the typed line) lands after a GOSUB in it. */
+    return old_pc < g_imm_base && pc == g_imm_base && imm_lines_present();
+}
+
+static void run_lines(int start_pc, int fresh);
+void run_from(int start_pc) { run_lines(start_pc, 1); }
+
+static void run_lines(int start_pc, int fresh) {
     g_break = 0;
     Interp ip = { .pc = start_pc, .running = 1 };
-    sound_init();
+    if (fresh) sound_init();
 
 
 #ifdef USE_SDL_WINDOW
@@ -176,10 +201,15 @@ void run_from(int start_pc) {
                 g_error_resume_pc = old_pc;
                 cmd_goto(&ip, g_error_handler);
                 jumped = 1;
+            } else if (ip.pc == old_pc) {
+                /* No ON ERROR: stop here rather than retry the statement forever. */
+                g_cont_pc = -1;
+                break;
             }
         } else if (!jumped) {
             ip.pc = old_pc + 1;
         }
+        if (g_imm_base >= 0 && ran_into_immediate(old_pc, ip.pc)) break;
     }
 
     // Final frame
@@ -203,10 +233,15 @@ void run_from(int start_pc) {
                 g_error_resume_pc = old_pc;
                 cmd_goto(&ip, g_error_handler);
                 jumped = 1;
+            } else if (ip.pc == old_pc) {
+                /* No ON ERROR: stop here rather than retry the statement forever. */
+                g_cont_pc = -1;
+                break;
             }
         } else if (!jumped) {
             ip.pc = old_pc + 1;
         }
+        if (g_imm_base >= 0 && ran_into_immediate(old_pc, ip.pc)) break;
     }
 #endif
 
@@ -477,22 +512,7 @@ return 0;
             for (int i = 0; i < g_nvar; i++) {
                 Var *v = &g_vars[i];
                 if (v->kind == VAR_STR && v->str) { free(v->str); v->str = nullptr; }
-                else if (v->kind == VAR_ARRAY_NUM) {
-                    /* Arrays are now static in Var struct, just clear the mpf_t values */
-                    int size = 0;
-                    if (v->ndim == 1) size = v->dim[0];
-                    else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-                    else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-                    for (int j = 0; j < size; j++) mpf_clear(v->arr_num[j]);
-                }
-                else if (v->kind == VAR_ARRAY_STR) {
-                    /* Arrays are now static, just free the individual string elements */
-                    int size = 0;
-                    if (v->ndim == 1) size = v->dim[0];
-                    else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-                    else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-                    for (int j = 0; j < size; j++) if (v->arr_str[j]) { free(v->arr_str[j]); v->arr_str[j] = nullptr; }
-                }
+                var_free_arrays(v);
                 mpf_clear(v->num);
             }
             g_nvar = 0; g_ctrl_top = 0; g_data_pos = 0;
@@ -685,15 +705,43 @@ return 0;
             suppress_ok = 1; continue;  /* no Ok prompt */
 
         } else {
-            /* Immediate execution (every statement of "COLOR 14, 1: CLS") */
-            Interp ip = { .pc=0, .running=1 };
+            /* Immediate execution: every statement of "COLOR 14, 1: CLS" or
+             * "FOR I=1 TO 10: PRINT I: NEXT", run like a program line. */
             extern jmp_buf g_parse_error_jmp;
             extern int g_parse_error_active;
+            char *segs[256];
+            int nseg = typed_line_segments(p, segs, 256);
+            if (nseg == 0) continue;
+            if (g_nlines + nseg > MAX_LINES) { display_print("Out of memory\n"); continue; }
+            int base = g_nlines;
+            for (int k = 0; k < nseg; k++) {
+                g_lines[base+k].linenum = IMMEDIATE_LINE;
+                g_lines[base+k].text = bstrdup(segs[k]);
+            }
+            g_nlines += nseg;
+            g_imm_base = base;
+            g_imm_text = g_lines[base].text;
+            int ctrl_top = g_ctrl_top;
             g_parse_error_active = 1;
             if (setjmp(g_parse_error_jmp) == 0) {
-                dispatch_multi(&ip, p);
+                run_lines(base, 0);
             }
             g_parse_error_active = 0;
+            if (imm_lines_present()) {
+                /* Take the typed line back out (keeping any lines it added, as
+                 * MERGE does), and anything that points into it: CONT after a
+                 * break in it, loops and GOSUBs left open in it. */
+                int w = base;
+                for (int k = base; k < g_nlines; k++) {
+                    if (g_lines[k].linenum == IMMEDIATE_LINE) free(g_lines[k].text);
+                    else g_lines[w++] = g_lines[k];
+                }
+                g_nlines = w;
+                if (g_cont_pc >= base) g_cont_pc = -1;
+                while (g_ctrl_top > ctrl_top && g_ctrl[g_ctrl_top-1].line_idx >= base) g_ctrl_top--;
+            }
+            g_imm_base = -1;
+            g_imm_text = NULL;
             continue;
         }
     }

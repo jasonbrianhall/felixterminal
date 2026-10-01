@@ -39,11 +39,16 @@ survives a reboot.
 | | `ARCH=x86_64` (default) | `ARCH=i386` |
 |---|---|---|
 | CPU | any 64-bit PC | 386 or later, **with a 387** (or a 486DX) |
-| RAM | 32 MB | 8 MB |
+| RAM | 6 MB (7 MB for 640x480 graphics) | 4 MB (5 MB for 640x480 graphics) |
 | Screen | 640x480, else larger | 640x480 at 8 bits (a 512 KB VESA card), else larger |
 | Sound | HD Audio or AC97, else PC speaker | PC speaker (or AC97/HD Audio on a PCI machine) |
 | Keyboard | PS/2 and USB | PS/2 |
-| Limits | 256 variables, 4096-element arrays | 200 variables, 1024-element arrays |
+| Limits | 1024 variables, arrays up to 65536 elements | 512 variables, arrays up to 32768 elements |
+
+Arrays take memory when they're `DIM`med, as much as they need, and so do
+graphics pages when a `SCREEN` mode uses them; when there isn't enough, BASIC
+says `Out of memory` and carries on (a mode that doesn't fit leaves the screen
+in text mode).
 
 BASIC numbers are doubles, so a 386 needs its math coprocessor; without one
 the machine says so. The video card needs a VESA BIOS with a linear

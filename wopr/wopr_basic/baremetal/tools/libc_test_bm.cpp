@@ -25,6 +25,7 @@ bool storage_write_protected() { return false; }
 bool storage_disk_write_protected() { return false; }
 const char* storage_cwd() { return "/"; }
 void storage_set_cwd(const char*) {}
+extern "C" void exit(int code) noexcept { __asm__ volatile("syscall" :: "a"(60), "D"(code)); __builtin_unreachable(); }
 extern "C" void start_c() {
     char b[512];
 #define X(f, v) snprintf(b, sizeof b, f, v); wr(f); wr("\t"); wr(b); wr("\n");

@@ -553,17 +553,7 @@ static int cmd_erase(Interp *ip, char *args) {
         p = sk(read_varname(p, name));
         Var *v = var_find(name);
         if (v) {
-            if (v->kind == VAR_ARRAY_NUM) {
-                /* Arrays are now static in Var struct, just clear the mpf_t values */
-                int total = v->dim[0] * (v->ndim == 2 ? v->dim[1] : 1);
-                for (int i = 0; i < total; i++) mpf_clear(v->arr_num[i]);
-            } else if (v->kind == VAR_ARRAY_STR) {
-                /* Arrays are now static, just free the individual string elements */
-                int total = v->dim[0] * (v->ndim == 2 ? v->dim[1] : 1);
-                for (int i = 0; i < total; i++) {
-                    if (v->arr_str[i]) { free(v->arr_str[i]); v->arr_str[i] = NULL; }
-                }
-            }
+            var_free_arrays(v);
             v->kind = var_is_str_name(name) ? VAR_STR : VAR_NUM;
             v->ndim = 0;
         }
@@ -740,6 +730,7 @@ static int cmd_locate(Interp *ip, char *args) {
 /* Forward declarations for commands used before their definition */
 static int cmd_dim(Interp *ip, char *args);
 static int cmd_return(Interp *ip, char *args);
+static void byref_return(int fi);
 static char *parse_field_varname(char *p, char *out);
 static int eval_one_cmp(char **pp);
 
@@ -1114,6 +1105,7 @@ static int cmd_exit(Interp *ip, char *args) {
         /* unwind to the nearest GOSUB return frame */
         for (int fi = g_ctrl_top - 1; fi >= 0; fi--) {
             if (strcmp(g_ctrl[fi].varname, "\x01" "GOSUB") == 0) {
+                byref_return(fi);
                 ip->pc = g_ctrl[fi].line_idx;
                 mpf_clear(g_ctrl[fi].limit); mpf_clear(g_ctrl[fi].step);
                 g_ctrl_top = fi;
@@ -1401,7 +1393,82 @@ static int cmd_end_sub(Interp *ip, char *args) {
 /* ================================================================
  * CALL subname [args]  for now, treat as GOSUB to label
  * ================================================================ */
-static int cmd_call(Interp *ip, char *args) {
+/* SUB arguments are passed by reference, as in QBasic: a variable given
+ * as an argument gets the parameter's value back when the SUB returns, and
+ * an array passed as A() is the parameter array while the SUB runs (its
+ * storage moves to the parameter and back). Each entry belongs to the
+ * call's frame on the control stack. */
+typedef struct {
+    int  frame;
+    int  is_array;
+    char param[MAX_VARNAME];
+    char caller[MAX_VARNAME];
+} ByRef;
+#define MAX_BYREF 256
+static ByRef g_byref[MAX_BYREF];
+static int   g_nbyref;
+
+static void array_move(Var *to, Var *from) {
+    var_free_arrays(to);
+    to->kind = from->kind;
+    memcpy(to->dim, from->dim, sizeof to->dim);
+    to->ndim = from->ndim;
+    to->arr_len = from->arr_len; to->arr_num = from->arr_num; to->arr_str = from->arr_str;
+    from->arr_len = 0; from->arr_num = NULL; from->arr_str = NULL;
+}
+
+/* The SUB whose frame is `fi` returns: hand back what it was given. */
+static void byref_return(int fi) {
+    while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= fi) {
+        ByRef *b = &g_byref[--g_nbyref];
+        if (b->frame != fi) continue;          /* a frame unwound without returning */
+        Var *pv = var_find(b->param);
+        if (!pv) continue;
+        if (b->is_array) {
+            if (pv->kind != VAR_ARRAY_NUM && pv->kind != VAR_ARRAY_STR) continue;
+            Var *cv = var_get(b->caller);
+            array_move(cv, pv);
+            pv->kind = VAR_NUM; pv->ndim = 0;
+        } else {
+            Var *cv = var_get(b->caller);
+            if (var_is_str_name(b->caller)) {
+                const char *val = (pv->kind == VAR_STR && pv->str) ? pv->str : "";
+                char *dup = str_dup(val);
+                if (cv->kind == VAR_STR) free(cv->str);
+                cv->kind = VAR_STR; cv->str = dup;
+            } else if (pv->kind == VAR_NUM) {
+                mpf_set(cv->num, pv->num);
+            }
+        }
+    }
+}
+
+/* The argument at cs, if it's a plain variable (or ARRAY()): its name. */
+static int byref_arg(char *cs, char *name, int *is_array) {
+    int n = 0;
+    char *q = cs;
+    if (!isalpha((unsigned char)*q)) return 0;
+    while ((isalnum((unsigned char)*q) || *q == '_' || *q == '.') && n < MAX_VARNAME - 2) name[n++] = *q++;
+    if (*q == '$' || *q == '!' || *q == '#' || *q == '%' || *q == '&') name[n++] = *q++;
+    name[n] = '\0';
+    q = sk(q);
+    *is_array = 0;
+    if (*q == '(') {
+        char *inner = sk(q + 1);
+        if (*inner != ')') return 0;           /* A(3): an element, by value */
+        *is_array = 1;
+        q = sk(inner + 1);
+    }
+    if (*q && *q != ',' && *q != ')') return 0;   /* an expression */
+    return 1;
+}
+
+static int call_sub(Interp *ip, char *args, int bare);
+static int cmd_call(Interp *ip, char *args) { return call_sub(ip, args, 0); }
+
+/* CALL Name(args), or bare Name args. Bare, "Name (X)" passes X by value,
+ * as QBasic does: the parentheses make it an expression. */
+static int call_sub(Interp *ip, char *args, int bare) {
     char *p = sk(args);
     char name[MAX_VARNAME]; int i = 0;
     while ((isalnum((unsigned char)*p) || *p == '_') && i < MAX_VARNAME - 1)
@@ -1410,7 +1477,7 @@ static int cmd_call(Interp *ip, char *args) {
 
     /* p now points past the name  skip optional parens/spaces to call-site args */
     p = sk(p);
-    if (*p == '(') p = sk(p + 1);
+    if (*p == '(' && !bare) p = sk(p + 1);
 
     /* Find the SUB definition line so we can read its parameter names.
      * The label points at the "SUB name ..." line itself. */
@@ -1427,6 +1494,11 @@ static int cmd_call(Interp *ip, char *args) {
         if (*sp == '(') sp = sk(sp + 1);
         param_src = sp;
     }
+
+    /* Entries for frames that were unwound without a return are stale. */
+    while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= g_ctrl_top) g_nbyref--;
+    int frame = g_ctrl_top;           /* the frame cmd_gosub pushes below */
+    int nbyref0 = g_nbyref;
 
     /* Walk call-site args and sub param names in parallel, assigning values */
     if (param_src && *param_src && *param_src != ')') {
@@ -1455,21 +1527,40 @@ static int cmd_call(Interp *ip, char *args) {
             cs = sk(cs);
             if (!*cs || *cs == ')') break;
 
-            /* Array passed by reference: "ArrName()"  skip it, all vars are global */
-            {
+            /* A variable argument is passed by reference (see ByRef). */
+            char aname[MAX_VARNAME]; int is_arr = 0;
+            int by_ref = byref_arg(cs, aname, &is_arr) && strcasecmp(aname, pname) != 0 &&
+                         g_nbyref < MAX_BYREF;
+            if (is_arr) {
+                /* "ArrName()": the parameter array is the caller's array */
                 char *look = cs;
-                while (isalnum((unsigned char)*look) || *look == '_') look++;
-                look = sk(look);
-                if (*look == '(') {
-                    char *inner = sk(look + 1);
-                    if (*inner == ')') {
-                        /* bare "()"  array ref, skip the whole token */
-                        cs = sk(inner + 1);
-                        if (*cs == ',') cs = sk(cs + 1);
-                        if (*ps == ',') ps = sk(ps + 1);
-                        continue;
+                while (*look && *look != ')') look++;
+                cs = sk(look + 1);
+                if (by_ref) {
+                    Var *cv = var_find(aname);
+                    Var *pv0 = var_find(pname);
+                    int c_arr = cv && (cv->kind == VAR_ARRAY_NUM || cv->kind == VAR_ARRAY_STR);
+                    int p_arr = pv0 && (pv0->kind == VAR_ARRAY_NUM || pv0->kind == VAR_ARRAY_STR);
+                    /* The caller's array, or (not dimensioned yet) the one the SUB DIMs */
+                    if (c_arr || !p_arr) {
+                        Var *pv = var_get(pname);
+                        if (pv->kind == VAR_STR) { free(pv->str); pv->str = NULL; }
+                        if (c_arr) array_move(pv, cv);
+                        ByRef *b = &g_byref[g_nbyref++];
+                        b->frame = frame; b->is_array = 1;
+                        strncpy(b->param, pname, MAX_VARNAME - 1); b->param[MAX_VARNAME-1] = 0;
+                        strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0;
                     }
                 }
+                if (*cs == ',') cs = sk(cs + 1);
+                if (*ps == ',') ps = sk(ps + 1);
+                continue;
+            }
+            if (by_ref) {
+                ByRef *b = &g_byref[g_nbyref++];
+                b->frame = frame; b->is_array = 0;
+                strncpy(b->param, pname, MAX_VARNAME - 1); b->param[MAX_VARNAME-1] = 0;
+                strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0;
             }
 
             if (var_is_str_name(pname)) {
@@ -1494,8 +1585,10 @@ static int cmd_call(Interp *ip, char *args) {
         }
     }
 
-    if (find_line_by_label(name) < 0) return 0;
-    return cmd_gosub(ip, name);
+    if (find_line_by_label(name) < 0) { byref_return(frame); g_nbyref = nbyref0; return 0; }
+    int r = cmd_gosub(ip, name);
+    if (r < 0) byref_return(frame);      /* the call didn't happen: give it all back */
+    return r;
 }
 
 /* ================================================================
@@ -1594,23 +1687,13 @@ static int cmd_dim(Interp *ip, char *args) {
             if (dim2 < 1) dim2 = 1;
             int total = dim1 * dim2;
             if (total > MAX_ARRAY_SIZE) { basic_stderr("Array too large: %d\n", total); total = MAX_ARRAY_SIZE; }
-            if (var_is_str_name(name)) {
-                v->kind = VAR_ARRAY_STR; v->dim[0] = dim1; v->dim[1] = dim2; v->ndim = ndim;
-                /* Use static array from Var struct instead of calloc */
-                /* Initialize all string pointers to empty strings */
-                for (int i = 0; i < total; i++) {
-                    if (v->arr_str[i]) free(v->arr_str[i]);
-                    v->arr_str[i] = str_dup("");
-                }
-            } else {
-                v->kind = VAR_ARRAY_NUM; v->dim[0] = dim1; v->dim[1] = dim2; v->ndim = ndim;
-                /* Use static array from Var struct instead of calloc */
-                for (int i = 0; i < total; i++) { 
-                    mpf_clear(v->arr_num[i]);
-                    mpf_init2(v->arr_num[i], g_prec); 
-                    mpf_set_ui(v->arr_num[i], 0); 
-                }
-            }
+            int is_str = var_is_str_name(name);
+            /* A plain variable of the same name becomes the array. */
+            if (v->kind == VAR_STR && v->str) { free(v->str); v->str = NULL; }
+            v->kind = is_str ? VAR_ARRAY_STR : VAR_ARRAY_NUM;
+            v->dim[0] = dim1; v->dim[1] = dim2; v->ndim = ndim;
+            if (!var_alloc_array(v, total, is_str))
+                basic_stderr("Out of memory for array %s(%d)\n", name, total);
         }
         p = sk(p);
         /* skip optional AS typename  e.g. "AS INTEGER", "AS PlayerData" */
@@ -2114,8 +2197,10 @@ static int cmd_get_graphics(Interp *ip, char *args) {
     /* Get unique sprite ID for this array variable */
     int id = sprite_id_for(v);
     
+#ifdef BASIC_DEBUG_GFX
     basic_stderr("GET: var='%s' id=%d coords=(%d,%d)-(%d,%d)\n", 
                  vname, id, (int)x1, (int)y1, (int)x2, (int)y2);
+#endif
     
 #ifdef USE_SDL_WINDOW
     /* CRITICAL: Flush any pending SDL render so pixel buffer is current */
@@ -2123,7 +2208,9 @@ static int cmd_get_graphics(Interp *ip, char *args) {
     
     /* Now capture sprite into the registry under this ID */
     gfx_get(id, (int)x1, (int)y1, (int)x2, (int)y2);
+#ifdef BASIC_DEBUG_GFX
     basic_stderr("  -> gfx_get() called for sprite id=%d\n", id);
+#endif
 #else
     /* OSC 666 path */
     felix_drawf("get;%d;%d;%d;%d;%d", id,
@@ -2153,8 +2240,10 @@ static int cmd_put_graphics(Interp *ip, char *args) {
 
 #ifdef USE_SDL_WINDOW
     gfx_put(id, (int)x, (int)y, xor_mode);
+#ifdef BASIC_DEBUG_GFX
     basic_stderr("PUT: %s (id=%d) at (%d,%d), xor=%d\n", 
                  vname, id, (int)x, (int)y, xor_mode);
+#endif
 #else
     /* OSC path */
     felix_drawf("put;%d;%d;%d;%s", id, (int)x, (int)y, mode);
@@ -2437,6 +2526,7 @@ static int cmd_next(Interp *ip, char *args) {
             if (strcasecmp(g_ctrl[fi].varname, vname) == 0) break;
         if (fi < 0) { basic_stderr("NEXT without FOR: %s\n", vname); return -1 ; }
     }
+    if (fi < 0) { basic_stderr("NEXT without FOR\n"); return -1; }
     CtrlFrame *f = &g_ctrl[fi];
     Var *cv = var_get(f->varname);
     mpf_add(cv->num, cv->num, f->step);
@@ -2505,6 +2595,7 @@ static int cmd_return(Interp *ip, char *args) {
     (void)args;
     for (int fi = g_ctrl_top - 1; fi >= 0; fi--) {
         if (strcmp(g_ctrl[fi].varname, "\x01" "GOSUB") == 0) {
+            byref_return(fi);
             ip->pc = g_ctrl[fi].line_idx;
             mpf_clear(g_ctrl[fi].limit); mpf_clear(g_ctrl[fi].step);
             g_ctrl_top = fi; return 1;
@@ -3142,6 +3233,13 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
             if (*peek == '.') return cmd_let(ip, p);
             /* array assignment: arr(i) = ... */
             if (*peek == '=') return cmd_let(ip, p);
+            /* Name (X): a SUB called with a parenthesized argument */
+            {
+                int si = find_line_by_label(name);
+                if (si >= 0 && strncasecmp(sk(g_lines[si].text), "SUB", 3) == 0 &&
+                    !isalnum((unsigned char)sk(g_lines[si].text)[3]))
+                    return call_sub(ip, p, 1);
+            }
             /* No '='  treat as a bare numeric expression and print the result.
              * Handles: tan(5), sin(3.14), sqr(2), (3+4)*2, etc. */
             {
@@ -3159,7 +3257,7 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
             }
         }
         /* Bare sub call without CALL keyword */
-        return cmd_call(ip, p);
+        return call_sub(ip, p, 1);
     }
 
     /* Bare numeric expression starting with unary sign, digit, or paren */
