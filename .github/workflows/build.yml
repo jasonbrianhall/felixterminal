@@ -13,6 +13,10 @@ on:
       - 'vcpkg.json'
       - '**.yml'
       - '**.yaml'
+      - '**.hpp'
+      - '**.S'
+      - 'wopr/wopr_basic/baremetal/**'
+      - 'wopr/wopr_basic/test/**'
   pull_request:
     branches: [ main, dev ]
     paths:
@@ -25,6 +29,10 @@ on:
       - 'vcpkg.json'
       - '**.yml'
       - '**.yaml'
+      - '**.hpp'
+      - '**.S'
+      - 'wopr/wopr_basic/baremetal/**'
+      - 'wopr/wopr_basic/test/**'
   workflow_dispatch:
 
 env:
@@ -202,6 +210,44 @@ jobs:
       with:
         name: felix-terminal-debug-x64
         path: FelixTerminal-Debug-x64.zip
+        retention-days: 7
+
+  build-baremetal-i386:
+    # Felix BASIC on bare metal: boots straight into BASIC on a 386 (with a
+    # 387) or later, 4 MB of RAM. The floppy image keeps programs on the disk;
+    # the ISO (CD / USB stick) uses a RAM disk.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential g++-multilib python3 \
+          grub-pc-bin grub-common mtools dosfstools xorriso
+
+    - name: Build (i386 floppy + ISO)
+      working-directory: wopr/wopr_basic/baremetal
+      run: |
+        make ARCH=i386 floppy iso -j"$(nproc)"
+
+    - name: Check the Filesystem Code
+      working-directory: wopr/wopr_basic/baremetal
+      run: |
+        bash tools/fat12_test.sh
+
+    - name: Prepare Artifacts
+      run: |
+        mkdir -p dist
+        cp wopr/wopr_basic/baremetal/felixbasic-i386-floppy.img dist/FelixBASIC-i386-floppy.img
+        cp wopr/wopr_basic/baremetal/felixbasic-i386.iso dist/FelixBASIC-i386.iso
+        ls -l dist
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: felix-basic-i386
+        path: dist/*
         retention-days: 7
 
   build-msi-windows:
@@ -573,7 +619,7 @@ jobs:
         retention-days: 7
 
   create-release:
-    needs: [build-windows, build-msi-windows, build-msix-windows, build-debug-standalone]
+    needs: [build-windows, build-msi-windows, build-msix-windows, build-debug-standalone, build-baremetal-i386]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -606,6 +652,12 @@ jobs:
         name: felix-terminal-debug-x64
         path: release
 
+    - name: Download Bare-Metal BASIC Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: felix-basic-i386
+        path: release
+
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
@@ -616,6 +668,8 @@ jobs:
           release/FelixTerminal-Portable-x64.zip
           release/FelixTerminal-Portable-arm64.zip
           release/FelixTerminal-Debug-x64.zip
+          release/FelixBASIC-i386-floppy.img
+          release/FelixBASIC-i386.iso
         tag_name: ${{ github.ref == 'refs/heads/main' && format('v{0}', github.run_number) || format('dev-v{0}', github.run_number) }}
         name: ${{ github.ref == 'refs/heads/main' && format('Release v{0}', github.run_number) || format('Dev Build v{0}', github.run_number) }}
         draft: false
@@ -635,6 +689,8 @@ jobs:
           - **FelixTerminal.msi** — Windows installer (x64 only) with Start Menu and optional desktop shortcuts
           - **FelixTerminal-x64.msix** / **FelixTerminal-arm64.msix** — Unsigned packages ready for Microsoft Store submission
           - **FelixTerminal-Portable-x64.zip** / **FelixTerminal-Portable-arm64.zip** — Portable versions, no installation required
+          - **FelixBASIC-i386-floppy.img** — Bare-metal Felix BASIC: a bootable 1.44 MB floppy that boots straight into BASIC on a 386 (with a 387) or later, 4 MB of RAM; programs are saved on the floppy. Write it with `dd if=FelixBASIC-i386-floppy.img of=/dev/fd0`, or try it with `qemu-system-i386 -m 8 -drive file=FelixBASIC-i386-floppy.img,if=floppy,format=raw -boot a`
+          - **FelixBASIC-i386.iso** — The same for CD or USB stick (files go to a RAM disk)
 
           ### ✨ Installer Features (MSI)
           - ✅ Start Menu shortcuts for cmd.exe and PowerShell
