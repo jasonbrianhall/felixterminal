@@ -43,9 +43,10 @@ LDEMU    :=
 GFXMODE  := 640x480x32,640x480x16,640x480x8,800x600x32,1024x768x32,auto
 FBDEFS   := -DFB_W=640 -DFB_H=480 -DFB_BPP=32
 ARCHFLAGS := -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -msse2
-# Every variable carries its own array slots (../basic.h): 1024 x 4096 is
-# 64 MB. The desktop build's 16384 x 4096 would be a gigabyte.
-LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=4096 -DCTRL_STACK_MAX=4096 -DMAX_VARNAME=256
+# Every variable carries its own array slots (../basic.h): 256 x 4096 is
+# 16 MB, so BASIC runs in 32 MB. (The desktop build's 16384 x 4096 would
+# be a gigabyte.)
+LIMITS   := -DMAX_VARS=256 -DMAX_ARRAY_SIZE=4096 -DCTRL_STACK_MAX=4096 -DMAX_VARNAME=256
 else ifeq ($(ARCH),i386)
 MFLAG    := -m32
 SUFFIX   := -i386
@@ -108,13 +109,19 @@ $(addprefix $(BUILD)/,$(addsuffix .o,$(IRQ_OBJS))): $(BUILD)/%.o: %.cpp $(HDRS)
 	@mkdir -p $(BUILD)
 	$(CXX) $(IRQFLAGS) -c $< -o $@
 
-$(BUILD)/sound_bm.o: sound_bm.cpp $(HDRS) $(CORE_HDRS)
+$(BUILD)/sound_bm.o: sound_bm.cpp $(HDRS) $(CORE_HDRS) $(BUILD)/limits
 	@mkdir -p $(BUILD)
 	$(CXX) $(CORE_FLAGS) -c $< -o $@
 
-$(BUILD)/kernel.o: kernel.cpp $(HDRS) $(CORE_HDRS)
+$(BUILD)/kernel.o: kernel.cpp $(HDRS) $(CORE_HDRS) $(BUILD)/limits
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) -DUSE_SDL_WINDOW -c $< -o $@
+	$(CXX) $(CXXFLAGS) -DUSE_SDL_WINDOW -DDONTUSEGMP $(LIMITS) -w -c $< -o $@
+
+# Rebuild everything that depends on the limits when they change.
+$(BUILD)/limits: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(LIMITS)' | cmp -s - $@ || echo '$(LIMITS)' > $@
+FORCE:
 
 $(BUILD)/%.o: %.cpp $(HDRS)
 	@mkdir -p $(BUILD)
@@ -125,10 +132,10 @@ $(BUILD)/basic_gfx_bm.cpp: $(SRC)/basic_gfx_sdl.cpp tools/make_gfx_bm.py
 	@mkdir -p $(BUILD)
 	python3 tools/make_gfx_bm.py $< $@
 
-$(BUILD)/basic_gfx_bm.o: $(BUILD)/basic_gfx_bm.cpp $(HDRS) $(CORE_HDRS)
+$(BUILD)/basic_gfx_bm.o: $(BUILD)/basic_gfx_bm.cpp $(HDRS) $(CORE_HDRS) $(BUILD)/limits
 	$(CXX) $(CORE_FLAGS) -c $< -o $@
 
-$(BUILD)/core/%.o: $(SRC)/%.cpp $(CORE_HDRS) overrides/SDL2/SDL.h
+$(BUILD)/core/%.o: $(SRC)/%.cpp $(CORE_HDRS) overrides/SDL2/SDL.h $(BUILD)/limits
 	@mkdir -p $(BUILD)/core
 	$(CXX) $(CORE_FLAGS) -c $< -o $@
 
@@ -177,7 +184,8 @@ $(FLOPPY): $(KERNEL) $(BUILD)/grub.cfg $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
 	@echo "$@: GRUB $$(( $$(stat -c %s $(BUILD)/core.img) / 1024 )) KB + kernel $$(( $$(stat -c %s $(BUILD)/kernel.gz) / 1024 )) KB (gzipped) + programs; $$(( $$(mdir -i $@ :: | sed -n 's/ *\([0-9 ]*\) bytes free/\1/p' | tr -d ' ') / 1024 )) KB free"
 
 # ---------------------------------------------------------------- QEMU
-# SOUND=speaker (default: the PC speaker, as BASIC had), hda, ac97 or none.
+# SOUND=hda (default for x86_64), ac97, speaker (default for i386: a 386
+# had no PCI sound card) or none. The kernel uses whichever it finds.
 AUDIODEV ?= $(if $(filter Darwin,$(shell uname)),coreaudio,pa)
 comma := ,
 QAUDIO_OPTS ?= timer-period=2000,out.buffer-length=10000$(if $(filter pa,$(AUDIODEV)),$(comma)out.latency=5000)
@@ -185,7 +193,7 @@ QSOUND_speaker := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -machine pcspk-au
 QSOUND_ac97    := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -device AC97,audiodev=snd0
 QSOUND_hda     := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -device intel-hda -device hda-output,audiodev=snd0
 QSOUND_none    :=
-SOUND    ?= speaker
+SOUND    ?= $(if $(filter i386,$(ARCH)),speaker,hda)
 KVM      ?= $(if $(wildcard /dev/kvm),-enable-kvm,)
 ifeq ($(ARCH),x86_64)
 QEMU     := qemu-system-x86_64 $(KVM) -m 256 -serial stdio $(QSOUND_$(SOUND))
@@ -212,4 +220,4 @@ clean:
 	rm -rf build felixbasic.elf felixbasic.iso felixbasic-floppy.img \
 	       felixbasic-i386.elf felixbasic-i386.iso felixbasic-i386-floppy.img
 
-.PHONY: all iso floppy floppies run run-iso run-floppy clean
+.PHONY: all iso floppy floppies run run-iso run-floppy clean FORCE

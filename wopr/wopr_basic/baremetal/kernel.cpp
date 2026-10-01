@@ -25,7 +25,7 @@
 #include <SDL2/SDL.h>
 
 int main(int argc, char** argv);                       // ../main.cpp: the interpreter
-namespace StandaloneBasic { extern volatile int g_break; }
+#include "basic.h"                                     // sizeof(Var), for the memory check
 
 // ---------------------------------------------------------------- serial
 #define COM1 0x3F8
@@ -516,10 +516,24 @@ extern "C" void kmain() {
     // The heap before the constructors: the interpreter allocates its
     // variable and program tables in them.
     heap_init(&info);
-    for (auto f = __init_array_start; f != __init_array_end; f++) (*f)();
-
     if (!video_init(&info)) { printf("No usable framebuffer found\n"); return; }
     video_ready = true;
+    // The interpreter's constructors allocate its variable table (MAX_VARS
+    // variables, each with room for MAX_ARRAY_SIZE elements) and don't
+    // survive running out: check first, with room for the rest.
+#ifdef __x86_64__
+    size_t need = sizeof(StandaloneBasic::Var) * MAX_VARS + (6u << 20);   // + room for graphics pages
+#else
+    size_t need = sizeof(StandaloneBasic::Var) * MAX_VARS + (2u << 20);
+#endif
+    if (heap_free_bytes() < need) {
+        static char l2[96];
+        snprintf(l2, sizeof l2, "Felix BASIC needs %u MB of RAM; this PC has %u MB.",
+                 (unsigned)((need + (1u << 20) + (__kernel_end - __kernel_start)) >> 20) + 1,
+                 (unsigned)((heap_free_bytes() + (2u << 20)) >> 20));
+        halt_screen("NOT ENOUGH MEMORY", l2);
+    }
+    for (auto f = __init_array_start; f != __init_array_end; f++) (*f)();
 
 #ifndef __x86_64__
     if (!fpu_present)                                   // BASIC numbers are doubles

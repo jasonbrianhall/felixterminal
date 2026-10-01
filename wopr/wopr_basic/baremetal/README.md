@@ -39,11 +39,11 @@ survives a reboot.
 | | `ARCH=x86_64` (default) | `ARCH=i386` |
 |---|---|---|
 | CPU | any 64-bit PC | 386 or later, **with a 387** (or a 486DX) |
-| RAM | 128 MB | 8 MB |
+| RAM | 32 MB | 8 MB |
 | Screen | 640x480, else larger | 640x480 at 8 bits (a 512 KB VESA card), else larger |
 | Sound | HD Audio or AC97, else PC speaker | PC speaker (or AC97/HD Audio on a PCI machine) |
 | Keyboard | PS/2 and USB | PS/2 |
-| Limits | 1024 variables, 4096-element arrays | 200 variables, 1024-element arrays |
+| Limits | 256 variables, 4096-element arrays | 200 variables, 1024-element arrays |
 
 BASIC numbers are doubles, so a 386 needs its math coprocessor; without one
 the machine says so. The video card needs a VESA BIOS with a linear
