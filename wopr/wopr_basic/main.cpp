@@ -185,8 +185,9 @@ static void run_lines(int start_pc, int fresh) {
             // Pump SDL events
             if (!gfx_sdl_pump())
                 break;
-            // Render accumulated pixels
-            gfx_sdl_render();
+            // Render accumulated pixels (a program pacing itself with
+            // DELAY/SLEEP is shown at each pause instead)
+            if (!basic_paced()) gfx_sdl_render();
             last_frame = now;
         }
 

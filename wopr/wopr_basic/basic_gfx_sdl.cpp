@@ -1442,7 +1442,7 @@ int display_inkey(void) {
     // Only render every ~16ms (60 FPS) during INKEY polling
     if (now - s_last_inkey_render >= 16) {
         gfx_sdl_pump();
-        gfx_sdl_render();
+        if (!BASIC_NS::basic_paced()) gfx_sdl_render();
         s_last_inkey_render = now;
     }
     

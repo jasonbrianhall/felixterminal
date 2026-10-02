@@ -173,6 +173,7 @@ Var    *var_create(char *name);
 Var    *var_get(char *name);
 mpf_t  *arr_num_elem(Var *v, int i, int j);
 void    basic_frame_tick(void);       /* present the screen now and then */
+int     basic_paced(void);            /* the program is pacing itself with pauses */
 void    var_free_arrays(Var *v);      /* release an array's elements and storage */
 bool    var_alloc_array(Var *v, int total, int is_str);
 char  **arr_str_elem(Var *v, int i, int j);

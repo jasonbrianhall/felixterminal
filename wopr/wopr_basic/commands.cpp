@@ -592,6 +592,21 @@ static int cmd_system(Interp *ip, char *args) {
 /* Show what's been drawn and keep the window alive while a program waits
  * (DELAY, SLEEP, _LIMIT), so animation paced by them is seen frame by
  * frame. Ctrl+Break ends the wait. */
+#ifdef USE_SDL_WINDOW
+static Uint32 s_last_wait_ms;      /* when the program last paused */
+#endif
+
+/* True while the program paces itself with pauses: then the screen is shown
+ * at each pause, when a frame is complete, and not also at odd moments in
+ * between (half-drawn, say between erasing a sprite and drawing it again). */
+int basic_paced(void) {
+#ifdef USE_SDL_WINDOW
+    return s_last_wait_ms && SDL_GetTicks() - s_last_wait_ms < 250;
+#else
+    return 0;
+#endif
+}
+
 static void basic_wait(double secs) {
 #ifdef USE_SDL_WINDOW
     ::gfx_sdl_pump();
@@ -603,6 +618,8 @@ static void basic_wait(double secs) {
         SDL_Delay(left > 10 ? 10 : (Uint32)left);
         ::gfx_sdl_pump();
     }
+    s_last_wait_ms = SDL_GetTicks();
+    if (!s_last_wait_ms) s_last_wait_ms = 1;
 #elif defined(_WIN32)
     Sleep((DWORD)(secs * 1000));
 #else
@@ -621,7 +638,7 @@ void basic_frame_tick(void) {
     Uint32 now = SDL_GetTicks();
     if (now - last >= 16) {
         ::gfx_sdl_pump();
-        ::gfx_sdl_render();
+        if (!basic_paced()) ::gfx_sdl_render();
         last = now;
     }
 #endif
@@ -884,7 +901,7 @@ static int cmd_loop(Interp *ip, char *args) {
             if (last == 0 || now - last >= 16) {
                 mpf_set_ui(g_ctrl[fi].limit, (unsigned long)now);
                 ::gfx_sdl_pump();
-                ::gfx_sdl_render();
+                if (!basic_paced()) ::gfx_sdl_render();
             }
         }
 #endif
@@ -2670,7 +2687,7 @@ static int cmd_next(Interp *ip, char *args) {
                 s_for_total = 1000;
             }
             ::gfx_sdl_pump();
-            ::gfx_sdl_render();
+            if (!basic_paced()) ::gfx_sdl_render();
             /* At 1M iters/sec, 1000 iters should take 1ms */
             Uint32 target_ms = (Uint32)(s_for_total / 1000);
             Uint32 elapsed   = SDL_GetTicks() - s_for_t0;
