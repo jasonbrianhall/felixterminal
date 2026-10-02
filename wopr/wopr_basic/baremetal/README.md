@@ -41,7 +41,7 @@ survives a reboot.
 | CPU | any 64-bit PC | 386 or later, **with a 387** (or a 486DX) |
 | RAM | 6 MB (7 MB for 640x480 graphics) | 4 MB (5 MB for 640x480 graphics) |
 | Screen | the monitor's own resolution, else 1024x768 or smaller | 640x480 at 8 bits (a 512 KB VESA card), else larger |
-| Sound | HD Audio or AC97, else PC speaker | PC speaker (or AC97/HD Audio on a PCI machine) |
+| Sound | HD Audio, AC97 or a Sound Blaster, else PC speaker | a Sound Blaster (Pro 2.0 or later), else PC speaker (or AC97/HD Audio on a PCI machine) |
 | Keyboard | PS/2 and USB | PS/2 |
 | Limits | 1024 variables, arrays up to 65536 elements | 512 variables, arrays up to 32768 elements |
 
@@ -63,17 +63,19 @@ shows them), with the text grid over them; `CIRCLE` uses QBasic's aspect
 ratio, so circles stay round. The CP437 box-drawing, block and shade
 characters (`CHR$(176)`-`CHR$(223)`) are drawn too.
 
-`SOUND`, `BEEP` and `PLAY` go through the PC speaker, as on the original
-machines, or a PCI sound card when there is one; they play from the timer
-interrupt, so music keeps time however busy the program is.
+`SOUND`, `BEEP` and `PLAY` go through a sound card when there is one (HD
+Audio, AC97, or a Sound Blaster Pro 2.0 or later at port 220h, 8-bit DMA
+1), else the PC speaker, as on the original machines; they play from the
+timer interrupt, so music keeps time however busy the program is.
 
 Ctrl+C or Ctrl+Break stops a running program (`Break`); Shift+PgUp/PgDn
 scroll back through the text; Ctrl+Alt+Del reboots. `SYSTEM` asks whether
 to reboot.
 
 Boot options (on the `multiboot` line in `/boot/grub/grub.cfg`):
-`audio=speaker|hda|ac97|off`, `floppy=off`, `latency=MS` (sound card
-buffering).
+`audio=speaker|hda|ac97|sb|off`, `sb=220,1` (the Sound Blaster's port and
+8-bit DMA channel, as in `BLASTER=A220 D1`), `floppy=off`, `latency=MS`
+(sound card buffering).
 
 ## How it's put together
 

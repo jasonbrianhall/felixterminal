@@ -1,7 +1,9 @@
-// Audio output for the bare-metal build: Intel HD Audio and Intel AC'97.
-// Both play from the same looping DMA ring (16-bit stereo, 48 kHz). Each frame
-// the main loop hands us the game's mono samples and we write them a little
-// ahead of the hardware's play position. No interrupts are used.
+// Audio output for the bare-metal build: Intel HD Audio, Intel AC'97 and the
+// Sound Blaster (Pro 2.0 and later). HD Audio and AC'97 play from the same
+// looping DMA ring (16-bit stereo, 48 kHz); the Sound Blaster from its own
+// (8-bit mono, 22 kHz, ISA DMA). Each frame the main loop hands us the
+// game's mono samples and we write them a little ahead of the hardware's
+// play position. No interrupts are used.
 // (Driver shared with the Super Mario Bros. bare-metal build.)
 #include <stdint.h>
 #include <stddef.h>
@@ -286,6 +288,148 @@ static uint32_t hda_play_pos() {
     return (r32(sd + 0x04) / 4) % RING_FRAMES;       // link position in buffer
 }
 
+
+// ================================================================ Sound Blaster
+// The Sound Blaster Pro 2.0's DSP (version 3.xx; the SB16 and its clones
+// speak it too): 8-bit unsigned mono from an auto-initialising ISA DMA
+// ring on an 8-bit channel, the rate set by a time constant. The DSP's
+// interrupt is left masked at the PIC; the play position comes from the
+// DMA controller's count, as with the other cards.
+static uint16_t sb_base = 0x220;
+static int sb_dma = 1;
+static uint32_t sb_rate;                     // what the time constant gives
+#define SB_RING 16384                        // bytes (frames): 0.74 s at 22 kHz
+static uint8_t sb_ring[SB_RING] __attribute__((aligned(65536)));   // in one 64 KB DMA page
+static uint32_t sb_write;                    // next frame we will write
+static uint32_t sb_ahead;                    // desired latency in frames
+static uint32_t sb_phase;                    // 48 kHz -> sb_rate resampling
+static int32_t  sb_acc, sb_accn;
+
+static bool sb_wait_write() {
+    for (int i = 0; i < 20000; i++) if (!(inb(sb_base + 0xC) & 0x80)) return true;
+    return false;
+}
+static bool sb_wait_read() {
+    for (int i = 0; i < 20000; i++) if (inb(sb_base + 0xE) & 0x80) return true;
+    return false;
+}
+static void sb_out(uint8_t v) { if (sb_wait_write()) outb(sb_base + 0xC, v); }
+static int sb_in() { return sb_wait_read() ? inb(sb_base + 0xA) : -1; }
+
+static bool sb_reset() {
+    outb(sb_base + 0x6, 1);
+    io_delay(10);
+    outb(sb_base + 0x6, 0);
+    for (int i = 0; i < 100; i++) {
+        if ((inb(sb_base + 0xE) & 0x80) && inb(sb_base + 0xA) == 0xAA) return true;
+        io_delay(10);
+    }
+    return false;
+}
+
+// 8237 registers for 8-bit channels 0-3: address, count, page.
+static const uint8_t kDmaAddr[4] = {0x00, 0x02, 0x04, 0x06};
+static const uint8_t kDmaCount[4] = {0x01, 0x03, 0x05, 0x07};
+static const uint8_t kDmaPage[4] = {0x87, 0x83, 0x81, 0x82};
+
+static bool sb_init(const char* cmdline) {
+    // sb=220,1  (port, 8-bit DMA channel)
+    for (const char* p = cmdline; p && *p; p++)
+        if (!strncmp(p, "sb=", 3)) {
+            unsigned v = 0; const char* q = p + 3;
+            for (; (*q >= '0' && *q <= '9') || ((*q | 32) >= 'a' && (*q | 32) <= 'f'); q++)
+                v = v * 16 + (*q <= '9' ? *q - '0' : (*q | 32) - 'a' + 10);
+            if (v >= 0x200 && v <= 0x280) sb_base = (uint16_t)v;
+            if (*q == ',' && q[1] >= '0' && q[1] <= '3') sb_dma = q[1] - '0';
+        }
+    if (!sb_reset()) return false;
+    sb_out(0xE1);                                     // DSP version
+    int major = sb_in(), minor = sb_in();
+    if (major < 2) return false;                      // the SB 1.x has no auto-init DMA
+    uintptr_t phys = (uintptr_t)sb_ring;
+    if (phys + SB_RING > 0x1000000) return false;     // ISA DMA reaches the first 16 MB only
+
+    // Mixer (SB Pro and later): mono output, filter on, voice and master full.
+    if (major >= 3) {
+        outb(sb_base + 4, 0x0E); outb(sb_base + 5, 0x00);
+        outb(sb_base + 4, 0x04); outb(sb_base + 5, 0xFF);
+        outb(sb_base + 4, 0x22); outb(sb_base + 5, 0xFF);
+    }
+    memset(sb_ring, 0x80, sizeof sb_ring);            // silence is 128
+
+    // DMA: single mode, auto-init, memory to device, over the whole ring.
+    int ch = sb_dma;
+    outb(0x0A, 0x04 | ch);                            // mask the channel
+    outb(0x0C, 0);                                    // clear the byte flip-flop
+    outb(0x0B, 0x58 | ch);
+    outb(kDmaAddr[ch], phys & 0xFF);
+    outb(kDmaAddr[ch], (phys >> 8) & 0xFF);
+    outb(kDmaPage[ch], (phys >> 16) & 0xFF);
+    outb(kDmaCount[ch], (SB_RING - 1) & 0xFF);
+    outb(kDmaCount[ch], ((SB_RING - 1) >> 8) & 0xFF);
+    outb(0x0A, ch);                                   // unmask
+
+    // DSP: speaker on, 22 kHz (time constant 256 - 1000000/rate), a block
+    // the length of the ring, 8-bit auto-init output.
+    int tc = 211;
+    sb_rate = 1000000 / (256 - tc);                   // 22222 Hz
+    sb_out(0xD1);
+    sb_out(0x40); sb_out((uint8_t)tc);
+    sb_out(0x48); sb_out((SB_RING - 1) & 0xFF); sb_out(((SB_RING - 1) >> 8) & 0xFF);
+    sb_out(0x1C);
+    printf("Audio: Sound Blaster DSP %d.%02d at %Xh, DMA %d\n", major, minor < 0 ? 0 : minor, sb_base, ch);
+    return true;
+}
+
+// Frames the DMA controller has played into the ring.
+static uint32_t sb_play_pos() {
+    int ch = sb_dma;
+    inb(sb_base + 0xE);                               // acknowledge the DSP's block interrupt
+    uint32_t c1, c2;
+    do {
+        outb(0x0C, 0);
+        c1 = inb(kDmaCount[ch]); c1 |= inb(kDmaCount[ch]) << 8;
+        outb(0x0C, 0);
+        c2 = inb(kDmaCount[ch]); c2 |= inb(kDmaCount[ch]) << 8;
+    } while (c1 - c2 > 4 && c2 - c1 > 4);             // read twice: the count was changing
+    uint32_t left = (c2 + 1) & 0xFFFF;                // bytes left in this pass
+    if (left > SB_RING) left = SB_RING;
+    return (SB_RING - left) % SB_RING;
+}
+
+// As audio_frames_wanted, in the Sound Blaster's frames; `nominal` and the
+// answer are 48 kHz frames.
+static int sb_frames_wanted(int nominal, uint32_t* underruns) {
+    uint32_t play = sb_play_pos();
+    uint32_t ahead = (sb_write + SB_RING - play) % SB_RING;
+    int nom = (int)((uint32_t)nominal * sb_rate / 48000);
+    if (ahead < sb_ahead / 8 || ahead > sb_ahead * 2) {
+        if (ahead < sb_ahead / 8 || ahead >= SB_RING / 2) (*underruns)++;
+        sb_write = (play + sb_ahead + SB_RING - nom % SB_RING) % SB_RING;
+        return nominal;
+    }
+    int err = (int)(ahead + nom) - (int)sb_ahead;
+    int m = nom - err / 8, lim = nom / 32 + 1;
+    m = m < nom - lim ? nom - lim : m > nom + lim ? nom + lim : m;
+    return (int)((uint32_t)m * 48000 / sb_rate);
+}
+
+// 48 kHz signed 16-bit in, sb_rate 8-bit unsigned out: each output sample
+// is the average of the input samples that fall in it.
+static void sb_submit(const int16_t* samples, int n) {
+    for (int i = 0; i < n; i++) {
+        sb_acc += samples[i]; sb_accn++;
+        sb_phase += sb_rate;
+        if (sb_phase >= 48000) {
+            sb_phase -= 48000;
+            int v = sb_acc / sb_accn;
+            sb_acc = 0; sb_accn = 0;
+            sb_ring[sb_write] = (uint8_t)((v >> 8) + 128);
+            sb_write = (sb_write + 1) % SB_RING;
+        }
+    }
+}
+
 // ================================================================ common
 static bool arg_is(const char* cmdline, const char* want) {
     if (!cmdline) return false;
@@ -298,11 +442,13 @@ AudioDriver audio_init(const char* cmdline) {
     bool want_off = arg_is(cmdline, "off");
     bool want_hda = arg_is(cmdline, "hda");
     bool want_ac  = arg_is(cmdline, "ac97");
-    bool any = !want_hda && !want_ac;
+    bool want_sb  = arg_is(cmdline, "sb");
+    bool any = !want_hda && !want_ac && !want_sb;
     memset(ring, 0, sizeof(ring));
     if (!want_off) {
         if ((any || want_hda) && hda_init()) driver = AUDIO_HDA;
         else if ((any || want_ac) && ac97_init()) driver = AUDIO_AC97;
+        else if ((any || want_sb) && sb_init(cmdline)) driver = AUDIO_SB;
     }
     if (driver == AUDIO_NONE) { printf("Audio: none\n"); return driver; }
 
@@ -321,6 +467,12 @@ AudioDriver audio_init(const char* cmdline) {
             for (const char* q = p + 8; *q >= '0' && *q <= '9'; q++) v = v * 10 + (*q - '0');
             if (v >= 5 && v <= 200) ms = v;
         }
+    if (driver == AUDIO_SB) {
+        sb_ahead = sb_rate * ms / 1000;
+        sb_write = (sb_play_pos() + sb_ahead) % SB_RING;
+        printf("Audio: %s at %u Hz, %d ms latency\n", audio_name(), (unsigned)sb_rate, ms);
+        return driver;
+    }
     target_ahead = (uint32_t)(kRate * ms / 1000);
     write_pos = (audio_play_pos() + target_ahead) % RING_FRAMES;
     printf("Audio: %s at %d Hz, %d ms latency\n", audio_name(), kRate, ms);
@@ -331,6 +483,7 @@ uint32_t audio_play_pos() {
     switch (driver) {
     case AUDIO_HDA:  return hda_play_pos();
     case AUDIO_AC97: return ac97_play_pos();
+    case AUDIO_SB:   return sb_play_pos();
     default:         return 0;
     }
 }
@@ -345,6 +498,7 @@ static uint32_t underruns;
 uint32_t audio_underruns() { return underruns; }
 int audio_frames_wanted(int nominal) {
     if (driver == AUDIO_NONE || nominal <= 0) return nominal;
+    if (driver == AUDIO_SB) return sb_frames_wanted(nominal, &underruns);
     uint32_t play = audio_play_pos();
     uint32_t ahead = (write_pos + RING_FRAMES - play) % RING_FRAMES;
     if (ahead < target_ahead / 8 || ahead > target_ahead * 2) {
@@ -359,6 +513,7 @@ int audio_frames_wanted(int nominal) {
 
 void audio_submit(const int16_t* samples, int n) {
     if (driver == AUDIO_NONE) return;
+    if (driver == AUDIO_SB) { sb_submit(samples, n); return; }
     for (int i = 0; i < n; i++) {
         ring[write_pos * 2] = samples[i];
         ring[write_pos * 2 + 1] = samples[i];
@@ -368,9 +523,11 @@ void audio_submit(const int16_t* samples, int n) {
 
 uint32_t audio_delay_ms() {
     if (driver == AUDIO_NONE) return 0;
+    if (driver == AUDIO_SB) return (sb_write + SB_RING - sb_play_pos()) % SB_RING * 1000 / sb_rate;
     return (write_pos + RING_FRAMES - audio_play_pos()) % RING_FRAMES * 1000 / kRate;
 }
 
 const char* audio_name() {
-    return driver == AUDIO_HDA ? "HD Audio" : driver == AUDIO_AC97 ? "AC97" : "none";
+    return driver == AUDIO_HDA ? "HD Audio" : driver == AUDIO_AC97 ? "AC97" :
+           driver == AUDIO_SB ? "Sound Blaster" : "none";
 }

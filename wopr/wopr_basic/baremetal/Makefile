@@ -185,16 +185,18 @@ $(FLOPPY): $(KERNEL) $(BUILD)/grub.cfg $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
 	@echo "$@: GRUB $$(( $$(stat -c %s $(BUILD)/core.img) / 1024 )) KB + kernel $$(( $$(stat -c %s $(BUILD)/kernel.gz) / 1024 )) KB (gzipped) + programs; $$(( $$(mdir -i $@ :: | sed -n 's/ *\([0-9 ]*\) bytes free/\1/p' | tr -d ' ') / 1024 )) KB free"
 
 # ---------------------------------------------------------------- QEMU
-# SOUND=hda (default for x86_64), ac97, speaker (default for i386: a 386
-# had no PCI sound card) or none. The kernel uses whichever it finds.
+# SOUND=hda (default for x86_64), ac97, sb (default for i386: a Sound
+# Blaster, as a 386 would have had; QEMU's is an SB16, which plays the
+# SB Pro's way too), speaker or none. The kernel uses whichever it finds.
 AUDIODEV ?= $(if $(filter Darwin,$(shell uname)),coreaudio,pa)
 comma := ,
 QAUDIO_OPTS ?= timer-period=2000,out.buffer-length=10000$(if $(filter pa,$(AUDIODEV)),$(comma)out.latency=5000)
 QSOUND_speaker := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -machine pcspk-audiodev=snd0
 QSOUND_ac97    := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -device AC97,audiodev=snd0
 QSOUND_hda     := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -device intel-hda -device hda-output,audiodev=snd0
+QSOUND_sb      := -audiodev $(AUDIODEV),id=snd0,$(QAUDIO_OPTS) -device sb16,audiodev=snd0
 QSOUND_none    :=
-SOUND    ?= $(if $(filter i386,$(ARCH)),speaker,hda)
+SOUND    ?= $(if $(filter i386,$(ARCH)),sb,hda)
 KVM      ?= $(if $(wildcard /dev/kvm),-enable-kvm,)
 ifeq ($(ARCH),x86_64)
 QEMU     := qemu-system-x86_64 $(KVM) -m 256 -serial stdio $(QSOUND_$(SOUND))
