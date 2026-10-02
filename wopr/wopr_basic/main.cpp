@@ -276,6 +276,7 @@ int basic_main(int argc, char **argv) {
         if (argc >= 3) g_prec = (mp_bitcnt_t)atoi(argv[2]);
         load(argv[1]);
         prescan_data();
+        scope_program_start();
         run();
         display_shutdown();
         return 0;
@@ -317,6 +318,7 @@ argv[1] = tmpfile_path;
 
 load(argv[1]);
 prescan_data();
+scope_program_start();
 run();
 display_shutdown();
 return 0;
@@ -327,6 +329,7 @@ return 0;
     if (g_autoload_path[0]) {
         load_program(g_autoload_path);
         prescan_data();
+        scope_program_start();
         run();
         display_shutdown();
         return 0;
@@ -512,11 +515,13 @@ return 0;
             /* Clean up old variables before running */
             for (int i = 0; i < g_nvar; i++) {
                 Var *v = &g_vars[i];
+                if (!v->name) continue;
                 if (v->kind == VAR_STR && v->str) { free(v->str); v->str = nullptr; }
                 var_free_arrays(v);
                 mpf_clear(v->num);
             }
             g_nvar = 0; g_ctrl_top = 0; g_data_pos = 0;
+            scope_program_start();
             run();
 
         } else if (strncasecmp(p,"CONT",4)==0 && !isalnum((unsigned char)p[4])) {

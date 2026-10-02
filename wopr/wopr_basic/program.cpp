@@ -657,6 +657,7 @@ void clear_program(void) {
     /* Free all allocated variable data */
     for (int i = 0; i < g_nvar; i++) {
         Var *v = &g_vars[i];
+        if (!v->name) continue;
         free(v->name);
         v->name = nullptr;
         if (v->kind == VAR_STR && v->str) {
@@ -691,6 +692,8 @@ void clear_program(void) {
     
     g_nlines      = 0;
     g_nvar        = 0;
+    g_scope       = 0;
+    g_locals      = 0;
     g_ctrl_top    = 0;
     g_data_count  = 0;
     g_data_pos    = 0;

@@ -231,6 +231,16 @@ void sprites_reset(void) {
 #endif
 }
 
+/* A variable going away (a procedure's, when it returns): its slot may be
+ * reused, so it no longer names its sprite. */
+void sprite_forget(Var *var) {
+    for (int i = 0; i < g_nsprites; i++)
+        if (g_sprites[i].var == var) {
+            g_sprites[i] = g_sprites[--g_nsprites];
+            return;
+        }
+}
+
 static int sprite_id_for(Var *var) {
     for (int i = 0; i < g_nsprites; i++)
         if (g_sprites[i].var == var) return g_sprites[i].id;
@@ -282,6 +292,7 @@ static int cmd_run(Interp *ip, char *args) {
         load_program(name);
         prescan_data();
         g_nvar     = 0;
+        scope_program_start();
         g_ctrl_top = 0;
         g_data_pos = 0;
         ip->pc     = 0;
@@ -290,6 +301,7 @@ static int cmd_run(Interp *ip, char *args) {
 
     /* Reset interpreter state (variables, stack, data pointer) */
     g_nvar     = 0;
+    scope_program_start();
     g_ctrl_top = 0;
     g_data_pos = 0;
 
@@ -1452,24 +1464,32 @@ static int cmd_end_sub(Interp *ip, char *args) {
 /* ================================================================
  * CALL subname [args]  for now, treat as GOSUB to label
  * ================================================================ */
-/* SUB parameters, as in QBasic: a variable given as an argument is passed
- * by reference (it gets the parameter's value back when the SUB returns),
- * an array passed as A() is the parameter array while the SUB runs (its
- * storage moves to the parameter and back), and a parameter is local to
- * the SUB: a variable of the same name outside it keeps its value. Each
- * entry belongs to the call's frame on the control stack. */
+/* SUB parameters, as in QBasic. A variable given as an argument is passed
+ * by reference: it gets the parameter's value back when the SUB returns.
+ * An array passed as A() is the parameter array while the SUB runs (its
+ * storage moves to the parameter and back). A parameter belongs to the
+ * SUB: with procedure scopes (see scope_enter) it is one of the call's own
+ * variables; in a program whose variables are all global, the variable of
+ * that name is put back as it was when the SUB returns. Each entry belongs
+ * to the call's frame on the control stack. */
 typedef struct {
     int    frame;
     int    is_array;
     char   param[MAX_VARNAME];
     char   caller[MAX_VARNAME];     /* "" when passed by value */
-    int    saved_kind;              /* the parameter's variable before the call; -1: none */
+    int    restore;                 /* global variables: put the parameter's variable back */
+    int    saved_kind;              /* ... as it was: -1 when it didn't exist */
     mpf_t  saved_num;
     char  *saved_str;
 } ByRef;
 #define MAX_BYREF 256
 static ByRef g_byref[MAX_BYREF];
 static int   g_nbyref;
+
+/* The scope each SUB call opened, by its frame. */
+#define MAX_CALLS 256
+static struct { int frame, scope; } g_calls[MAX_CALLS];
+static int g_ncalls;
 
 static void array_move(Var *to, Var *from) {
     var_free_arrays(to);
@@ -1480,11 +1500,29 @@ static void array_move(Var *to, Var *from) {
     from->arr_len = 0; from->arr_num = NULL; from->arr_str = NULL;
 }
 
-static void byref_drop(ByRef *b) {
-    if (!b->is_array) { mpf_clear(b->saved_num); free(b->saved_str); b->saved_str = NULL; }
+/* A TYPE array's elements are variables of their own (A.3.X): passing A()
+ * passes them too, renamed into the parameter's name and scope and back. */
+static void fields_move(char *from, int from_scope, char *to, int to_scope) {
+    int fs = var_scope_for(from, from_scope), ts = var_scope_for(to, to_scope);
+    size_t lf = strlen(from);
+    if (fs == ts && strcasecmp(from, to) == 0) return;
+    for (int i = 0; i < g_nvar; i++) {
+        Var *v = &g_vars[i];
+        if (!v->name || v->scope != fs) continue;
+        if (strncasecmp(v->name, from, lf) != 0 || v->name[lf] != '.') continue;
+        char buf[MAX_VARNAME * 2];
+        snprintf(buf, sizeof buf, "%s%s", to, v->name + lf);
+        free(v->name);
+        v->name = bstrdup(buf);
+        v->scope = ts;
+    }
 }
 
-/* Put back the variable a parameter shadowed. */
+static void byref_drop(ByRef *b) {
+    if (b->restore) { mpf_clear(b->saved_num); free(b->saved_str); b->saved_str = NULL; b->restore = 0; }
+}
+
+/* Put back the variable a parameter shadowed (global variables). */
 static void byref_restore(ByRef *b, Var *pv) {
     if (b->saved_kind == VAR_STR) {
         if (pv->kind == VAR_STR) free(pv->str);
@@ -1500,53 +1538,61 @@ static void byref_restore(ByRef *b, Var *pv) {
     }
 }
 
-/* Entries for frames unwound without a return (GOTO out, RUN) are stale. */
-static void byref_prune(int top) {
+/* Calls whose frames went without a return (GOTO out, RUN) are over. */
+static void calls_prune(int top) {
     while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= top) byref_drop(&g_byref[--g_nbyref]);
+    while (g_ncalls > 0 && g_calls[g_ncalls-1].frame >= top) scope_leave(g_calls[--g_ncalls].scope);
 }
 
-/* The SUB whose frame is `fi` returns: hand back what it was given. */
+/* The SUB whose frame is `fi` returns: hand back what it was given, and
+ * its variables go. (For a plain GOSUB there's nothing to do.) */
 static void byref_return(int fi) {
+    int scope = 0, has_call = 0;
+    for (int k = g_ncalls - 1; k >= 0 && g_calls[k].frame >= fi; k--)
+        if (g_calls[k].frame == fi) { scope = g_calls[k].scope; has_call = 1; }
+    int caller_scope = scope > 0 ? scope - 1 : g_scope;
     while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= fi) {
         ByRef *b = &g_byref[--g_nbyref];
         if (b->frame != fi) { byref_drop(b); continue; }   /* unwound without returning */
-        Var *pv = var_find(b->param);
+        Var *pv = scope ? var_find_in(b->param, scope) : var_find(b->param);
         if (!pv) { byref_drop(b); continue; }
-        if (!b->is_array) {
-            if (b->caller[0]) {
-                Var *cv = var_get(b->caller);
-                pv = var_find(b->param);
-                if (var_is_str_name(b->caller)) {
-                    char *dup = str_dup((pv->kind == VAR_STR && pv->str) ? pv->str : (char *)"");
-                    if (cv->kind == VAR_STR) free(cv->str);
-                    cv->kind = VAR_STR; cv->str = dup;
-                } else if (pv->kind == VAR_NUM) {
-                    mpf_set(cv->num, pv->num);
-                }
-            }
-            byref_restore(b, pv);
-            byref_drop(b);
-            continue;
-        }
         if (b->is_array) {
+            fields_move(b->param, scope ? scope : g_scope, b->caller, caller_scope);
             if (pv->kind != VAR_ARRAY_NUM && pv->kind != VAR_ARRAY_STR) continue;
-            Var *cv = var_get(b->caller);
+            Var *cv = var_get_in(b->caller, caller_scope);
+            pv = scope ? var_find_in(b->param, scope) : var_find(b->param);
             array_move(cv, pv);
             pv->kind = VAR_NUM; pv->ndim = 0;
+            continue;
         }
+        if (b->caller[0]) {
+            Var *cv = var_get_in(b->caller, caller_scope);
+            pv = scope ? var_find_in(b->param, scope) : var_find(b->param);
+            if (var_is_str_name(b->caller)) {
+                char *dup = str_dup((pv->kind == VAR_STR && pv->str) ? pv->str : (char *)"");
+                if (cv->kind == VAR_STR) free(cv->str);
+                cv->kind = VAR_STR; cv->str = dup;
+            } else if (pv->kind == VAR_NUM && cv->kind == VAR_NUM) {
+                mpf_set(cv->num, pv->num);
+            }
+        }
+        if (b->restore) byref_restore(b, pv);
+        byref_drop(b);
     }
+    if (has_call)
+        while (g_ncalls > 0 && g_calls[g_ncalls-1].frame >= fi) scope_leave(g_calls[--g_ncalls].scope);
 }
 
 /* The argument at cs, if it's a plain variable (or ARRAY()): its name. */
 static int byref_arg(char *cs, char *name, int *is_array) {
     int n = 0;
     char *q = cs;
+    *is_array = 0;
     if (!isalpha((unsigned char)*q)) return 0;
     while ((isalnum((unsigned char)*q) || *q == '_' || *q == '.') && n < MAX_VARNAME - 2) name[n++] = *q++;
     if (*q == '$' || *q == '!' || *q == '#' || *q == '%' || *q == '&') name[n++] = *q++;
     name[n] = '\0';
     q = sk(q);
-    *is_array = 0;
     if (*q == '(') {
         char *inner = sk(q + 1);
         if (*inner != ')') return 0;           /* A(3): an element, by value */
@@ -1559,6 +1605,16 @@ static int byref_arg(char *cs, char *name, int *is_array) {
 
 static int call_sub(Interp *ip, char *args, int bare);
 static int cmd_call(Interp *ip, char *args) { return call_sub(ip, args, 0); }
+
+/* One argument of a SUB call, evaluated in the caller before the call. */
+typedef struct {
+    char  pname[MAX_VARNAME];
+    char  aname[MAX_VARNAME];   /* the variable passed, "" for an expression */
+    int   is_array;
+    int   is_str;
+    mpf_t num;
+    char *str;
+} SubArg;
 
 /* CALL Name(args), or bare Name args. Bare, "Name (X)" passes X by value,
  * as QBasic does: the parentheses make it an expression. */
@@ -1589,15 +1645,16 @@ static int call_sub(Interp *ip, char *args, int bare) {
         param_src = sp;
     }
 
-    byref_prune(g_ctrl_top);
+    calls_prune(g_ctrl_top);
     int frame = g_ctrl_top;           /* the frame cmd_gosub pushes below */
-    int nbyref0 = g_nbyref;
 
-    /* Walk call-site args and sub param names in parallel, assigning values */
+    /* 1. Evaluate the arguments, in the caller's scope. */
+    static SubArg argv_[16];
+    int nargs = 0;
     if (param_src && *param_src && *param_src != ')') {
         char *cs = p;          /* call-site arg pointer */
         char *ps = param_src;  /* param name pointer    */
-        while (*ps && *ps != ')') {
+        while (*ps && *ps != ')' && nargs < 16) {
             /* --- read one parameter name --- */
             ps = sk(ps);
             char pname[MAX_VARNAME]; int pi = 0;
@@ -1620,48 +1677,84 @@ static int call_sub(Interp *ip, char *args, int bare) {
             cs = sk(cs);
             if (!*cs || *cs == ')') break;
 
-            /* A variable argument is passed by reference (see ByRef). */
+            SubArg *a = &argv_[nargs++];
+            strcpy(a->pname, pname);
+            a->aname[0] = 0;
+            a->str = NULL;
+            a->is_str = var_is_str_name(pname);
             char aname[MAX_VARNAME]; int is_arr = 0;
-            int by_ref = byref_arg(cs, aname, &is_arr) && strcasecmp(aname, pname) != 0 &&
-                         g_nbyref < MAX_BYREF;
+            if (byref_arg(cs, aname, &is_arr)) strcpy(a->aname, aname);
+            a->is_array = is_arr;
             if (is_arr) {
-                /* "ArrName()": the parameter array is the caller's array */
+                /* "ArrName()": no value, the array itself */
                 char *look = cs;
                 while (*look && *look != ')') look++;
                 cs = sk(look + 1);
-                if (by_ref) {
-                    Var *cv = var_find(aname);
-                    Var *pv0 = var_find(pname);
-                    int c_arr = cv && (cv->kind == VAR_ARRAY_NUM || cv->kind == VAR_ARRAY_STR);
-                    int p_arr = pv0 && (pv0->kind == VAR_ARRAY_NUM || pv0->kind == VAR_ARRAY_STR);
-                    /* The caller's array, or (not dimensioned yet) the one the SUB DIMs */
-                    if (c_arr || !p_arr) {
-                        Var *pv = var_get(pname);
-                        if (pv->kind == VAR_STR) { free(pv->str); pv->str = NULL; }
-                        if (c_arr) array_move(pv, cv);
-                        ByRef *b = &g_byref[g_nbyref++];
-                        b->frame = frame; b->is_array = 1;
-                        strncpy(b->param, pname, MAX_VARNAME - 1); b->param[MAX_VARNAME-1] = 0;
-                        strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0;
-                    }
-                }
-                if (*cs == ',') cs = sk(cs + 1);
-                if (*ps == ',') ps = sk(ps + 1);
-                continue;
+            } else if (a->is_str) {
+                char sbuf[DEFAULT_BUFFER];
+                cs = sk(eval_str_expr(cs, sbuf, sizeof sbuf));
+                a->str = str_dup(sbuf);
+            } else {
+                mpf_init2(a->num, g_prec);
+                cs = sk(eval_expr(cs, a->num));
             }
-            /* The parameter is local: remember the variable it shadows (not
-             * when the argument is that same variable, passed by reference). */
-            int same = byref_arg(cs, aname, &is_arr) && strcasecmp(aname, pname) == 0;
-            if (!same && g_nbyref < MAX_BYREF) {
-                ByRef *b = &g_byref[g_nbyref++];
-                b->frame = frame; b->is_array = 0;
-                strncpy(b->param, pname, MAX_VARNAME - 1); b->param[MAX_VARNAME-1] = 0;
-                if (by_ref) { strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0; }
-                else b->caller[0] = 0;
+            cs = sk(cs);
+            /* skip separating comma in both lists */
+            if (*cs == ',') cs = sk(cs + 1);
+            if (*ps == ',') ps = sk(ps + 1);
+        }
+    }
+
+    if (sub_idx < 0) {
+        for (int k = 0; k < nargs; k++) {
+            if (argv_[k].is_array) continue;
+            if (argv_[k].is_str) free(argv_[k].str); else mpf_clear(argv_[k].num);
+        }
+        return 0;
+    }
+
+    /* 2. The call's scope, and the parameters bound in it. */
+    int caller_scope = g_scope;
+    int scope = scope_enter();
+    for (int k = 0; k < nargs; k++) {
+        SubArg *a = &argv_[k];
+        /* passing a variable to a parameter of the same name, with variables
+         * global, is passing it to itself */
+        int same = !scope && a->aname[0] && strcasecmp(a->aname, a->pname) == 0;
+        if (a->is_array) {
+            if (a->aname[0] && !same && g_nbyref < MAX_BYREF) {
+                Var *cv = var_find_in(a->aname, caller_scope);
+                Var *pv0 = var_find(a->pname);
+                int c_arr = cv && (cv->kind == VAR_ARRAY_NUM || cv->kind == VAR_ARRAY_STR);
+                int p_arr = pv0 && (pv0->kind == VAR_ARRAY_NUM || pv0->kind == VAR_ARRAY_STR);
+                /* The caller's array, or (not dimensioned yet) the one the SUB DIMs */
+                if (c_arr || !p_arr) {
+                    Var *pv = var_get(a->pname);
+                    cv = var_find_in(a->aname, caller_scope);
+                    if (pv->kind == VAR_STR) { free(pv->str); pv->str = NULL; }
+                    if (c_arr) array_move(pv, cv);
+                    fields_move(a->aname, caller_scope, a->pname, g_scope);
+                    ByRef *b = &g_byref[g_nbyref++];
+                    memset(b, 0, sizeof *b);
+                    b->frame = frame; b->is_array = 1;
+                    strcpy(b->param, a->pname);
+                    strcpy(b->caller, a->aname);
+                }
+            }
+            continue;
+        }
+        if (!same && g_nbyref < MAX_BYREF && (scope == 0 || a->aname[0])) {
+            ByRef *b = &g_byref[g_nbyref++];
+            memset(b, 0, sizeof *b);
+            b->frame = frame; b->is_array = 0;
+            strcpy(b->param, a->pname);
+            strcpy(b->caller, a->aname);
+            if (scope == 0) {
+                /* global variables: remember the one the parameter shadows */
+                b->restore = 1;
                 mpf_init2(b->saved_num, g_prec);
-                b->saved_str = NULL;
                 b->saved_kind = -1;
-                Var *pv0 = var_find(pname);
+                Var *pv0 = var_find(a->pname);
                 if (pv0 && pv0->kind == VAR_STR) {
                     b->saved_kind = VAR_STR;
                     b->saved_str = str_dup(pv0->str ? pv0->str : (char *)"");
@@ -1670,30 +1763,22 @@ static int call_sub(Interp *ip, char *args, int bare) {
                     mpf_set(b->saved_num, pv0->num);
                 }
             }
-
-            if (var_is_str_name(pname)) {
-                char sbuf[DEFAULT_BUFFER];
-                cs = sk(eval_str_expr(cs, sbuf, sizeof sbuf));
-                cs = sk(cs);  /* Skip whitespace after expression */
-                Var *v = var_get(pname);
-                free(v->str);
-                v->str = str_dup(sbuf);
-            } else {
-                mpf_t val; mpf_init2(val, g_prec);
-                cs = sk(eval_expr(cs, val));
-                cs = sk(cs);  /* Skip whitespace after expression */
-                Var *v = var_get(pname);
-                mpf_set(v->num, val);
-                mpf_clear(val);
-            }
-
-            /* skip separating comma in both lists */
-            if (*cs == ',') cs = sk(cs + 1);
-            if (*ps == ',') ps = sk(ps + 1);
+        }
+        Var *v = var_get(a->pname);
+        if (a->is_str) {
+            if (v->kind == VAR_STR) free(v->str);
+            v->kind = VAR_STR; v->str = a->str; a->str = NULL;
+        } else {
+            if (v->kind == VAR_NUM) mpf_set(v->num, a->num);
+            mpf_clear(a->num);
         }
     }
+    if (g_ncalls < MAX_CALLS) {
+        g_calls[g_ncalls].frame = frame;
+        g_calls[g_ncalls].scope = scope;
+        g_ncalls++;
+    }
 
-    if (find_line_by_label(name) < 0) { byref_return(frame); (void)nbyref0; return 0; }
     int r = cmd_gosub(ip, name);
     if (r < 0) byref_return(frame);      /* the call didn't happen: give it all back */
     return r;

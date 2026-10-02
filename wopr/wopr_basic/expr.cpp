@@ -1633,29 +1633,37 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                 }
             }
 
-            /* Save old parameter values (all vars are global; we must restore
-             * them after the call so the caller's variables are not clobbered).
-             * e.g. FnRan(x) uses param "x" which would overwrite the caller's x. */
+            /* Evaluate the arguments, in the caller's scope */
+            mpf_t args_v[16];
+            int   n_args = 0;
+            for (int ai = 0; ai < n_params; ai++) {
+                skip_ws_p(ps);
+                if (*ps->p == ')' || *ps->p == '\0') break;
+                mpf_init2(args_v[ai], g_prec);
+                parse_expr_p(ps, args_v[ai]);
+                n_args++;
+                skip_ws_p(ps);
+                if (*ps->p == ',') ps->p++;
+            }
+
+            /* The call's own scope (see scope_enter); with variables global,
+             * the parameters' variables are saved and put back afterwards
+             * (FnRan(x) mustn't change the caller's x). */
+            int fn_scope = scope_enter();
             mpf_t saved_params[16];
             bool  param_was_num[16];
             for (int ai = 0; ai < n_params; ai++) {
+                param_was_num[ai] = false;
+                if (fn_scope) continue;
                 Var *pv = var_find(param_names[ai]);
                 param_was_num[ai] = (pv && pv->kind == VAR_NUM);
                 mpf_init2(saved_params[ai], g_prec);
                 if (param_was_num[ai]) mpf_set(saved_params[ai], pv->num);
             }
-
-            /* Evaluate and assign arguments */
-            for (int ai = 0; ai < n_params; ai++) {
-                skip_ws_p(ps);
-                if (*ps->p == ')' || *ps->p == '\0') break;
-                mpf_t arg; mpf_init2(arg, g_prec);
-                parse_expr_p(ps, arg);
+            for (int ai = 0; ai < n_args; ai++) {
                 Var *pv = var_get(param_names[ai]);
-                mpf_set(pv->num, arg);
-                mpf_clear(arg);
-                skip_ws_p(ps);
-                if (*ps->p == ',') ps->p++;
+                if (pv->kind == VAR_NUM) mpf_set(pv->num, args_v[ai]);
+                mpf_clear(args_v[ai]);
             }
             /* consume closing paren and any remaining args */
             skip_ws_p(ps);
@@ -1718,19 +1726,24 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                 g_current_pc = saved_pc;
             }
 
-            /* Restore caller's variables that were overwritten by parameters */
-            for (int ai = 0; ai < n_params; ai++) {
-                if (param_was_num[ai]) {
-                    Var *pv = var_find(param_names[ai]);
-                    if (pv) mpf_set(pv->num, saved_params[ai]);
-                }
-                mpf_clear(saved_params[ai]);
-            }
-
             /* Read return value — stored in variable named after function */
             Var *rv = var_find(fname);
-            if (rv) mpf_set(result, rv->num);
+            if (rv && rv->kind == VAR_NUM) mpf_set(result, rv->num);
             else    mpf_set_ui(result, 0);
+
+            /* The call's variables go; or, with variables global, the
+             * caller's variables the parameters overwrote come back */
+            if (fn_scope) {
+                scope_leave(fn_scope);
+            } else {
+                for (int ai = 0; ai < n_params; ai++) {
+                    if (param_was_num[ai]) {
+                        Var *pv = var_find(param_names[ai]);
+                        if (pv) mpf_set(pv->num, saved_params[ai]);
+                    }
+                    mpf_clear(saved_params[ai]);
+                }
+            }
             return;
         }
     }

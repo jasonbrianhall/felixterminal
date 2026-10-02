@@ -21,6 +21,7 @@ struct VarsInit {
     }
     ~VarsInit() {
         for (int i = 0; i < g_nvar; i++) {
+            if (!g_vars[i].name) continue;
             free(g_vars[i].name);
             if (g_vars[i].kind == VAR_STR) free(g_vars[i].str);
             var_free_arrays(&g_vars[i]);
@@ -85,32 +86,161 @@ int var_is_str_name(char *name) {
     return name[strlen(name) - 1] == '$';
 }
 
-Var *var_find(char *name) {
+/* ---------------------------------------------------------------- scopes */
+int g_scope  = 0;
+int g_locals = 0;
+
+static char **g_shared;      /* names declared SHARED anywhere in the program */
+static int    g_nshared, g_capshared;
+
+static void shared_add(const char *name, int len) {
+    if (len <= 0 || len >= MAX_VARNAME) return;
+    for (int i = 0; i < g_nshared; i++)
+        if ((int)strlen(g_shared[i]) == len && strncasecmp(g_shared[i], name, len) == 0) return;
+    if (g_nshared == g_capshared) {
+        int cap = g_capshared ? g_capshared * 2 : 32;
+        char **n = (char **)realloc(g_shared, (size_t)cap * sizeof(char *));
+        if (!n) return;
+        g_shared = n; g_capshared = cap;
+    }
+    char *c = (char *)malloc((size_t)len + 1);
+    if (!c) return;
+    memcpy(c, name, (size_t)len); c[len] = 0;
+    g_shared[g_nshared++] = c;
+}
+
+/* A name seen from inside a procedure: one of the main program's SHARED
+ * variables? (For a TYPE variable, P.X goes by P.) */
+static int var_is_shared(const char *name) {
+    int len = 0;
+    while (name[len] && name[len] != '.') len++;
+    for (int i = 0; i < g_nshared; i++)
+        if ((int)strlen(g_shared[i]) == len && strncasecmp(g_shared[i], name, len) == 0) return 1;
+    return 0;
+}
+
+static int kw_at(const char *p, const char *kw) {
+    size_t n = strlen(kw);
+    return strncasecmp(p, kw, n) == 0 && !isalnum((unsigned char)p[n]) && p[n] != '_';
+}
+
+/* The names in "DIM SHARED A, B(10), C AS INTEGER" and the like. */
+static void shared_scan_list(const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *n = p;
+        while (isalnum((unsigned char)*p) || *p == '_') p++;
+        if (*p == '$' || *p == '!' || *p == '#' || *p == '%' || *p == '&') p++;
+        if (p == n) return;
+        shared_add(n, (int)(p - n));
+        while (*p == ' ') p++;
+        if (*p == '(') {                         /* array bounds */
+            int depth = 0;
+            do { if (*p == '(') depth++; else if (*p == ')') depth--; p++; } while (*p && depth > 0);
+            while (*p == ' ') p++;
+        }
+        if (kw_at(p, "AS")) {                   /* AS type */
+            p += 2;
+            while (*p == ' ') p++;
+            while (isalnum((unsigned char)*p) || *p == '_') p++;
+            while (*p == ' ') p++;
+        }
+        if (*p != ',') return;
+        p++;
+    }
+}
+
+void scope_program_start(void) {
+    for (int i = 0; i < g_nshared; i++) free(g_shared[i]);
+    g_nshared = 0;
+    g_scope = 0;
+    int any = 0;
+    for (int i = 0; i < g_nlines; i++) {
+        const char *t = g_lines[i].text;
+        if (!t) continue;
+        while (*t == ' ' || *t == '\t') t++;
+        if (kw_at(t, "DIM") || kw_at(t, "REDIM") || kw_at(t, "COMMON")) {
+            t += kw_at(t, "DIM") ? 3 : kw_at(t, "REDIM") ? 5 : 6;
+            while (*t == ' ') t++;
+            if (kw_at(t, "PRESERVE")) { t += 8; while (*t == ' ') t++; }
+            if (!kw_at(t, "SHARED")) continue;
+            t += 6;
+        } else if (kw_at(t, "SHARED")) {
+            t += 6;
+        } else continue;
+        any = 1;
+        shared_scan_list(t);
+    }
+    g_locals = any;
+}
+
+int scope_enter(void) {
+    if (!g_locals) return 0;
+    return ++g_scope;
+}
+
+static void var_release(Var *v) {
+    sprite_forget(v);
+    free(v->name);
+    if (v->kind == VAR_STR) free(v->str);
+    else if (v->kind == VAR_NUM) mpf_clear(v->num);
+    var_free_arrays(v);
+    memset(v, 0, sizeof(*v));                    /* name NULL: a free slot */
+}
+
+void scope_leave(int scope) {
+    if (scope <= 0) return;
     for (int i = 0; i < g_nvar; i++)
-        if (strcasecmp(g_vars[i].name, name) == 0) return &g_vars[i];
+        if (g_vars[i].name && g_vars[i].scope >= scope) var_release(&g_vars[i]);
+    while (g_nvar > 0 && !g_vars[g_nvar - 1].name) g_nvar--;
+    if (g_scope >= scope) g_scope = scope - 1;
+}
+
+/* Which scope a name means, seen from scope sc. */
+static int scope_of(char *name, int sc) {
+    return (sc > 0 && g_locals && !var_is_shared(name)) ? sc : 0;
+}
+
+int var_scope_for(char *name, int sc) { return scope_of(name, sc); }
+
+Var *var_find_in(char *name, int sc) {
+    int want = scope_of(name, sc);
+    for (int i = 0; i < g_nvar; i++)
+        if (g_vars[i].name && g_vars[i].scope == want && strcasecmp(g_vars[i].name, name) == 0)
+            return &g_vars[i];
     return NULL;
 }
 
-Var *var_create(char *name) {
+Var *var_find(char *name) { return var_find_in(name, g_scope); }
+
+static Var *var_create_in(char *name, int sc) {
     extern jmp_buf g_parse_error_jmp;
     extern int g_parse_error_active;
-    
-    if (g_nvar >= MAX_VARS) {
-        basic_stderr("Too many variables %i/%i\n", g_nvar, MAX_VARS);
-        if (g_parse_error_active) {
-            longjmp(g_parse_error_jmp, 1);
-        } else {
-            exit(1);
+
+    /* a slot freed when a procedure returned, else a new one */
+    Var *v = NULL;
+    if (g_locals)
+        for (int i = 0; i < g_nvar; i++)
+            if (!g_vars[i].name) { v = &g_vars[i]; break; }
+    if (!v) {
+        if (g_nvar >= MAX_VARS) {
+            basic_stderr("Too many variables %i/%i\n", g_nvar, MAX_VARS);
+            if (g_parse_error_active) {
+                longjmp(g_parse_error_jmp, 1);
+            } else {
+                exit(1);
+            }
         }
+        v = &g_vars[g_nvar++];
+        /* A slot reused after RUN (which just resets the count) may still hold
+         * the old variable's name, string or array. */
+        free(v->name);
+        if (v->kind == VAR_STR) free(v->str);
+        var_free_arrays(v);
     }
-    Var *v = &g_vars[g_nvar++];
-    /* A slot reused after RUN (which just resets the count) may still hold
-     * the old variable's name, string or array. */
-    free(v->name);
-    if (v->kind == VAR_STR) free(v->str);
-    var_free_arrays(v);
     memset(v, 0, sizeof(*v));
     v->name = bstrdup(name);
+    v->scope = scope_of(name, sc);
     if (var_is_str_name(name)) {
         v->kind = VAR_STR;
         v->str  = str_dup("");
@@ -122,10 +252,14 @@ Var *var_create(char *name) {
     return v;
 }
 
-Var *var_get(char *name) {
-    Var *v = var_find(name);
-    return v ? v : var_create(name);
+Var *var_create(char *name) { return var_create_in(name, g_scope); }
+
+Var *var_get_in(char *name, int sc) {
+    Var *v = var_find_in(name, sc);
+    return v ? v : var_create_in(name, sc);
 }
+
+Var *var_get(char *name) { return var_get_in(name, g_scope); }
 
 /* ================================================================
  * Array element access (1-based or option-base-based indices)

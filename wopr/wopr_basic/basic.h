@@ -162,6 +162,7 @@ typedef struct {
     int     arr_len;
     mpf_t  *arr_num;
     char  **arr_str;                  /* the strings themselves are malloc'd too */
+    int     scope;                    /* 0: the main program; n: the n-th procedure call deep */
 } Var;
 
 extern Var* g_vars;
@@ -171,6 +172,19 @@ int     var_is_str_name(char *name);
 Var    *var_find(char *name);
 Var    *var_create(char *name);
 Var    *var_get(char *name);
+/* Procedure scopes. A program that declares SHARED variables gets QBasic's
+ * rules: a SUB or FUNCTION has its own variables, which start at 0 or ""
+ * on each call, and sees the main program's only where they're SHARED.
+ * A program with no SHARED keeps every variable global. */
+extern int g_scope;
+extern int g_locals;
+void    scope_program_start(void);    /* RUN: find the SHARED names, back to the main program */
+int     scope_enter(void);            /* a procedure call: its scope, 0 when variables are global */
+void    scope_leave(int scope);       /* its variables go */
+Var    *var_find_in(char *name, int scope);
+int     var_scope_for(char *name, int scope);   /* the scope a name means, seen from scope */
+Var    *var_get_in(char *name, int scope);
+void    sprite_forget(Var *v);        /* commands.cpp: a variable going away */
 mpf_t  *arr_num_elem(Var *v, int i, int j);
 void    basic_frame_tick(void);       /* present the screen now and then */
 int     basic_paced(void);            /* the program is pacing itself with pauses */
