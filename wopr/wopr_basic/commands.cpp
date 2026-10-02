@@ -2,6 +2,7 @@
  * commands.c All BASIC command handlers, command registration table,
  *              statement splitter, and dispatcher.
  */
+#include <stdint.h>
 #include "basic.h"
 #include <stdarg.h>
 #include "basic_print.h"
@@ -629,6 +630,7 @@ static int cmd_kill(Interp *ip, char *args) {
     return 0;
 }
 
+static int g_view_top = 1, g_view_bottom = 25;   /* the text viewport (VIEW PRINT) */
 static int cmd_cls(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
@@ -648,7 +650,13 @@ static int cmd_cls(Interp *ip, char *args) {
          *   CLS 2 = clear text viewport only (no-op in pixel-buffer mode)
          *   CLS (no arg) = clear both
          * The arg is NOT a color index. Always clear to background (index 0). */
-        if (arg == 2) return 0;  /* text-only clear: no-op in graphics mode */
+        if (arg == 2) {
+            /* the text viewport (VIEW PRINT), with the graphics under it */
+#ifdef USE_SDL_WINDOW
+            gfx_cls_text(g_view_top, g_view_bottom);
+#endif
+            return 0;
+        }
         /* arg==1 or no arg: clear graphics to background color */
         int c = 0;  /* always clear pixel buffer to color index 0 (background) */
         (void)arg;
@@ -1320,8 +1328,19 @@ static int cmd_motor(Interp *ip, char *args) {
  * VIEW PRINT [top TO bottom]  set text viewport (stub: just clear)
  * ================================================================ */
 static int cmd_view_print(Interp *ip, char *args) {
-    (void)ip; (void)args;
-    /* TODO: real viewport when we have a graphical backend */
+    (void)ip;
+    char *p = sk(args);
+    g_view_top = 1; g_view_bottom = 25;
+    if (*p && *p != ':' && *p != '\'') {
+        mpf_t a, b; mpf_init2(a, g_prec); mpf_init2(b, g_prec);
+        p = sk(eval_expr(p, a));
+        if (kw_match(p, "TO")) {
+            p = sk(eval_expr(sk(p + 2), b));
+            int t = (int)mpf_get_si(a), bt = (int)mpf_get_si(b);
+            if (t >= 1 && bt >= t && bt <= 50) { g_view_top = t; g_view_bottom = bt; }
+        }
+        mpf_clears(a, b, NULL);
+    }
     return 0;
 }
 
@@ -1432,8 +1451,7 @@ static void byref_return(int fi) {
         } else {
             Var *cv = var_get(b->caller);
             if (var_is_str_name(b->caller)) {
-                char *val = (pv->kind == VAR_STR && pv->str) ? pv->str : "";
-                char *dup = str_dup(val);
+                char *dup = str_dup((pv->kind == VAR_STR && pv->str) ? pv->str : (char *)"");
                 if (cv->kind == VAR_STR) free(cv->str);
                 cv->kind = VAR_STR; cv->str = dup;
             } else if (pv->kind == VAR_NUM) {
@@ -2229,20 +2247,48 @@ static int cmd_put_graphics(Interp *ip, char *args) {
     char vname[MAX_VARNAME];
     p = sk(read_varname(sk(p), vname));
     Var *v = var_get(vname);
-    /* optional mode: PSET or XOR */
-    char *mode = "pset";
-    p = sk(p); if (*p == ',') p = sk(p + 1);
-    if (kw_match(p, "XOR"))  mode = "xor";
-    int xor_mode = (strcmp(mode, "xor") == 0) ? 1 : 0;
+    /* The array may be written Name() or Name(start) */
+    if (*p == '(') {
+        int depth = 1;
+        for (p++; *p && depth > 0; p++) {
+            if (*p == '(') depth++;
+            else if (*p == ')') depth--;
+        }
+        p = sk(p);
+    }
+    /* Action: PSET, PRESET, AND, OR or XOR; QBasic's default is XOR */
+    const char *mode = "xor";
+    int put_mode = 1;
+    if (*p == ',') {
+        p = sk(p + 1);
+        if (kw_match(p, "PSET"))        { mode = "pset";   put_mode = 0; }
+        else if (kw_match(p, "PRESET")) { mode = "preset"; put_mode = 2; }
+        else if (kw_match(p, "AND"))    { mode = "and";    put_mode = 3; }
+        else if (kw_match(p, "OR"))     { mode = "or";     put_mode = 4; }
+    }
 
     /* Get the unique sprite ID assigned to this array variable */
     int id = sprite_id_for(v);
 
 #ifdef USE_SDL_WINDOW
-    gfx_put(id, (int)x, (int)y, xor_mode);
+    if (gfx_sprite_exists(id)) {
+        gfx_put(id, (int)x, (int)y, put_mode);
+    } else if (v->kind == VAR_ARRAY_NUM && v->arr_num && v->arr_len > 0) {
+        /* An array filled in by the program (READ from DATA, as Gorillas'
+         * bananas are): a GET image in the PC's own format. */
+        int n = v->arr_len;
+        int *raw = (int *)malloc((size_t)n * sizeof(int));
+        if (raw) {
+            for (int i = 0; i < n; i++) {
+                double d = mpf_get_d(v->arr_num[i]);
+                raw[i] = (int)(uint32_t)(long long)d;
+            }
+            gfx_put_array(raw, n, (int)x, (int)y, put_mode);
+            free(raw);
+        }
+    }
 #ifdef BASIC_DEBUG_GFX
-    basic_stderr("PUT: %s (id=%d) at (%d,%d), xor=%d\n", 
-                 vname, id, (int)x, (int)y, xor_mode);
+    basic_stderr("PUT: %s (id=%d) at (%d,%d), mode=%s\n", vname, id, (int)x, (int)y, mode);
 #endif
 #else
     /* OSC path */

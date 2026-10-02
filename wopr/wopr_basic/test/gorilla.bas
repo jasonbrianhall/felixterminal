@@ -47,6 +47,7 @@ Const SUNSHOCK = TRUE
 Const RIGHTUP = 1
 Const LEFTUP = 2
 Const ARMSDOWN = 3
+Const Pi = 3.141592653589
 
 'Global Variables
 Dim Shared GorillaX(1 To 2) 'Location of the two gorillas

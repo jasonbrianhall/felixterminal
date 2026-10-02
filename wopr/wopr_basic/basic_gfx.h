@@ -67,16 +67,26 @@ void gfx_paint(int x, int y, int fill_color, int border_color);
 /* Capture rectangle to sprite slot id. */
 void gfx_get(int id, int x1, int y1, int x2, int y2);
 
-/* Blit sprite id at (x,y).  xor_mode=1 → XOR blit, 0 → PSET (opaque). */
-void gfx_put(int id, int x, int y, int xor_mode);
+/* PUT actions, as in QBasic: PSET copies the sprite, PRESET copies its
+ * inverse, AND / OR / XOR combine it with what's on the screen. */
+enum { GFX_PUT_PSET = 0, GFX_PUT_XOR = 1, GFX_PUT_PRESET = 2, GFX_PUT_AND = 3, GFX_PUT_OR = 4 };
+
+/* Blit sprite id at (x,y) with one of the GFX_PUT_* actions. */
+void gfx_put(int id, int x, int y, int mode);
+
+/* CLS 2: clear text rows top..bottom (from 1) and the pixels under them. */
+void gfx_cls_text(int top, int bottom);
+
+/* 1 if GET has captured sprite id. */
+int  gfx_sprite_exists(int id);
 
 /* Blit sprite directly from a GW-BASIC GET array (numeric data loaded from DATA
  * statements).  raw_longs points to the array elements as int32 values; count is
  * the number of elements.  Format: element[0] low-word = pixel width,
  * element[0] high-word = pixel height; remaining bytes = 4bpp packed rows
  * (high nibble = left pixel, low nibble = right pixel), each row padded to a
- * byte boundary.  xor_mode=1 → XOR blit, 0 → PSET. */
-void gfx_put_array(const int *raw_longs, int count, int x, int y, int xor_mode);
+ * byte boundary.  mode: one of the GFX_PUT_* actions. */
+void gfx_put_array(const int *raw_longs, int count, int x, int y, int mode);
 
 /* ── Query ─────────────────────────────────────────────────────────────────── */
 

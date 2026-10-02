@@ -1083,6 +1083,26 @@ void gfx_cls(int color) {
     s_needs_render = true;
 }
 
+// CLS 2: clear the text viewport (rows top..bottom, from 1), and in a
+// graphics mode the pixels under it, as QBasic does.
+void gfx_cls_text(int top, int bottom) {
+    if (top < 1) top = 1;
+    if (bottom > s_text_rows) bottom = s_text_rows;
+    if (top > bottom) return;
+    for (int r = top - 1; r < bottom; r++)
+        for (int c = 0; c < s_text_cols; c++)
+            s_grid[r][c] = { ' ', (Uint8)s_cur_fg, (Uint8)s_cur_bg };
+    if (s_gfx_active && s_text_rows > 0 && !s_pages[s_apage].empty()) {
+        int y0 = (top - 1) * s_gfx_h / s_text_rows;
+        int y1 = bottom * s_gfx_h / s_text_rows;
+        Uint32 fill = ((Uint32)0 << 24) | (s_pal[0] & 0x00FFFFFFu);
+        std::fill(s_pages[s_apage].begin() + (size_t)y0 * s_gfx_w,
+                  s_pages[s_apage].begin() + (size_t)y1 * s_gfx_w, fill);
+    }
+    s_cur_row = top - 1;
+    s_cur_col = 0;
+    s_needs_render = true;
+}
 
 void gfx_pset(int x, int y, int color) {
     px_set(x, y, color);
@@ -1249,34 +1269,39 @@ void gfx_get(int id, int x1, int y1, int x2, int y2) {
     for (int row = 0; row < h; row++)
         for (int col = 0; col < w; col++)
             sp.px[(size_t)(row * w + col)] = px_get(x1 + col, y1 + row);
-    // Record the current background fill colour so gfx_put PSET can skip it.
     sp.bg_color = s_cur_bg & 15;
 }
 
-void gfx_put(int id, int x, int y, int xor_mode) {
+int gfx_sprite_exists(int id) { return s_sprites.count(id) ? 1 : 0; }
+
+// One pixel of a PUT: the sprite's colour index ci combined with the screen.
+static void put_pixel(int dx, int dy, int ci, int mode) {
+    if (dx < 0 || dy < 0 || dx >= s_gfx_w || dy >= s_gfx_h) return;
+    size_t pidx = (size_t)(dy * s_gfx_w + dx);
+    int old = px_index(s_pages[s_apage][pidx]) & 15;
+    int c;
+    switch (mode) {
+        case GFX_PUT_XOR:    c = old ^ ci; break;
+        case GFX_PUT_PRESET: c = ~ci;      break;
+        case GFX_PUT_AND:    c = old & ci; break;
+        case GFX_PUT_OR:     c = old | ci; break;
+        default:             c = ci;       break;   // PSET: the whole rectangle, background too
+    }
+    c &= 15;
+    s_pages[s_apage][pidx] = ((Uint32)c << 24) | (s_pal[c] & 0x00FFFFFFu);
+}
+
+void gfx_put(int id, int x, int y, int mode) {
     auto it = s_sprites.find(id);
     if (it == s_sprites.end()) return;
     const Sprite &sp = it->second;
-    for (int row = 0; row < sp.h; row++) {
-        for (int col = 0; col < sp.w; col++) {
-            int dx = x + col, dy = y + row;
-            if (dx < 0 || dy < 0 || dx >= s_gfx_w || dy >= s_gfx_h) continue;
-            Uint32 src = sp.px[(size_t)(row * sp.w + col)];
-            size_t pidx = (size_t)(dy * s_gfx_w + dx);
-            int ci = px_index(src);
-            if (xor_mode) {
-                int new_ci = (px_index(s_pages[s_apage][pidx]) ^ ci) & 15;
-                s_pages[s_apage][pidx] = ((Uint32)new_ci << 24) | (s_pal[new_ci] & 0x00FFFFFFu);
-            } else {
-                if (ci == sp.bg_color) continue;  // background colour at GET time = transparent
-                s_pages[s_apage][pidx] = ((Uint32)ci << 24) | (s_pal[ci] & 0x00FFFFFFu);
-            }
-        }
-    }
+    for (int row = 0; row < sp.h; row++)
+        for (int col = 0; col < sp.w; col++)
+            put_pixel(x + col, y + row, px_index(sp.px[(size_t)(row * sp.w + col)]), mode);
     s_needs_render = true;
 }
 
-void gfx_put_array(const int *raw_longs, int count, int x, int y, int xor_mode) {
+void gfx_put_array(const int *raw_longs, int count, int x, int y, int mode) {
     if (!s_gfx_active || !raw_longs || count < 1) return;
 
     // GW-BASIC / QB GET array format for EGA SCREEN 9 (and similar planar modes):
@@ -1313,16 +1338,7 @@ void gfx_put_array(const int *raw_longs, int count, int x, int y, int xor_mode) 
                 if (byte_off < bpp_row)
                     pal_idx |= (((plane[byte_off] >> bit) & 1) << p);
             }
-            pal_idx &= 15;
-            int dx = x + col, dy = y + row;
-            if (dx < 0 || dy < 0 || dx >= s_gfx_w || dy >= s_gfx_h) continue;
-            size_t pidx = (size_t)(dy * s_gfx_w + dx);
-            if (xor_mode) {
-                int new_ci = (px_index(s_pages[s_apage][pidx]) ^ pal_idx) & 15;
-                s_pages[s_apage][pidx] = ((Uint32)new_ci << 24) | (s_pal[new_ci] & 0x00FFFFFFu);
-            } else {
-                s_pages[s_apage][pidx] = ((Uint32)pal_idx << 24) | (s_pal[pal_idx] & 0x00FFFFFFu);
-            }
+            put_pixel(x + col, y + row, pal_idx & 15, mode);
         }
     }
     s_needs_render = true;

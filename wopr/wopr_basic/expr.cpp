@@ -1684,11 +1684,14 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                     g_current_pc = pc;
                     char *line = g_lines[pc].text;
                     char *t = sk(line);
-                    /* Stop at END FUNCTION / END SUB */
+                    /* Stop at END FUNCTION / END SUB -- this function's own:
+                     * the END SUB of a SUB it called returns from that SUB. */
                     if ((strncasecmp(t,"END",3)==0) &&
                         (kw_match(sk(t+3),"FUNCTION") || kw_match(sk(t+3),"SUB"))) {
-                        pc++;
-                        break;
+                        int inner = g_ctrl_top - 1;
+                        while (inner > call_frame &&
+                               strcmp(g_ctrl[inner].varname, "\x01""GOSUB") != 0) inner--;
+                        if (inner <= call_frame) { pc++; break; }
                     }
                     Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
                     int jumped = dispatch(&tmp_ip, line);
