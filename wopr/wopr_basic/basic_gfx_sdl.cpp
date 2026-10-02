@@ -1152,51 +1152,73 @@ void gfx_boxfill(int x1, int y1, int x2, int y2, int color) {
     s_needs_render = true;
 }
 
-void gfx_circle(int cx, int cy, int radius, int color) {
-    int x = radius, y = 0, err = 0;
-    while (x >= y) {
-        px_set(cx+x, cy+y, color); px_set(cx+y, cy+x, color);
-        px_set(cx-y, cy+x, color); px_set(cx-x, cy+y, color);
-        px_set(cx-x, cy-y, color); px_set(cx-y, cy-x, color);
-        px_set(cx+y, cy-x, color); px_set(cx+x, cy-y, color);
-        y++;
-        if (err <= 0) err += 2*y + 1;
-        else          { x--; err += 2*(y - x) + 1; }
+// An ellipse (QBasic's CIRCLE with an aspect ratio), midpoint algorithm.
+void gfx_ellipse(int cx, int cy, int rx, int ry, int color) {
+    if (rx < 0 || ry < 0) return;
+    if (rx == 0 || ry == 0) {                    // degenerate: a line
+        for (int i = -rx; i <= rx; i++) px_set(cx + i, cy, color);
+        for (int i = -ry; i <= ry; i++) px_set(cx, cy + i, color);
+        s_needs_render = true;
+        return;
+    }
+    long long a2 = (long long)rx * rx, b2 = (long long)ry * ry;
+    long long x = 0, y = ry;
+    long long d = b2 - a2 * ry + a2 / 4;
+    auto plot4 = [&](long long px, long long py) {
+        px_set(cx + (int)px, cy + (int)py, color); px_set(cx - (int)px, cy + (int)py, color);
+        px_set(cx + (int)px, cy - (int)py, color); px_set(cx - (int)px, cy - (int)py, color);
+    };
+    while (b2 * x <= a2 * y) {                   // region 1: |slope| < 1
+        plot4(x, y);
+        if (d < 0) d += b2 * (2 * x + 3);
+        else { d += b2 * (2 * x + 3) + a2 * (2 - 2 * y); y--; }
+        x++;
+    }
+    d = b2 * (x * x + x) + a2 * (y - 1) * (y - 1) - a2 * b2;
+    while (y >= 0) {                             // region 2
+        plot4(x, y);
+        if (d > 0) d += a2 * (3 - 2 * y);
+        else { d += b2 * (2 * x + 2) + a2 * (3 - 2 * y); x++; }
+        y--;
     }
     s_needs_render = true;
 }
 
-void gfx_arc(int cx, int cy, int radius, double start_a, double end_a, int color) {
-    if (radius <= 0) return;
-    // QB BASIC arc convention:
-    //   angles in radians, 0 = right (3 o'clock), increase counter-clockwise
-    //   negative angle = draw radius line to that angle endpoint
-    // Normalize: if end <= start, wrap end by adding 2*pi
+void gfx_circle(int cx, int cy, int radius, int color) {
+    gfx_ellipse(cx, cy, radius, radius, color);
+}
+
+// An arc of an ellipse, QBasic style: angles in radians, 0 = right (3
+// o'clock), counter-clockwise; a negative angle also draws the radius to
+// that end (a pie slice).
+static inline int iround(double v) { return (int)(v < 0 ? v - 0.5 : v + 0.5); }
+
+void gfx_ellipse_arc(int cx, int cy, int rx, int ry, double start_a, double end_a, int color) {
+    if (rx <= 0 && ry <= 0) return;
     const double PI2 = 6.283185307179586;
-    double sa = start_a, ea = end_a;
-    // Handle negative angles (radius line indicator — just use absolute value)
-    if (sa < 0) sa = -sa;
-    if (ea < 0) ea = -ea;
-    // Normalize to [0, 2pi)
-    while (sa < 0)    sa += PI2;
+    bool line_s = start_a < 0, line_e = end_a < 0;
+    double sa = fabs(start_a), ea = fabs(end_a);
     while (sa >= PI2) sa -= PI2;
-    while (ea < 0)    ea += PI2;
     while (ea >= PI2) ea -= PI2;
-    // If end <= start, arc wraps around
-    if (ea <= sa) ea += PI2;
-    // Step around the arc in small increments
-    int steps = (int)(radius * (ea - sa)) + 4;
-    if (steps < 4) steps = 4;
+    if (ea <= sa) ea += PI2;                     // the arc wraps around 0
+    int r = std::max(rx, ry);
+    int steps = (int)(r * (ea - sa) * 1.5) + 8;
     double step = (ea - sa) / steps;
+    int lx = 0, ly = 0;
     for (int i = 0; i <= steps; i++) {
         double angle = sa + i * step;
-        // QB: 0=right, CCW. In screen coords y increases down, so:
-        // x = cx + r*cos(angle), y = cy - r*sin(angle)
-        int px = cx + (int)(radius * cos(angle) + 0.5);
-        int py = cy - (int)(radius * sin(angle) + 0.5);
-        px_set(px, py, color);
+        int px = cx + iround(rx * cos(angle));
+        int py = cy - iround(ry * sin(angle));
+        if (i > 0) gfx_line(lx, ly, px, py, color); else px_set(px, py, color);
+        lx = px; ly = py;
     }
+    if (line_s) gfx_line(cx, cy, cx + iround(rx * cos(sa)), cy - iround(ry * sin(sa)), color);
+    if (line_e) gfx_line(cx, cy, cx + iround(rx * cos(ea)), cy - iround(ry * sin(ea)), color);
     s_needs_render = true;
+}
+
+void gfx_arc(int cx, int cy, int radius, double start_a, double end_a, int color) {
+    gfx_ellipse_arc(cx, cy, radius, radius, start_a, end_a, color);
 }
 
 void gfx_paint(int x, int y, int fill_color, int border_color) {

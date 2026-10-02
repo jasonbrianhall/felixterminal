@@ -2500,7 +2500,7 @@ static int cmd_circle(Interp *ip, char *args) {
     }
     int color = color_resolve(color_raw);
     /* Parse optional start_angle, end_angle, aspect */
-    double start_angle = 0.0, end_angle = 0.0;
+    double start_angle = 0.0, end_angle = 0.0, aspect = -1.0;
     int has_arc = 0, filled = 0;
     int arg_n = 0;
     while (*p == ',') {
@@ -2513,17 +2513,27 @@ static int cmd_circle(Interp *ip, char *args) {
         double val = mpf_get_d(tmp); mpf_clear(tmp);
         if (arg_n == 0)      { start_angle = val; has_arc = 1; }
         else if (arg_n == 1) { end_angle   = val; has_arc = 1; }
-        /* arg_n==2 is aspect ratio  ignored */
+        else if (arg_n == 2) aspect = val;
         arg_n++;
     }
 #ifdef USE_SDL_WINDOW
+    /* QBasic's aspect ratio: y radius / x radius. By default the screen's
+     * own (4/3 x height/width), so circles come out round on the 4:3
+     * screen every mode is shown on. Below 1, r is the x radius; above,
+     * the y radius. */
+    if (aspect <= 0 && gfx_width() > 0)
+        aspect = 4.0 / 3.0 * gfx_height() / gfx_width();
+    if (aspect <= 0) aspect = 1.0;
+    double rxd = r, ryd = r;
+    if (aspect < 1.0) ryd = r * aspect; else rxd = r / aspect;
+    int rx = (int)(rxd + 0.5), ry = (int)(ryd + 0.5);
     if (filled) {
-        gfx_circle((int)x, (int)y, (int)(r + 0.5), color);
+        gfx_ellipse((int)x, (int)y, rx, ry, color);
         gfx_paint((int)x, (int)y, color, color);
     } else if (has_arc) {
-        gfx_arc((int)x, (int)y, (int)(r + 0.5), start_angle, end_angle, color);
+        gfx_ellipse_arc((int)x, (int)y, rx, ry, start_angle, end_angle, color);
     } else {
-        gfx_circle((int)x, (int)y, (int)(r + 0.5), color);
+        gfx_ellipse((int)x, (int)y, rx, ry, color);
     }
 #else
     felix_drawf("circle;%d;%d;%d;%d",

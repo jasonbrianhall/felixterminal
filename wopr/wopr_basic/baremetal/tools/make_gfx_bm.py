@@ -91,21 +91,24 @@ void gfx_maybe_mark_dirty() {
     }
 }
 
-// Work out where things go on the framebuffer for the current mode: scaled
-// up to fill as much of the screen as fits, pixels kept square (as the
-// SDL window shows them). Text mode: 80 (or 40) x 25 cells of the 8x16
-// font (40 columns get double-width characters, as on the PC and the Apple
-// II), at a whole-number scale when that comes close to filling the screen,
-// so the font stays crisp. Graphics: the page, with the 80x25 text grid
-// over it.
+// Work out where things go on the framebuffer for the current mode. Every
+// mode fills the largest 4:3 area of the screen, the shape of the monitors
+// these modes were made for (an EGA's 640x350 filled one, as 320x200 did,
+// and as the SDL window shows them; CIRCLE's aspect ratio keeps circles
+// round). Text mode: 80 (or 40) x 25 cells of the 8x16 font (40 columns
+// get double-width characters, as on the PC and the Apple II), at a
+// whole-number scale when that comes close to filling it, so the font
+// stays crisp. Graphics: the page stretched to fit, with the 80x25 text
+// grid over it.
 static void layout() {
     int fw = (int)fb_width(), fh = (int)fb_height();
+    int dh = std::min(fh, fw * 3 / 4);
+    int dw = std::min(fw, dh * 4 / 3);
     if (!s_gfx_active) {
         s_text_rows = TEXT_ROWS_DEF;
         int bw = 640 / s_text_cols, bh = 16, th = s_text_rows * bh;
-        int dw = std::min(fw, fh * 640 / th), dh = dw * th / 640;   // 640x400, fitted
-        int k = std::max(1, std::min(fw / 640, fh / th));
-        if (640 * k * 5 >= dw * 4) {
+        int k = std::max(1, std::min(dw / 640, dh / th));
+        if (640 * k * 5 >= dw * 4 && th * k * 5 >= dh * 4) {
             s_cell_w = bw * k; s_cell_h = bh * k;            // crisp
         } else {
             s_cell_w = std::max(bw, dw / s_text_cols);       // stretched to fit
@@ -113,9 +116,7 @@ static void layout() {
         }
         s_disp_w = s_cell_w * s_text_cols; s_disp_h = s_cell_h * s_text_rows;
     } else {
-        int gw = std::max(1, s_gfx_w), gh = std::max(1, s_gfx_h);
-        int dw = fw, dh = (int)((long long)fw * gh / gw);
-        if (dh > fh) { dh = fh; dw = (int)((long long)fh * gw / gh); }
+        int gw = std::max(1, s_gfx_w);
         s_disp_w = std::max(1, dw); s_disp_h = std::max(1, dh);
         s_xmap.resize((size_t)s_disp_w);
         for (int x = 0; x < s_disp_w; x++) s_xmap[(size_t)x] = (int)((long long)x * gw / s_disp_w);

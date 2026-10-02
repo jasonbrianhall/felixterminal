@@ -59,6 +59,10 @@ void gfx_circle(int cx, int cy, int radius, int color);
  * 0=right, increases counter-clockwise). Negative angles draw a radius line. */
 void gfx_arc(int cx, int cy, int radius, double start_angle, double end_angle, int color);
 
+/* The same with separate x and y radii (CIRCLE's aspect ratio). */
+void gfx_ellipse(int cx, int cy, int rx, int ry, int color);
+void gfx_ellipse_arc(int cx, int cy, int rx, int ry, double start_angle, double end_angle, int color);
+
 /* Flood-fill from (x,y) with fill_color, stopping at border_color. */
 void gfx_paint(int x, int y, int fill_color, int border_color);
 

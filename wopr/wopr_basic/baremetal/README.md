@@ -57,9 +57,10 @@ framebuffer (VBE 2.0; UniVBE adds it to older cards).
 The text screen is 80x25 (or 40x25 after `WIDTH 40`, with double-width
 characters) in the 8x16 VGA font, scaled up to fill the screen (by whole
 numbers when that comes close, so the font stays crisp). Graphics modes
-(`SCREEN 1`, `7`, `9`, `12`, `13`, ...) are scaled up to fill as much of the
-screen as fits, pixels kept square as in the SDL window, with the text grid
-over them. The CP437 box-drawing, block and shade
+(`SCREEN 1`, `7`, `9`, `12`, `13`, ...) fill the largest 4:3 area of the
+screen, the shape of the monitors they were made for (as the SDL window
+shows them), with the text grid over them; `CIRCLE` uses QBasic's aspect
+ratio, so circles stay round. The CP437 box-drawing, block and shade
 characters (`CHR$(176)`-`CHR$(223)`) are drawn too.
 
 `SOUND`, `BEEP` and `PLAY` go through the PC speaker, as on the original
