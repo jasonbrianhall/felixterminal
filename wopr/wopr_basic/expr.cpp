@@ -1694,6 +1694,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                         if (inner <= call_frame) { pc++; break; }
                     }
                     basic_frame_tick();
+                    if (g_break) break;      /* Ctrl+C / Ctrl+Break, or the window closed */
                     Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
                     int jumped = dispatch(&tmp_ip, line);
                     if (!tmp_ip.running) break;

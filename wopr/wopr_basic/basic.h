@@ -62,6 +62,11 @@ typedef struct _mpf_struct mpf_t[1];
 
 
 
+/* Hosted builds: g_break expands to this global (defined in main.cpp). */
+#if defined(WOPR) || defined(FELIX_BASIC)
+extern volatile sig_atomic_t BASIC_BREAK_SYM;
+#endif
+
 BASIC_NS_BEGIN
 
 /* ================================================================

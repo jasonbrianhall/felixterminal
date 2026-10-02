@@ -992,7 +992,10 @@ End Function
 'Rest:
 '  pauses the program
 Sub Rest (t#)
-    If (t# > 0) Then Delay t#
+    ' The original timed its pauses with DOS's clock, which ticks 18.2 times
+    ' a second, so every pause ran to the next tick: at least 1/18 second.
+    ' That is what sets the speed of the banana's flight and the explosions.
+    If (t# > 0) Then Delay (Int(t# * 18.2) + 1) / 18.2
 End Sub
 
 'Scl:
