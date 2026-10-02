@@ -16,7 +16,12 @@
 #define FB_H 480
 #define FB_BPP 32
 #endif
-    .long FB_W, FB_H, FB_BPP     # preferred width, height, depth
+#ifndef MB_W                     /* what to ask the boot loader for; 0: no preference */
+#define MB_W FB_W
+#define MB_H FB_H
+#define MB_BPP FB_BPP
+#endif
+    .long MB_W, MB_H, MB_BPP     # preferred width, height, depth
 
 .section .bss
 .align 16

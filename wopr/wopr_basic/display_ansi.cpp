@@ -417,11 +417,16 @@ int display_getline(char *buf, int bufsz)
         }
     };
 
+    int interrupted = 0;
     for (;;) {
         unsigned char c;
         ssize_t n = read(STDIN_FILENO, &c, 1);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR && g_break) interrupted = 1;   /* Ctrl+C */
+            break;
+        }
 
+        if (c == 3) { interrupted = 1; break; }   /* Ctrl+C, when the terminal passes it on */
         if (c == '\n' || c == '\r') {
             write(STDOUT_FILENO, "\r\n", 2);
             break;
@@ -533,6 +538,12 @@ int display_getline(char *buf, int bufsz)
         int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
         g_raw = 1;
+    }
+    if (interrupted) {             /* Ctrl+C at the prompt closes BASIC */
+        g_break = 0;
+        write(STDOUT_FILENO, "\r\n", 2);
+        buf[0] = '\0';
+        return -1;
     }
     return len;
 }

@@ -54,12 +54,12 @@ s = replace_between(s, '''// ===================================================
 // SDL globals''', '''// ============================================================================
 // Frame rate limiting''', '''// ============================================================================
 // Screen layout (bare metal): where the text grid / graphics page land on
-// the framebuffer, at whole-number scales so the 8x16 font stays crisp.
+// the framebuffer, scaled to fill it as a monitor of the day would have.
 // ============================================================================
 static bool          s_needs_render = true;
 static Uint32        s_last_dirty = 0;
 static int           s_disp_x = 0, s_disp_y = 0, s_disp_w = 640, s_disp_h = 400;
-static int           s_gsx = 1, s_gsy = 1;      // graphics page scale
+static std::vector<int> s_xmap;                 // screen column -> graphics page column
 static bool          s_layout_changed = true;    // clear the borders on the next render
 
 ''')
@@ -91,28 +91,34 @@ void gfx_maybe_mark_dirty() {
     }
 }
 
-// Work out where things go on the framebuffer for the current mode.
-// Text mode: 80 (or 40) x 25 cells of the 8x16 font, scaled by the largest
-// whole number that fits (40 columns get double-width characters, as on the
-// PC and the Apple II). Graphics: the page at whole-number scales chosen to
-// come close to the 4:3 shape of a monitor, with the 80x25 text grid over it.
+// Work out where things go on the framebuffer for the current mode: scaled
+// up to fill as much of the screen as fits, pixels kept square (as the
+// SDL window shows them). Text mode: 80 (or 40) x 25 cells of the 8x16
+// font (40 columns get double-width characters, as on the PC and the Apple
+// II), at a whole-number scale when that comes close to filling the screen,
+// so the font stays crisp. Graphics: the page, with the 80x25 text grid
+// over it.
 static void layout() {
     int fw = (int)fb_width(), fh = (int)fb_height();
     if (!s_gfx_active) {
         s_text_rows = TEXT_ROWS_DEF;
-        int bw = 640 / s_text_cols, bh = 16;
-        int k = std::max(1, std::min(fw / 640, fh / (s_text_rows * bh)));
-        s_cell_w = bw * k; s_cell_h = bh * k;
+        int bw = 640 / s_text_cols, bh = 16, th = s_text_rows * bh;
+        int dw = std::min(fw, fh * 640 / th), dh = dw * th / 640;   // 640x400, fitted
+        int k = std::max(1, std::min(fw / 640, fh / th));
+        if (640 * k * 5 >= dw * 4) {
+            s_cell_w = bw * k; s_cell_h = bh * k;            // crisp
+        } else {
+            s_cell_w = std::max(bw, dw / s_text_cols);       // stretched to fit
+            s_cell_h = std::max(bh, dh / s_text_rows);
+        }
         s_disp_w = s_cell_w * s_text_cols; s_disp_h = s_cell_h * s_text_rows;
     } else {
         int gw = std::max(1, s_gfx_w), gh = std::max(1, s_gfx_h);
-        int sx = std::max(1, fw / gw);
-        double ratio = (gw * 3.0 / 4.0) / gh;               // 4:3 display
-        int sy = std::max(1, (int)(sx * ratio + 0.5));
-        while (sy > 1 && gh * sy > fh) sy--;
-        while (sx > 1 && gh * sy > fh) { sx--; sy = std::max(1, (int)(sx * ratio + 0.5)); }
-        s_gsx = sx; s_gsy = sy;
-        s_disp_w = std::min(fw, gw * sx); s_disp_h = std::min(fh, gh * sy);
+        int dw = fw, dh = (int)((long long)fw * gh / gw);
+        if (dh > fh) { dh = fh; dw = (int)((long long)fh * gw / gh); }
+        s_disp_w = std::max(1, dw); s_disp_h = std::max(1, dh);
+        s_xmap.resize((size_t)s_disp_w);
+        for (int x = 0; x < s_disp_w; x++) s_xmap[(size_t)x] = (int)((long long)x * gw / s_disp_w);
         s_text_cols = TEXT_COLS_DEF; s_text_rows = TEXT_ROWS_DEF;
         s_cell_w = std::max(1, s_disp_w / s_text_cols);
         s_cell_h = std::max(1, s_disp_h / s_text_rows);
@@ -265,23 +271,19 @@ static void render_strip(int y0, int lines) {
     uint32_t* strip = video_band(y0, lines);
     if (!strip) return;
     for (size_t i = 0; i < (size_t)w * lines; i++) strip[i] = 0;
-    // 1. The visible graphics page, scaled up
+    // 1. The visible graphics page, scaled to the display area
     if (s_gfx_active) {
         const std::vector<Uint32> &vpx = (s_vpage < GFX_MAX_PAGES && !s_pages[s_vpage].empty())
                                           ? s_pages[s_vpage] : s_pages[0];
-        if (!vpx.empty()) {
-            int cols = std::min(s_gfx_w, s_disp_w / s_gsx);
+        if (!vpx.empty() && (int)s_xmap.size() == s_disp_w && s_gfx_h > 0) {
+            const int* xm = s_xmap.data();
             for (int r = 0; r < lines; r++) {
                 int y = y0 + r - s_disp_y;
                 if (y < 0 || y >= s_disp_h) continue;
-                int gy = y / s_gsy;
-                if (gy >= s_gfx_h) continue;
+                int gy = (int)((long long)y * s_gfx_h / s_disp_h);
                 const Uint32* src = &vpx[(size_t)gy * s_gfx_w];
                 Uint32* d = &strip[(size_t)r * w + s_disp_x];
-                for (int gx = 0; gx < cols; gx++) {
-                    Uint32 p = src[gx] & 0xFFFFFF;
-                    for (int k = 0; k < s_gsx; k++) *d++ = p;
-                }
+                for (int x = 0; x < s_disp_w; x++) d[x] = src[xm[x]] & 0xFFFFFF;
             }
         }
     }

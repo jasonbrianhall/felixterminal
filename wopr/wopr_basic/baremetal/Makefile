@@ -38,14 +38,15 @@ SUFFIX   :=
 BOOT_S   := boot.S
 USB_OBJ  := usb
 LDEMU    :=
-# VGA's 640x480 first: the 80x25 screen and every SCREEN mode fit it at
-# whole-number scales. GRUB falls back along the list.
-GFXMODE  := 640x480x32,640x480x16,640x480x8,800x600x32,1024x768x32,auto
-FBDEFS   := -DFB_W=640 -DFB_H=480 -DFB_BPP=32
+# The screen's own resolution first (GRUB's "auto": the monitor's preferred
+# mode), so the picture fills it; BASIC scales every mode to fit. GRUB falls
+# back along the list.
+GFXMODE  := auto,1024x768x32,800x600x32,640x480x32,640x480x16,640x480x8
+# The boot loader picks the mode from GFXMODE (no preference in the kernel's
+# header); 640x480 is for QEMU -kernel, which sets none.
+FBDEFS   := -DFB_W=640 -DFB_H=480 -DFB_BPP=32 -DMB_W=0 -DMB_H=0 -DMB_BPP=0
 ARCHFLAGS := -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -msse2
-# Every variable carries its own array slots (../basic.h): 256 x 4096 is
-# 16 MB, so BASIC runs in 32 MB. (The desktop build's 16384 x 4096 would
-# be a gigabyte.)
+# Arrays take memory when they're DIMmed; these size the fixed tables.
 LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=65536 -DCTRL_STACK_MAX=1024 -DMAX_VARNAME=128 -DMAX_DIR_ENTRIES=512
 else ifeq ($(ARCH),i386)
 MFLAG    := -m32
@@ -55,13 +56,13 @@ BOOT_S   := boot32.S
 # for a 386's memory.
 USB_OBJ  := usb_none
 LDEMU    := -m elf_i386
-# 640x480 at 8 bits needs only a 512 KB VESA card.
+# 640x480 at 8 bits needs only a 512 KB VESA card, and is quick to redraw
+# on a 386; BASIC scales it to fill the screen.
 GFXMODE  := 640x480x8,640x480x16,640x480x15,640x480x32,800x600x8,1024x768x8,auto
 FBDEFS   := -DFB_W=640 -DFB_H=480 -DFB_BPP=8
 ARCHFLAGS := -fno-pic -fno-pie -march=i386 -mtune=i486 -mfpmath=387 -mno-sse
-# 200 variables x 1024-element arrays (about 2.5 MB), 512-deep FOR/GOSUB
-# nesting, 63-character names and 256-entry FILES listings: BASIC fits in
-# an 8 MB machine.
+# 512 variables, 512-deep FOR/GOSUB nesting, 63-character names and
+# 256-entry FILES listings: BASIC runs in a 4 MB machine.
 LIMITS   := -DMAX_VARS=512 -DMAX_ARRAY_SIZE=32768 -DCTRL_STACK_MAX=512 -DMAX_VARNAME=64 -DMAX_DIR_ENTRIES=256
 else
 $(error ARCH must be x86_64 or i386)
@@ -73,7 +74,7 @@ BASE     := $(MFLAG) $(ARCHFLAGS) $(FBDEFS) -O2 -fno-stack-protector -fno-asynch
 CXXFLAGS := $(BASE) -std=gnu++17 -fno-rtti -fno-threadsafe-statics -Ioverrides -I$(SRC) -I. -Wno-write-strings
 # The interpreter, as its own Makefile builds the SDL window version
 # (graphics on) without GMP. -fpermissive and -w as there.
-CORE_FLAGS := $(CXXFLAGS) -DUSE_SDL_WINDOW -DDONTUSEGMP $(LIMITS) -fpermissive -w
+CORE_FLAGS := $(CXXFLAGS) -DUSE_SDL_WINDOW -DBASIC_BAREMETAL -DDONTUSEGMP $(LIMITS) -fpermissive -w
 # Interrupt-time code (and what it calls) never touches SSE or x87
 # registers: the entry stubs save only the general-purpose ones.
 IRQFLAGS := $(filter-out -msse2 -mfpmath=387,$(CXXFLAGS)) -mgeneral-regs-only
@@ -115,7 +116,7 @@ $(BUILD)/sound_bm.o: sound_bm.cpp $(HDRS) $(CORE_HDRS) $(BUILD)/limits
 
 $(BUILD)/kernel.o: kernel.cpp $(HDRS) $(CORE_HDRS) $(BUILD)/limits
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) -DUSE_SDL_WINDOW -DDONTUSEGMP $(LIMITS) -w -c $< -o $@
+	$(CXX) $(CXXFLAGS) -DUSE_SDL_WINDOW -DBASIC_BAREMETAL -DDONTUSEGMP $(LIMITS) -w -c $< -o $@
 
 # Rebuild everything that depends on the limits when they change.
 $(BUILD)/limits: FORCE

@@ -1530,6 +1530,15 @@ int display_getline(char *buf, int bufsz) {
         int c = key_pop();
         if (c < 0) { SDL_Delay(10); continue; }
 
+#ifndef BASIC_BAREMETAL
+        if (c == 3) {
+            // Ctrl+C at the prompt closes BASIC, as in a terminal
+            BASIC_NS::g_break = 0;
+            text_newline();
+            buf[0] = '\0';
+            return -1;
+        }
+#endif
         if (c == '\n' || c == '\r') {
             // Commit: advance cursor past the typed text
             s_cur_col = start_col + len;

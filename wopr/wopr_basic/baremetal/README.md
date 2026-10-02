@@ -40,7 +40,7 @@ survives a reboot.
 |---|---|---|
 | CPU | any 64-bit PC | 386 or later, **with a 387** (or a 486DX) |
 | RAM | 6 MB (7 MB for 640x480 graphics) | 4 MB (5 MB for 640x480 graphics) |
-| Screen | 640x480, else larger | 640x480 at 8 bits (a 512 KB VESA card), else larger |
+| Screen | the monitor's own resolution, else 1024x768 or smaller | 640x480 at 8 bits (a 512 KB VESA card), else larger |
 | Sound | HD Audio or AC97, else PC speaker | PC speaker (or AC97/HD Audio on a PCI machine) |
 | Keyboard | PS/2 and USB | PS/2 |
 | Limits | 1024 variables, arrays up to 65536 elements | 512 variables, arrays up to 32768 elements |
@@ -55,10 +55,11 @@ the machine says so. The video card needs a VESA BIOS with a linear
 framebuffer (VBE 2.0; UniVBE adds it to older cards).
 
 The text screen is 80x25 (or 40x25 after `WIDTH 40`, with double-width
-characters) in the 8x16 VGA font, scaled up by whole numbers on bigger
-screens. Graphics modes (`SCREEN 1`, `7`, `9`, `12`, `13`, ...) are drawn at
-whole-number scales close to the shape of a 4:3 monitor, with the text grid
-over them as in the SDL build. The CP437 box-drawing, block and shade
+characters) in the 8x16 VGA font, scaled up to fill the screen (by whole
+numbers when that comes close, so the font stays crisp). Graphics modes
+(`SCREEN 1`, `7`, `9`, `12`, `13`, ...) are scaled up to fill as much of the
+screen as fits, pixels kept square as in the SDL window, with the text grid
+over them. The CP437 box-drawing, block and shade
 characters (`CHR$(176)`-`CHR$(223)`) are drawn too.
 
 `SOUND`, `BEEP` and `PLAY` go through the PC speaker, as on the original
