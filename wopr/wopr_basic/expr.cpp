@@ -1693,6 +1693,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
                                strcmp(g_ctrl[inner].varname, "\x01""GOSUB") != 0) inner--;
                         if (inner <= call_frame) { pc++; break; }
                     }
+                    basic_frame_tick();
                     Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
                     int jumped = dispatch(&tmp_ip, line);
                     if (!tmp_ip.running) break;

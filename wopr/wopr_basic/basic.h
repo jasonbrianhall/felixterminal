@@ -167,6 +167,7 @@ Var    *var_find(char *name);
 Var    *var_create(char *name);
 Var    *var_get(char *name);
 mpf_t  *arr_num_elem(Var *v, int i, int j);
+void    basic_frame_tick(void);       /* present the screen now and then */
 void    var_free_arrays(Var *v);      /* release an array's elements and storage */
 bool    var_alloc_array(Var *v, int total, int is_str);
 char  **arr_str_elem(Var *v, int i, int j);

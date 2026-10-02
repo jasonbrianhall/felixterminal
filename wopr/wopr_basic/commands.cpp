@@ -335,6 +335,7 @@ static int cmd_fullscreen(Interp *ip, char *args) {
 }
 
 /* DELAY t# / SLEEP t#  pause for t# seconds (QB64 built-ins) */
+static void basic_wait(double secs);
 static int cmd_delay(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
@@ -343,12 +344,7 @@ static int cmd_delay(Interp *ip, char *args) {
     eval_expr(p, n);
     double secs = mpf_get_d(n);
     mpf_clear(n);
-    if (secs > 0) {
-        struct timespec ts;
-        ts.tv_sec  = (time_t)secs;
-        ts.tv_nsec = (long)((secs - (double)ts.tv_sec) * 1e9);
-        nanosleep(&ts, NULL);
-    }
+    if (secs > 0) basic_wait(secs);
     return 0;
 }
 
@@ -448,9 +444,7 @@ static int cmd_qlimit(Interp *ip, char *args) {
         if (last_time > 0) {
             uint32_t frame_time = (uint32_t)(1000.0 / fps);
             uint32_t elapsed = now - last_time;
-            if (elapsed < frame_time) {
-                SDL_Delay(frame_time - elapsed);
-            }
+            if (elapsed < frame_time) basic_wait((frame_time - elapsed) / 1000.0);
         }
         last_time = SDL_GetTicks();
     }
@@ -595,6 +589,44 @@ static int cmd_system(Interp *ip, char *args) {
     return 1;
 }
 
+/* Show what's been drawn and keep the window alive while a program waits
+ * (DELAY, SLEEP, _LIMIT), so animation paced by them is seen frame by
+ * frame. Ctrl+Break ends the wait. */
+static void basic_wait(double secs) {
+#ifdef USE_SDL_WINDOW
+    ::gfx_sdl_pump();
+    ::gfx_sdl_render();
+    Uint32 end = SDL_GetTicks() + (Uint32)(secs * 1000.0 + 0.5);
+    while (!g_break) {
+        Sint32 left = (Sint32)(end - SDL_GetTicks());
+        if (left <= 0) break;
+        SDL_Delay(left > 10 ? 10 : (Uint32)left);
+        ::gfx_sdl_pump();
+    }
+#elif defined(_WIN32)
+    Sleep((DWORD)(secs * 1000));
+#else
+    struct timespec ts;
+    ts.tv_sec  = (time_t)secs;
+    ts.tv_nsec = (long)((secs - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+#endif
+}
+
+/* Called between statements run outside the main loop (FUNCTION bodies):
+ * present the screen every 16 ms, as the main loop does. */
+void basic_frame_tick(void) {
+#ifdef USE_SDL_WINDOW
+    static Uint32 last = 0;
+    Uint32 now = SDL_GetTicks();
+    if (now - last >= 16) {
+        ::gfx_sdl_pump();
+        ::gfx_sdl_render();
+        last = now;
+    }
+#endif
+}
+
 static int cmd_sleep(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
@@ -605,16 +637,7 @@ static int cmd_sleep(Interp *ip, char *args) {
         secs = mpf_get_d(n);
         mpf_clear(n);
     }
-    if (secs > 0) {
-#ifdef _WIN32
-        Sleep((DWORD)(secs * 1000));
-#else
-        struct timespec ts;
-        ts.tv_sec  = (time_t)secs;
-        ts.tv_nsec = (long)((secs - (long)secs) * 1e9);
-        nanosleep(&ts, NULL);
-#endif
-    }
+    if (secs > 0) basic_wait(secs);
     return 0;
 }
 
@@ -1412,16 +1435,20 @@ static int cmd_end_sub(Interp *ip, char *args) {
 /* ================================================================
  * CALL subname [args]  for now, treat as GOSUB to label
  * ================================================================ */
-/* SUB arguments are passed by reference, as in QBasic: a variable given
- * as an argument gets the parameter's value back when the SUB returns, and
+/* SUB parameters, as in QBasic: a variable given as an argument is passed
+ * by reference (it gets the parameter's value back when the SUB returns),
  * an array passed as A() is the parameter array while the SUB runs (its
- * storage moves to the parameter and back). Each entry belongs to the
- * call's frame on the control stack. */
+ * storage moves to the parameter and back), and a parameter is local to
+ * the SUB: a variable of the same name outside it keeps its value. Each
+ * entry belongs to the call's frame on the control stack. */
 typedef struct {
-    int  frame;
-    int  is_array;
-    char param[MAX_VARNAME];
-    char caller[MAX_VARNAME];
+    int    frame;
+    int    is_array;
+    char   param[MAX_VARNAME];
+    char   caller[MAX_VARNAME];     /* "" when passed by value */
+    int    saved_kind;              /* the parameter's variable before the call; -1: none */
+    mpf_t  saved_num;
+    char  *saved_str;
 } ByRef;
 #define MAX_BYREF 256
 static ByRef g_byref[MAX_BYREF];
@@ -1436,27 +1463,59 @@ static void array_move(Var *to, Var *from) {
     from->arr_len = 0; from->arr_num = NULL; from->arr_str = NULL;
 }
 
+static void byref_drop(ByRef *b) {
+    if (!b->is_array) { mpf_clear(b->saved_num); free(b->saved_str); b->saved_str = NULL; }
+}
+
+/* Put back the variable a parameter shadowed. */
+static void byref_restore(ByRef *b, Var *pv) {
+    if (b->saved_kind == VAR_STR) {
+        if (pv->kind == VAR_STR) free(pv->str);
+        pv->kind = VAR_STR; pv->str = b->saved_str; b->saved_str = NULL;
+    } else if (b->saved_kind == VAR_NUM) {
+        if (pv->kind == VAR_STR) { free(pv->str); pv->str = NULL; }
+        pv->kind = VAR_NUM; mpf_set(pv->num, b->saved_num);
+    } else if (var_is_str_name(b->param)) {
+        if (pv->kind == VAR_STR) free(pv->str);
+        pv->kind = VAR_STR; pv->str = str_dup((char *)"");
+    } else if (pv->kind == VAR_NUM) {
+        mpf_set_ui(pv->num, 0);
+    }
+}
+
+/* Entries for frames unwound without a return (GOTO out, RUN) are stale. */
+static void byref_prune(int top) {
+    while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= top) byref_drop(&g_byref[--g_nbyref]);
+}
+
 /* The SUB whose frame is `fi` returns: hand back what it was given. */
 static void byref_return(int fi) {
     while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= fi) {
         ByRef *b = &g_byref[--g_nbyref];
-        if (b->frame != fi) continue;          /* a frame unwound without returning */
+        if (b->frame != fi) { byref_drop(b); continue; }   /* unwound without returning */
         Var *pv = var_find(b->param);
-        if (!pv) continue;
+        if (!pv) { byref_drop(b); continue; }
+        if (!b->is_array) {
+            if (b->caller[0]) {
+                Var *cv = var_get(b->caller);
+                pv = var_find(b->param);
+                if (var_is_str_name(b->caller)) {
+                    char *dup = str_dup((pv->kind == VAR_STR && pv->str) ? pv->str : (char *)"");
+                    if (cv->kind == VAR_STR) free(cv->str);
+                    cv->kind = VAR_STR; cv->str = dup;
+                } else if (pv->kind == VAR_NUM) {
+                    mpf_set(cv->num, pv->num);
+                }
+            }
+            byref_restore(b, pv);
+            byref_drop(b);
+            continue;
+        }
         if (b->is_array) {
             if (pv->kind != VAR_ARRAY_NUM && pv->kind != VAR_ARRAY_STR) continue;
             Var *cv = var_get(b->caller);
             array_move(cv, pv);
             pv->kind = VAR_NUM; pv->ndim = 0;
-        } else {
-            Var *cv = var_get(b->caller);
-            if (var_is_str_name(b->caller)) {
-                char *dup = str_dup((pv->kind == VAR_STR && pv->str) ? pv->str : (char *)"");
-                if (cv->kind == VAR_STR) free(cv->str);
-                cv->kind = VAR_STR; cv->str = dup;
-            } else if (pv->kind == VAR_NUM) {
-                mpf_set(cv->num, pv->num);
-            }
         }
     }
 }
@@ -1513,8 +1572,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
         param_src = sp;
     }
 
-    /* Entries for frames that were unwound without a return are stale. */
-    while (g_nbyref > 0 && g_byref[g_nbyref-1].frame >= g_ctrl_top) g_nbyref--;
+    byref_prune(g_ctrl_top);
     int frame = g_ctrl_top;           /* the frame cmd_gosub pushes below */
     int nbyref0 = g_nbyref;
 
@@ -1574,11 +1632,26 @@ static int call_sub(Interp *ip, char *args, int bare) {
                 if (*ps == ',') ps = sk(ps + 1);
                 continue;
             }
-            if (by_ref) {
+            /* The parameter is local: remember the variable it shadows (not
+             * when the argument is that same variable, passed by reference). */
+            int same = byref_arg(cs, aname, &is_arr) && strcasecmp(aname, pname) == 0;
+            if (!same && g_nbyref < MAX_BYREF) {
                 ByRef *b = &g_byref[g_nbyref++];
                 b->frame = frame; b->is_array = 0;
                 strncpy(b->param, pname, MAX_VARNAME - 1); b->param[MAX_VARNAME-1] = 0;
-                strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0;
+                if (by_ref) { strncpy(b->caller, aname, MAX_VARNAME - 1); b->caller[MAX_VARNAME-1] = 0; }
+                else b->caller[0] = 0;
+                mpf_init2(b->saved_num, g_prec);
+                b->saved_str = NULL;
+                b->saved_kind = -1;
+                Var *pv0 = var_find(pname);
+                if (pv0 && pv0->kind == VAR_STR) {
+                    b->saved_kind = VAR_STR;
+                    b->saved_str = str_dup(pv0->str ? pv0->str : (char *)"");
+                } else if (pv0 && pv0->kind == VAR_NUM) {
+                    b->saved_kind = VAR_NUM;
+                    mpf_set(b->saved_num, pv0->num);
+                }
             }
 
             if (var_is_str_name(pname)) {
@@ -1603,7 +1676,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
         }
     }
 
-    if (find_line_by_label(name) < 0) { byref_return(frame); g_nbyref = nbyref0; return 0; }
+    if (find_line_by_label(name) < 0) { byref_return(frame); (void)nbyref0; return 0; }
     int r = cmd_gosub(ip, name);
     if (r < 0) byref_return(frame);      /* the call didn't happen: give it all back */
     return r;
@@ -3263,8 +3336,8 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
         if (*after == '#' || *after == '!' || *after == '%' || *after == '&') after++;
         after = sk(after);
         if (*after == '=') return cmd_let(ip, p);
-        /* struct field: name.field = ... */
-        if (*after == '.') return cmd_let(ip, p);
+        /* struct field: name.field = ...  ("Rest .02" is a SUB call with a number) */
+        if (*after == '.' && !isdigit((unsigned char)after[1])) return cmd_let(ip, p);
         /* name(...)  peek past the argument list to decide: assignment or bare expression */
         if (*after == '(') {
             char *peek = after + 1;
