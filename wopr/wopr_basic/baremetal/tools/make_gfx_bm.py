@@ -234,17 +234,40 @@ static bool glyph_px(unsigned char ch, int x, int y) {
     return y >= 3 && y <= 12 && x >= 1 && x <= 6 && (x == 1 || x == 6 || y == 3 || y == 12);   // unknown: a box
 }
 
-// Which font row (of 16) and column (of 8) a cell pixel shows. Cells of 14
-// or 15 lines (EGA's 640x350) drop the font's blank top/bottom rows; other
-// sizes scale.
-static int glyph_row(int y) {
-    if (s_cell_h == 14 || s_cell_h == 15) return y + (16 - s_cell_h + 1) / 2;
-    return y * 16 / s_cell_h;
+// Which font row (of 16) / column (of 8) each pixel of a cell shows, or -1
+// for padding. A cell close to a whole multiple of the font (8x16 in a
+// 8x19 cell, say: 640x480 over 25 rows) gets the font at that multiple,
+// crisp, centred with a little padding; a cell well between multiples
+// (13 wide: 1.6 times) has the font stretched to it. Cells of 14 or 15
+// lines (EGA's 640x350) drop the font's blank top/bottom rows.
+static int s_glyph_x[256], s_glyph_y[256];
+static int s_glyph_cw = -1, s_glyph_ch = -1;
+static void glyph_axis(int* map, int cell, int font) {
+    cell = std::min(cell, 256);
+    int k = cell / font;
+    if (k >= 1 && cell - k * font < font / 2) {          // crisp, padded
+        int pad = (cell - k * font) / 2;
+        for (int i = 0; i < cell; i++) {
+            int f = (i - pad) / k;
+            map[i] = (i >= pad && f < font) ? f : -1;
+        }
+    } else if (font == 16 && (cell == 14 || cell == 15)) {  // EGA: crop
+        for (int i = 0; i < cell; i++) map[i] = i + (16 - cell + 1) / 2;
+    } else {                                                 // stretched
+        for (int i = 0; i < cell; i++) map[i] = i * font / cell;
+    }
+}
+static void glyph_maps() {
+    if (s_glyph_cw == s_cell_w && s_glyph_ch == s_cell_h) return;
+    glyph_axis(s_glyph_x, s_cell_w, 8);
+    glyph_axis(s_glyph_y, s_cell_h, 16);
+    s_glyph_cw = s_cell_w; s_glyph_ch = s_cell_h;
 }
 
 // Draw text row `row`'s cells into a strip whose first line is screen line y0.
 static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
     uint32_t w = fb_width();
+    glyph_maps();
     for (int col = 0; col < s_text_cols; col++) {
         const Cell cell = scrollback_get_cell(row, col);
         unsigned char ch = (unsigned char)cell.ch;
@@ -255,13 +278,16 @@ static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
         Uint32 fg = s_pal[cell.fg & 15] & 0xFFFFFF, bg = s_pal[cell.bg & 15] & 0xFFFFFF;
         int x0 = s_disp_x + col * s_cell_w;
         int cy0 = s_disp_y + row * s_cell_h;
-        for (int y = 0; y < s_cell_h; y++) {
+        int cw = std::min(s_cell_w, 256), chh = std::min(s_cell_h, 256);
+        for (int y = 0; y < chh; y++) {
             int sy = cy0 + y - y0;
             if (sy < 0 || sy >= lines) continue;
-            int gy = glyph_row(y);
+            int gy = s_glyph_y[y];
             Uint32* d = &strip[(size_t)sy * w + x0];
-            for (int x = 0; x < s_cell_w; x++)
-                d[x] = (!blank && glyph_px(ch, x * 8 / s_cell_w, gy)) ? fg : bg;
+            for (int x = 0; x < cw; x++) {
+                int gx = s_glyph_x[x];
+                d[x] = (!blank && gy >= 0 && gx >= 0 && glyph_px(ch, gx, gy)) ? fg : bg;
+            }
         }
     }
 }
