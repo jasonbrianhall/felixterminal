@@ -21,6 +21,8 @@ extern "C" {
 #endif
 Uint32 SDL_GetTicks(void);
 void   SDL_Delay(Uint32 ms);
+Uint64 SDL_GetPerformanceCounter(void);     // microseconds since boot
+Uint64 SDL_GetPerformanceFrequency(void);
 void   SDL_Log(const char* fmt, ...);
 #ifdef __cplusplus
 }
