@@ -28,6 +28,22 @@ void display_color(int fg, int bg);
 
 /* WIDTH cols — set terminal width (40 or 80) */
 void display_width(int cols);
+
+/* Key codes from the display layers beyond plain characters: the arrows
+ * are 0x1000 up, 0x1001 down, 0x1002 left, 0x1003 right; other extended
+ * keys are KEY_EXT(their PC scan code), e.g. KEY_EXT(59) for F1. INKEY$
+ * gives CHR$(0) + CHR$(scan) for both. */
+#define KEY_EXT(scan) (0x1100 | (scan))
+#define SCAN_F1    59
+#define SCAN_F10   68
+#define SCAN_HOME  71
+#define SCAN_PGUP  73
+#define SCAN_END   79
+#define SCAN_PGDN  81
+#define SCAN_INS   82
+#define SCAN_DEL   83
+#define SCAN_F11  133
+#define SCAN_F12  134
 /* WIDTH , rows — text rows (25, 43, 50); call before display_width */
 void display_text_rows(int rows);
 

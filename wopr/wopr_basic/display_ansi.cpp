@@ -307,22 +307,45 @@ int display_inkey(void)
     unsigned char c;
     ssize_t n = read(STDIN_FILENO, &c, 1);
     if (n == 1) {
-        /* Arrow keys arrive as ESC [ A..D (or ESC O A..D): hand them on as
-         * the codes the other display layers use (0x1000 up .. 0x1003 right). */
+        /* Extended keys arrive as escape sequences: ESC [ A..D (arrows),
+         * ESC [ H / F, ESC [ n ~ (Ins Del PgUp PgDn, F5-F12), ESC O P..S
+         * (F1-F4). Hand them on as the codes the other display layers use. */
         if (c == 27) {
-            unsigned char seq[2];
+            unsigned char seq[8]; int n = 0;
             usleep(2000);
-            if (read(STDIN_FILENO, &seq[0], 1) == 1) {
-                if ((seq[0] == '[' || seq[0] == 'O') && read(STDIN_FILENO, &seq[1], 1) == 1) {
-                    switch (seq[1]) {
-                    case 'A': return 0x1000;
-                    case 'B': return 0x1001;
-                    case 'D': return 0x1002;
-                    case 'C': return 0x1003;
+            while (n < (int)sizeof seq && read(STDIN_FILENO, &seq[n], 1) == 1) {
+                n++;
+                if (n >= 2 && (isalpha(seq[n - 1]) || seq[n - 1] == '~')) break;
+            }
+            if (n == 0) return 27;                       /* Esc on its own */
+            if (n >= 2 && (seq[0] == '[' || seq[0] == 'O')) {
+                char last = (char)seq[n - 1];
+                switch (last) {
+                case 'A': return 0x1000;
+                case 'B': return 0x1001;
+                case 'D': return 0x1002;
+                case 'C': return 0x1003;
+                case 'H': return KEY_EXT(SCAN_HOME);
+                case 'F': return KEY_EXT(SCAN_END);
+                case 'P': case 'Q': case 'R': case 'S': return KEY_EXT(SCAN_F1 + (last - 'P'));
+                case '~': {
+                    int num = atoi((const char *)seq + 1);
+                    switch (num) {
+                    case 1: case 7: return KEY_EXT(SCAN_HOME);
+                    case 4: case 8: return KEY_EXT(SCAN_END);
+                    case 2: return KEY_EXT(SCAN_INS);
+                    case 3: return KEY_EXT(SCAN_DEL);
+                    case 5: return KEY_EXT(SCAN_PGUP);
+                    case 6: return KEY_EXT(SCAN_PGDN);
+                    case 11: case 12: case 13: case 14: case 15: return KEY_EXT(SCAN_F1 + num - 11);
+                    case 17: case 18: case 19: case 20: case 21: return KEY_EXT(SCAN_F1 + 5 + num - 17);
+                    case 23: return KEY_EXT(SCAN_F11);
+                    case 24: return KEY_EXT(SCAN_F12);
                     }
                 }
-                return 0;            /* some other escape sequence: ignore it */
+                }
             }
+            return 0;                                    /* some other sequence: ignore it */
         }
         return (int)c;
     }

@@ -86,12 +86,18 @@ int var_is_str_name(char *name) {
     return name[strlen(name) - 1] == '$';
 }
 
-/* INKEY$'s string for key code ch: "" for none, one character, or for the
- * arrows (0x1000-0x1003 from the display layer) CHR$(0) + scan code. */
+/* INKEY$'s string for key code ch: "" for none, one character, or for an
+ * extended key CHR$(0) + its PC scan code: the arrows (0x1000-0x1003 from
+ * the display layer) and KEY_EXT(scan) for F1-F12, Home, End, PgUp, PgDn,
+ * Ins and Del. */
 int inkey_to_str(int ch, char *buf) {
     static const char arrows[4] = { 'H', 'P', 'K', 'M' };   /* up down left right */
     if (ch >= 0x1000 && ch <= 0x1003) {
         buf[0] = BASIC_NUL_CH; buf[1] = arrows[ch - 0x1000]; buf[2] = '\0';
+        return 2;
+    }
+    if (ch > KEY_EXT(0) && ch <= KEY_EXT(255)) {
+        buf[0] = BASIC_NUL_CH; buf[1] = (char)(ch & 0xFF); buf[2] = '\0';
         return 2;
     }
     if (ch <= 0 || ch > 255) { buf[0] = '\0'; return 0; }
@@ -99,8 +105,51 @@ int inkey_to_str(int ch, char *buf) {
     return 1;
 }
 
-/* ---------------------------------------------------------------- integers */
-unsigned char g_defint[26];
+/* ---------------------------------------------------------------- types */
+/* Each letter's default type, as DEFINT / DEFLNG / DEFSNG / DEFDBL / DEFSTR
+ * set it: the suffix a name without one stands for ('!' unless changed). */
+char g_deftype[26];
+
+static void deftype_reset(void) { memset(g_deftype, '!', sizeof g_deftype); }
+
+/* DEFINT A-Z, B (type '%', '&', '!', '#' or '$'). */
+void def_letters_apply(const char *p, char type) {
+    if (!g_deftype[0]) deftype_reset();
+    while (*p == ' ' || *p == '\t') p++;
+    while (isalpha((unsigned char)*p)) {
+        int a = toupper((unsigned char)*p) - 'A', b = a;
+        p++;
+        while (*p == ' ') p++;
+        if (*p == '-') {
+            p++;
+            while (*p == ' ') p++;
+            if (isalpha((unsigned char)*p)) { b = toupper((unsigned char)*p) - 'A'; p++; }
+        }
+        if (a > b) { int t = a; a = b; b = t; }
+        for (int i = a; i <= b; i++) g_deftype[i] = type;
+        while (*p == ' ') p++;
+        if (*p != ',') break;
+        p++;
+        while (*p == ' ') p++;
+    }
+}
+
+/* The name a variable is stored under. A numeric suffix that only repeats
+ * the letter's default type is dropped, so after DEFINT A-Z, A and A% are
+ * one variable, as in QBasic (and after none, A and A!). */
+static const char *var_canon(const char *name, char *buf) {
+    size_t n = strlen(name);
+    if (n < 2 || n >= MAX_VARNAME) return name;
+    char last = name[n - 1];
+    if (last != '%' && last != '&' && last != '!' && last != '#') return name;
+    int c = toupper((unsigned char)name[0]);
+    if (c < 'A' || c > 'Z') return name;
+    char def = g_deftype[0] ? g_deftype[c - 'A'] : '!';
+    if (def != last) return name;
+    memcpy(buf, name, n - 1);
+    buf[n - 1] = '\0';
+    return buf;
+}
 
 /* Is a plain variable of this name an integer: A% / A&, or no suffix and a
  * first letter DEFINT / DEFLNG covers. */
@@ -111,7 +160,8 @@ int var_name_is_int(const char *name) {
     if (last == '%' || last == '&') return 1;
     if (last == '$' || last == '!' || last == '#') return 0;
     int c = toupper((unsigned char)name[0]);
-    return c >= 'A' && c <= 'Z' && g_defint[c - 'A'];
+    if (c < 'A' || c > 'Z' || !g_deftype[0]) return 0;
+    return g_deftype[c - 'A'] == '%' || g_deftype[c - 'A'] == '&';
 }
 
 /* Storing into an INTEGER or LONG rounds to the nearest whole number, an
@@ -132,6 +182,9 @@ static int    g_nshared, g_capshared;
 
 static void shared_add(const char *name, int len) {
     if (len <= 0 || len >= MAX_VARNAME) return;
+    char raw[MAX_VARNAME], cb[MAX_VARNAME];
+    memcpy(raw, name, (size_t)len); raw[len] = '\0';
+    name = var_canon(raw, cb); len = (int)strlen(name);
     for (int i = 0; i < g_nshared; i++)
         if ((int)strlen(g_shared[i]) == len && strncasecmp(g_shared[i], name, len) == 0) return;
     if (g_nshared == g_capshared) {
@@ -149,6 +202,8 @@ static void shared_add(const char *name, int len) {
 /* A name seen from inside a procedure: one of the main program's SHARED
  * variables? (For a TYPE variable, P.X goes by P.) */
 static int var_is_shared(const char *name) {
+    char cb[MAX_VARNAME];
+    name = var_canon(name, cb);
     int len = 0;
     while (name[len] && name[len] != '.') len++;
     for (int i = 0; i < g_nshared; i++)
@@ -188,7 +243,18 @@ static void shared_scan_list(const char *p) {
 }
 
 void scope_program_start(void) {
-    memset(g_defint, 0, sizeof g_defint);
+    /* DEFINT and the rest are declarations: apply them all up front, so
+     * names are stored the same way however the program runs. */
+    deftype_reset();
+    for (int i = 0; i < g_nlines; i++) {
+        const char *t = g_lines[i].text;
+        if (!t) continue;
+        while (*t == ' ' || *t == '\t') t++;
+        static const struct { const char *kw; char type; } defs[] = {
+            { "DEFINT", '%' }, { "DEFLNG", '&' }, { "DEFSNG", '!' }, { "DEFDBL", '#' }, { "DEFSTR", '$' } };
+        for (auto &d : defs)
+            if (kw_at(t, d.kw)) { def_letters_apply(t + 6, d.type); break; }
+    }
     for (int i = 0; i < g_nshared; i++) free(g_shared[i]);
     g_nshared = 0;
     g_scope = 0;
@@ -242,6 +308,8 @@ static int scope_of(char *name, int sc) {
 int var_scope_for(char *name, int sc) { return scope_of(name, sc); }
 
 Var *var_find_in(char *name, int sc) {
+    char cb[MAX_VARNAME];
+    name = (char *)var_canon(name, cb);
     int want = scope_of(name, sc);
     for (int i = 0; i < g_nvar; i++)
         if (g_vars[i].name && g_vars[i].scope == want && strcasecmp(g_vars[i].name, name) == 0)
@@ -254,6 +322,8 @@ Var *var_find(char *name) { return var_find_in(name, g_scope); }
 static Var *var_create_in(char *name, int sc) {
     extern jmp_buf g_parse_error_jmp;
     extern int g_parse_error_active;
+    char cb[MAX_VARNAME];
+    name = (char *)var_canon(name, cb);
 
     /* a slot freed when a procedure returned, else a new one */
     Var *v = NULL;

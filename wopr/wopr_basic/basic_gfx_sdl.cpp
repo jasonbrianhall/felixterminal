@@ -644,6 +644,14 @@ bool gfx_sdl_pump() {
             else if (sym == SDLK_DOWN)    { key_push(0x1001); }
             else if (sym == SDLK_LEFT)    { key_push(0x1002); }
             else if (sym == SDLK_RIGHT)   { key_push(0x1003); }
+            else if (sym >= SDLK_F1 && sym <= SDLK_F10) { key_push(KEY_EXT(SCAN_F1 + (int)(sym - SDLK_F1))); }
+            else if (sym == SDLK_F12)     { key_push(KEY_EXT(SCAN_F12)); }
+            else if (sym == SDLK_HOME)    { key_push(KEY_EXT(SCAN_HOME)); }
+            else if (sym == SDLK_END)     { key_push(KEY_EXT(SCAN_END)); }
+            else if (sym == SDLK_INSERT)  { key_push(KEY_EXT(SCAN_INS)); }
+            else if (sym == SDLK_DELETE)  { key_push(KEY_EXT(SCAN_DEL)); }
+            else if (sym == SDLK_PAGEUP && !(e.key.keysym.mod & KMOD_SHIFT))   { key_push(KEY_EXT(SCAN_PGUP)); }
+            else if (sym == SDLK_PAGEDOWN && !(e.key.keysym.mod & KMOD_SHIFT)) { key_push(KEY_EXT(SCAN_PGDN)); }
             else if (sym == SDLK_PAGEUP && (e.key.keysym.mod & KMOD_SHIFT)) {
                 // Shift+PageUp: scroll up in history
                 int lines_in_scrollback = std::min(s_scrollback_count, SCROLLBACK_LINES);
@@ -1698,6 +1706,19 @@ int display_getline(char *buf, int bufsz) {
                 cursor--; len--;
                 redraw();
             }
+
+        } else if (c == KEY_EXT(SCAN_DEL)) {   // Delete: the character under the cursor
+            if (cursor < len) {
+                memmove(tmp + cursor, tmp + cursor + 1, len - cursor - 1);
+                len--;
+                redraw();
+            }
+
+        } else if (c == KEY_EXT(SCAN_HOME)) {
+            if (cursor > 0) { cursor = 0; redraw(); }
+
+        } else if (c == KEY_EXT(SCAN_END)) {
+            if (cursor < len) { cursor = len; redraw(); }
 
         } else if (c == 0x1002) {   // Left arrow
             if (cursor > 0) { cursor--; redraw(); }

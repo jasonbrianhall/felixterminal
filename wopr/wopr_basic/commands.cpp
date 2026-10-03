@@ -395,7 +395,6 @@ static char *parse_xy(char *p, double *x, double *y) {
 /* No-op stubs */
 static int cmd_rem(Interp *ip, char *args)    { (void)ip;(void)args; return 0; }
 static int cmd_defseg(Interp *ip, char *args) { (void)ip;(void)args; return 0; }
-static int cmd_defdbl(Interp *ip, char *args) { (void)ip;(void)args; return 0; }
 static int cmd_key(Interp *ip, char *args)    { (void)ip;(void)args; return 0; }
 /* ----------------------------------------------------------------
  * cmd_run  RUN [linenum | "filename"]
@@ -1588,6 +1587,25 @@ static int cmd_poke(Interp *ip, char *args) {
  * but we need them registered so they don't print "unknown".
  * END IF is similar.
  * ================================================================ */
+/* SUB / FUNCTION line. Reached by a call, it does nothing; reached by
+ * running on from the lines above, the procedure is skipped, as QBasic
+ * never runs a SUB's body except by calling it. */
+static int g_entering_sub = 0;
+static int cmd_sub_line(Interp *ip, char *args) {
+    (void)args;
+    if (g_entering_sub) { g_entering_sub = 0; return 0; }
+    int is_fn = strncasecmp(sk(g_lines[ip->pc].text), "FUNCTION", 8) == 0;
+    for (int i = ip->pc + 1; i < g_nlines; i++) {
+        char *t = sk(g_lines[i].text);
+        if (strncasecmp(t, "END", 3) == 0) {
+            char *q = sk(t + 3);
+            if (is_fn ? kw_match(q, "FUNCTION") : kw_match(q, "SUB")) { ip->pc = i + 1; return 1; }
+        }
+    }
+    ip->pc = g_nlines;
+    return 1;
+}
+
 static int cmd_end_sub(Interp *ip, char *args) {
     /* Only act as RETURN if we are inside a GOSUB/CALL frame.
      * During linear execution (falling through a SUB/FUNCTION body
@@ -1916,6 +1934,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
         g_ncalls++;
     }
 
+    g_entering_sub = 1;              /* the SUB line runs next: it's a call */
     int r = cmd_gosub(ip, name);
     if (r < 0) byref_return(frame);      /* the call didn't happen: give it all back */
     return r;
@@ -3364,25 +3383,12 @@ static int cmd_on(Interp *ip, char *args) {
 /* ================================================================
  * DEFINT / DEFSNG / DEFDBL / DEFSTR stubs
  * ================================================================ */
-/* DEFINT A-Z, B: mark (or unmark) the letters' default type as integer. */
-static int def_letters(char *args, int is_int) {
-    char *p = sk(args);
-    while (isalpha((unsigned char)*p)) {
-        int a = toupper((unsigned char)*p) - 'A', b = a;
-        p = sk(p + 1);
-        if (*p == '-') {
-            p = sk(p + 1);
-            if (isalpha((unsigned char)*p)) { b = toupper((unsigned char)*p) - 'A'; p = sk(p + 1); }
-        }
-        if (a > b) { int t = a; a = b; b = t; }
-        for (int i = a; i <= b; i++) g_defint[i] = (unsigned char)is_int;
-        if (*p != ',') break;
-        p = sk(p + 1);
-    }
-    return 0;
-}
-static int cmd_defint(Interp *ip, char *args) { (void)ip; return def_letters(args, 1); }
-static int cmd_defsng(Interp *ip, char *args) { (void)ip; return def_letters(args, 0); }
+/* DEFINT / DEFLNG / DEFSNG / DEFDBL / DEFSTR letters. (Applied up front too,
+ * when the program starts: see scope_program_start.) */
+static int cmd_defint(Interp *ip, char *args) { (void)ip; def_letters_apply(args, '%'); return 0; }
+static int cmd_deflng(Interp *ip, char *args) { (void)ip; def_letters_apply(args, '&'); return 0; }
+static int cmd_defsng(Interp *ip, char *args) { (void)ip; def_letters_apply(args, '!'); return 0; }
+static int cmd_defdbl(Interp *ip, char *args) { (void)ip; def_letters_apply(args, '#'); return 0; }
 static int cmd_defstr(Interp *ip, char *args) { (void)ip; (void)args; return 0; }  /* names keep their $ */
 
 /* ================================================================
@@ -3420,8 +3426,8 @@ const Command commands[] = {
     { "END FUNCTION",cmd_end_sub   },
     { "END IF",     cmd_rem        },
     { "END",        cmd_end        },
-    { "SUB",        cmd_rem        },
-    { "FUNCTION",   cmd_rem        },
+    { "SUB",        cmd_sub_line   },
+    { "FUNCTION",   cmd_sub_line   },
     { "EXIT",       cmd_exit       },
     { "STOP",       cmd_stop       },
     { "CONT",       cmd_cont       },
@@ -3469,11 +3475,10 @@ const Command commands[] = {
     { "CLOSE",      cmd_close      },
     { "DEF SEG",    cmd_defseg     },
     { "DEF",        cmd_def        },
-    { "DEFDBL",     cmd_defdbl     },
     { "DEFINT",     cmd_defint     },
     { "DEFSNG",     cmd_defsng     },
-    { "DEFDBL",     cmd_defsng     },
-    { "DEFLNG",     cmd_defint     },
+    { "DEFDBL",     cmd_defdbl     },
+    { "DEFLNG",     cmd_deflng     },
     { "DEFSTR",     cmd_defstr     },
     { "ON ERROR",   cmd_on_error   },
     { "ON",         cmd_on         },

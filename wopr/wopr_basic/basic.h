@@ -198,7 +198,8 @@ Var    *field_array(const char *base, const char *field, int *is_str);
  * by the scan code for extended keys, e.g. CHR$(0) + "H" for Up. */
 #define BASIC_NUL_CH ((char)0xFF)
 int     inkey_to_str(int ch, char *buf);
-extern unsigned char g_defint[26];      /* DEFINT/DEFLNG letters */
+extern char g_deftype[26];              /* each letter's DEFxxx type: '%' '&' '!' '#' '$' */
+void    def_letters_apply(const char *letters, char type);
 int     var_name_is_int(const char *name);
 void    var_fix_int(Var *v, mpf_t x);   /* round x as QBasic does if v is an integer */
 

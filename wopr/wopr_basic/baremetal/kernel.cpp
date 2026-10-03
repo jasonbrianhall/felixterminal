@@ -330,7 +330,8 @@ void platform_reboot() {
 // ---------------------------------------------------------------- keyboard
 // PS/2 (IRQ 1, irq.cpp) and USB keyboards queue set-1 scancodes; this turns
 // them into characters for BASIC (US layout), like the SDL build's keys:
-// ASCII, '\r' for Enter, 8 Backspace, 27 Esc, 0x1000-0x1003 the arrows.
+// ASCII, '\r' for Enter, 8 Backspace, 27 Esc, 0x1000-0x1003 the arrows,
+// KEY_EXT(scan code) the function keys, Home, End, PgUp, PgDn, Ins and Del.
 // Queue a scancode from a source other than the PS/2 interrupt (USB).
 void kbd_push(uint8_t b) {
     uintptr_t flags;
@@ -359,9 +360,12 @@ static void key_event(bool ext, uint8_t code, bool down) {
         case 0x4D: gfx_bm_key(0x1003); return;
         case 0x1C: gfx_bm_key('\r'); return;            // keypad Enter
         case 0x35: gfx_bm_key('/'); return;             // keypad /
-        case 0x53: if (ctrl && alt) platform_reboot(); gfx_bm_key(127); return;   // Delete
-        case 0x49: if (shift) gfx_bm_scroll(1); return;  // Page Up
-        case 0x51: if (shift) gfx_bm_scroll(-1); return; // Page Down
+        case 0x53: if (ctrl && alt) platform_reboot(); gfx_bm_key(KEY_EXT(SCAN_DEL)); return;   // Delete
+        case 0x47: gfx_bm_key(KEY_EXT(SCAN_HOME)); return;
+        case 0x4F: gfx_bm_key(KEY_EXT(SCAN_END)); return;
+        case 0x52: gfx_bm_key(KEY_EXT(SCAN_INS)); return;
+        case 0x49: if (shift) gfx_bm_scroll(1); else gfx_bm_key(KEY_EXT(SCAN_PGUP)); return;   // Page Up
+        case 0x51: if (shift) gfx_bm_scroll(-1); else gfx_bm_key(KEY_EXT(SCAN_PGDN)); return; // Page Down
         case 0x46: StandaloneBasic::g_break = 1; gfx_bm_key(3); return;   // Ctrl+Break
         }
         return;
@@ -373,7 +377,10 @@ static void key_event(bool ext, uint8_t code, bool down) {
     case 0x0E: gfx_bm_key(8); return;
     case 0x0F: gfx_bm_key(9); return;
     case 0x1C: gfx_bm_key('\r'); return;
+    case 0x57: gfx_bm_key(KEY_EXT(SCAN_F11)); return;
+    case 0x58: gfx_bm_key(KEY_EXT(SCAN_F12)); return;
     }
+    if (code >= 0x3B && code <= 0x44) { gfx_bm_key(KEY_EXT(code)); return; }   // F1-F10: scan 59-68
     if (code >= 0x47 && code <= 0x53) {                 // keypad
         static const char digits[] = "789-456+1230.";
         char d = digits[code - 0x47];
@@ -382,7 +389,9 @@ static void key_event(bool ext, uint8_t code, bool down) {
         else if (code == 0x50) gfx_bm_key(0x1001);
         else if (code == 0x4B) gfx_bm_key(0x1002);
         else if (code == 0x4D) gfx_bm_key(0x1003);
-        else if (code == 0x53) { if (ctrl && alt) platform_reboot(); gfx_bm_key(127); }
+        else if (code == 0x53) { if (ctrl && alt) platform_reboot(); gfx_bm_key(KEY_EXT(SCAN_DEL)); }
+        else if (code == 0x47 || code == 0x49 || code == 0x4F || code == 0x51 || code == 0x52)
+            gfx_bm_key(KEY_EXT(code));                  // Home PgUp End PgDn Ins
         return;
     }
     if (code == 0x37) { gfx_bm_key('*'); return; }      // keypad *
