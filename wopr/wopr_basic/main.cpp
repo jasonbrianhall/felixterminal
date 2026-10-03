@@ -215,7 +215,8 @@ static void run_lines(int start_pc, int fresh) {
         if (g_imm_base >= 0 && ran_into_immediate(old_pc, ip.pc)) break;
     }
 
-    // Final frame
+    // Final frame; a program that used the mouse hands it back for copy/paste
+    gfx_mouse_program_end();
     gfx_sdl_pump();
     gfx_sdl_render();
 
@@ -384,6 +385,9 @@ return 0;
         if (!suppress_ok) display_print("\nOk\n");
         suppress_ok = 0;
         display_cursor(1);
+#ifdef USE_SDL_WINDOW
+        gfx_mouse_program_end();   /* at the prompt the mouse selects text */
+#endif
         int _gl_ret = display_getline(line, sizeof line);
         if (_gl_ret < 0) break;   // window closed (SDL_QUIT)
         if (!_gl_ret) {

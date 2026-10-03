@@ -561,6 +561,36 @@ static int cmd_qdisplay(Interp *ip, char *args) {
     return 0;
 }
 
+/* _MOUSESHOW ["style"] / _MOUSEHIDE / _MOUSEMOVE x, y  (QB64) */
+static int cmd_qmouseshow(Interp *ip, char *args) {
+    (void)ip; (void)args;
+#ifdef USE_SDL_WINDOW
+    gfx_mouse_show(1);
+#endif
+    return 0;
+}
+static int cmd_qmousehide(Interp *ip, char *args) {
+    (void)ip; (void)args;
+#ifdef USE_SDL_WINDOW
+    gfx_mouse_show(0);
+#endif
+    return 0;
+}
+static int cmd_qmousemove(Interp *ip, char *args) {
+    (void)ip;
+    mpf_t v; mpf_init2(v, g_prec);
+    char *p = sk(eval_expr(sk(args), v));
+    int x = (int)mpf_get_si(v), y = 0;
+    if (*p == ',') { eval_expr(sk(p + 1), v); y = (int)mpf_get_si(v); }
+    mpf_clear(v);
+#ifdef USE_SDL_WINDOW
+    gfx_mouse_move(x, y);
+#else
+    (void)x; (void)y;
+#endif
+    return 0;
+}
+
 static int cmd_qtitle(Interp *ip, char *args) {
     (void)ip; (void)args;
     /* Just skip the string - don't evaluate it */
@@ -1761,6 +1791,91 @@ static int byref_arg(char *cs, char *name, int *is_array) {
 static int call_sub(Interp *ip, char *args, int bare);
 static int cmd_call(Interp *ip, char *args) { return call_sub(ip, args, 0); }
 
+/* ----------------------------------------------------------------
+ * The DOS mouse driver for QuickBASIC programs (gfx_mouse_int33):
+ *
+ *   CALL INTERRUPT(&H33, inregs, outregs)    (and INTERRUPTX) -- reads
+ *       inregs.AX/BX/CX/DX, sets outregs' (a RegType variable's fields)
+ *   CALL ABSOLUTE(ax%, bx%, cx%, dx%, offset) -- the usual QBasic mouse
+ *       routine: machine code that calls INT 33h with the four variables
+ *       as AX, BX, CX and DX. Other CALL ABSOLUTEs do nothing.
+ *
+ * Other interrupts do nothing. A program's own SUB of the same name wins.
+ * ---------------------------------------------------------------- */
+static int reg_get(const char *base, const char *reg) {
+    char n[MAX_VARNAME * 2];
+    snprintf(n, sizeof n, "%s.%s", base, reg);
+    Var *v = var_find(n);
+    if (!v) { snprintf(n, sizeof n, "%s.%s%%", base, reg); v = var_find(n); }
+    return (v && v->kind == VAR_NUM) ? (int)mpf_get_si(v->num) : 0;
+}
+static void reg_set(const char *base, const char *reg, int val) {
+    char n[MAX_VARNAME * 2];
+    snprintf(n, sizeof n, "%s.%s%%", base, reg);
+    Var *v = var_find(n);
+    if (!v) { snprintf(n, sizeof n, "%s.%s", base, reg); v = var_get(n); }
+    if (v->kind == VAR_NUM) mpf_set_si(v->num, val);
+}
+static int var_num_get(char *name) {
+    Var *v = var_find(name);
+    return (v && v->kind == VAR_NUM) ? (int)mpf_get_si(v->num) : 0;
+}
+static void var_num_set(char *name, int val) {
+    Var *v = var_get(name);
+    if (v->kind == VAR_NUM) mpf_set_si(v->num, val);
+}
+static void mouse_int33(int *ax, int *bx, int *cx, int *dx) {
+#ifdef USE_SDL_WINDOW
+    gfx_mouse_int33(ax, bx, cx, dx);
+#else
+    if ((*ax & 0xFFFF) == 0) *ax = 0;   /* reset: no mouse driver */
+    (void)bx; (void)cx; (void)dx;
+#endif
+}
+/* p: just past "CALL name(". Returns 1 if it was one of these. */
+static int call_dos(const char *name, char *p) {
+    if (!strcasecmp(name, "INTERRUPT") || !strcasecmp(name, "INTERRUPTX")) {
+        mpf_t v; mpf_init2(v, g_prec);
+        p = sk(eval_expr(sk(p), v));
+        int intno = (int)mpf_get_si(v);
+        mpf_clear(v);
+        char in[MAX_VARNAME] = "", out[MAX_VARNAME] = "";
+        int arr;
+        if (*p == ',') { p = sk(p + 1); if (byref_arg(p, in, &arr)) { while (*p && *p != ',' && *p != ')') p++; } }
+        if (*p == ',') { p = sk(p + 1); if (!byref_arg(p, out, &arr)) out[0] = 0; }
+        if (intno == 0x33 && in[0]) {
+            int ax = reg_get(in, "AX"), bx = reg_get(in, "BX"), cx = reg_get(in, "CX"), dx = reg_get(in, "DX");
+            mouse_int33(&ax, &bx, &cx, &dx);
+            if (!out[0]) strcpy(out, in);
+            reg_set(out, "AX", ax); reg_set(out, "BX", bx); reg_set(out, "CX", cx); reg_set(out, "DX", dx);
+        }
+        return 1;
+    }
+    if (!strcasecmp(name, "ABSOLUTE")) {
+        char a[5][MAX_VARNAME];
+        int n = 0, arr;
+        for (;;) {
+            p = sk(p);
+            if (!*p || *p == ')' || n == 5) break;
+            if (n < 4 && !(byref_arg(p, a[n], &arr) && !arr)) return 1;   /* not the mouse routine */
+            n++;
+            int depth = 0;                             /* to the next argument */
+            while (*p && !(depth == 0 && (*p == ',' || *p == ')'))) {
+                if (*p == '(') depth++; else if (*p == ')') depth--;
+                p++;
+            }
+            if (*p == ',') p++;
+        }
+        if (n == 5) {
+            int ax = var_num_get(a[0]), bx = var_num_get(a[1]), cx = var_num_get(a[2]), dx = var_num_get(a[3]);
+            mouse_int33(&ax, &bx, &cx, &dx);
+            var_num_set(a[0], ax); var_num_set(a[1], bx); var_num_set(a[2], cx); var_num_set(a[3], dx);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* One argument of a SUB call, evaluated in the caller before the call. */
 typedef struct {
     char  pname[MAX_VARNAME];
@@ -1787,6 +1902,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
     /* Find the SUB definition line so we can read its parameter names.
      * The label points at the "SUB name ..." line itself. */
     int sub_idx = find_line_by_label(name);
+    if (sub_idx < 0 && call_dos(name, p)) return 0;
     char *param_src = NULL;
     if (sub_idx >= 0) {
         char *sp = sk(g_lines[sub_idx].text);
@@ -3442,6 +3558,9 @@ const Command commands[] = {
     { "WINDOW",     cmd_window     },
     { "_DISPLAY",   cmd_qdisplay   },
     { "_TITLE",     cmd_qtitle     },
+    { "_MOUSESHOW", cmd_qmouseshow },
+    { "_MOUSEHIDE", cmd_qmousehide },
+    { "_MOUSEMOVE", cmd_qmousemove },
     { "_LIMIT",     cmd_qlimit     },
     { "SOUND",      cmd_sound      },
     { "PLAY",       cmd_play       },

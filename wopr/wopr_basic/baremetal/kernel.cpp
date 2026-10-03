@@ -3,7 +3,7 @@
 // is compiled unchanged; basic_gfx_bm.cpp draws its screen, sound_bm.cpp
 // plays SOUND/PLAY/BEEP, and libc.cpp + storage.cpp put its files (LOAD,
 // SAVE, OPEN, FILES...) on the boot floppy. This file is the machine: boot
-// information, memory, the framebuffer, the keyboard, timer and restart.
+// information, memory, the framebuffer, the keyboard, mouse, timer and restart.
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -287,7 +287,7 @@ struct __attribute__((packed)) IdtEntry {         // 32-bit interrupt gate
 };
 #endif
 static IdtEntry idt[256];
-extern "C" void isr_timer(), isr_keyboard(), isr_spurious(), isr_fault();
+extern "C" void isr_timer(), isr_keyboard(), isr_mouse(), isr_spurious(), isr_fault();
 
 static void set_gate(int n, void (*h)()) {
     uintptr_t a = (uintptr_t)h;
@@ -310,15 +310,17 @@ static void interrupts_init() {
     for (int i = 32; i < 256; i++) set_gate(i, isr_spurious);
     set_gate(32, isr_timer);
     set_gate(33, isr_keyboard);
+    set_gate(44, isr_mouse);
     struct __attribute__((packed)) { uint16_t lim; uintptr_t base; } idtr = { sizeof(idt) - 1, (uintptr_t)idt };
     __asm__ volatile("lidt %0" ::"m"(idtr));
 
-    // Remap the PICs to vectors 32..47; unmask only timer and keyboard.
+    // Remap the PICs to vectors 32..47; unmask the timer, keyboard, the
+    // cascade to the second PIC, and the PS/2 mouse (IRQ 12) on it.
     outb(0x20, 0x11); outb(0xA0, 0x11);
     outb(0x21, 32);   outb(0xA1, 40);
     outb(0x21, 4);    outb(0xA1, 2);
     outb(0x21, 1);    outb(0xA1, 1);
-    outb(0x21, 0xFC); outb(0xA1, 0xFF);
+    outb(0x21, 0xF8); outb(0xA1, 0xEF);
 
     // Mode 2 (rate generator): the count runs down once per interrupt, so
     // platform_us() can read how far into the tick we are.
@@ -417,7 +419,11 @@ static void key_event(bool ext, uint8_t code, bool down) {
     if (ctrl) {
         char l = c | 32;
         if (l >= 'a' && l <= 'z') {
-            if (l == 'c') StandaloneBasic::g_break = 1; // Ctrl+C breaks a running program
+            // Ctrl+C copies selected text; with nothing selected it breaks
+            // a running program. Ctrl+V types what was copied.
+            if (l == 'c' && gfx_bm_copy()) return;
+            if (l == 'v') { gfx_bm_paste(); return; }
+            if (l == 'c') StandaloneBasic::g_break = 1;
             gfx_bm_key(l - 'a' + 1);
         }
         return;
@@ -425,8 +431,71 @@ static void key_event(bool ext, uint8_t code, bool down) {
     gfx_bm_key((unsigned char)c);
 }
 
+// ---------------------------------------------------------------- mouse
+// A PS/2 mouse on the i8042's second port (IRQ 12, irq.cpp) or a USB one
+// (usb.cpp): either way relative motion and buttons go to mouse_push(),
+// and on to the display (basic_gfx_bm.cpp), which keeps the pointer, draws
+// it, selects text for copy and paste and answers BASIC's mouse functions.
+extern volatile uint8_t mouse_buf[256];
+extern volatile uint8_t mouse_head, mouse_tail;
+volatile bool g_bm_selection;            // set by the display: Ctrl+C copies rather than breaks
+static int ps2_packet = 3;               // bytes per packet: 4 with a wheel (IntelliMouse)
+
+static bool i8042_wait_write() { for (int i = 0; i < 100000; i++) if (!(inb(0x64) & 2)) return true; return false; }
+static bool i8042_wait_read()  { for (int i = 0; i < 100000; i++) if (inb(0x64) & 1) return true; return false; }
+static bool mouse_send(uint8_t b) {
+    i8042_wait_write(); outb(0x64, 0xD4);              // next byte to the aux device
+    i8042_wait_write(); outb(0x60, b);
+    for (int tries = 0; tries < 4; tries++) {          // skip stray bytes until the ACK
+        if (!i8042_wait_read()) return false;
+        if (inb(0x60) == 0xFA) return true;
+    }
+    return false;
+}
+static void ps2_mouse_init() {
+    i8042_wait_write(); outb(0x64, 0xA8);              // enable the aux port
+    i8042_wait_write(); outb(0x64, 0x20);              // read the controller config
+    if (!i8042_wait_read()) { printf("PS/2 mouse: none\n"); return; }
+    uint8_t cfg = inb(0x60);
+    cfg = (cfg | 0x02) & ~0x20;                        // aux interrupt on, aux clock on
+    i8042_wait_write(); outb(0x64, 0x60);
+    i8042_wait_write(); outb(0x60, cfg);
+    if (!mouse_send(0xF6)) { printf("PS/2 mouse: none\n"); return; }   // defaults
+    // The IntelliMouse knock (sample rates 200, 100, 80) turns on the wheel:
+    // the mouse then answers ID 3 and sends 4-byte packets.
+    static const uint8_t knock[] = {200, 100, 80};
+    bool ok = true;
+    for (uint8_t r : knock) ok = ok && mouse_send(0xF3) && mouse_send(r);
+    if (ok && mouse_send(0xF2) && i8042_wait_read() && inb(0x60) == 3) ps2_packet = 4;
+    mouse_send(0xF3); mouse_send(100);                 // a normal sample rate again
+    if (!mouse_send(0xF4)) { printf("PS/2 mouse: none\n"); return; }   // start streaming
+    printf("PS/2 mouse: ready%s\n", ps2_packet == 4 ? " (with wheel)" : "");
+}
+
+// Relative motion (x right, y down), buttons (1 left, 2 right, 4 middle)
+// and wheel clicks (+ away from you), from either kind of mouse.
+void mouse_push(int dx, int dy, int buttons, int wheel) { gfx_bm_mouse(dx, dy, buttons, wheel); }
+
+static void poll_ps2_mouse() {
+    static uint8_t pkt[4];
+    static int n;
+    while (mouse_tail != mouse_head) {
+        uint8_t b = mouse_buf[mouse_tail++];
+        if (n == 0 && !(b & 0x08)) continue;           // resync: byte 0 always has bit 3 set
+        pkt[n++] = b;
+        if (n < ps2_packet) continue;
+        n = 0;
+        if (pkt[0] & 0xC0) continue;                   // overflow: drop the packet
+        int dx = pkt[1] - ((pkt[0] << 4) & 0x100);
+        int dy = pkt[2] - ((pkt[0] << 3) & 0x100);
+        int z = ps2_packet == 4 ? (int)(int8_t)(pkt[3] << 4) >> 4 : 0;   // 4-bit signed
+        mouse_push(dx, -dy, pkt[0] & 7, -z);          // PS/2: y grows upward, z toward you
+    }
+}
+
 void platform_poll_input() {
     usb_poll();
+    poll_ps2_mouse();
     static bool ext;
     while (kbd_tail != kbd_head) {
         uint8_t b = kbd_buf[kbd_tail++];
@@ -597,6 +666,7 @@ extern "C" void kmain() {
     player_init(drv != AUDIO_NONE);
     printf("Sound: %s\n", drv != AUDIO_NONE ? audio_name() : "PC speaker");
     usb_init(cmdline);
+    ps2_mouse_init();
     interrupts_init();
     if ((info.flags & (1 << 3)) && info.mods_count) {   // a disk image (UEFI loader)
         const uint32_t* mod = (const uint32_t*)(uintptr_t)info.mods_addr;

@@ -43,6 +43,7 @@ survives a reboot.
 | Screen | the monitor's own resolution, else 1024x768 or smaller | 640x480 at 8 bits (a 512 KB VESA card), else larger |
 | Sound | HD Audio, AC97 or a Sound Blaster, else PC speaker | a Sound Blaster (Pro 2.0 or later), else PC speaker (or AC97/HD Audio on a PCI machine) |
 | Keyboard | PS/2 and USB | PS/2 |
+| Mouse | PS/2 and USB (with wheel) | PS/2 (with wheel) |
 | Limits | 1024 variables, arrays up to 65536 elements | 512 variables, arrays up to 32768 elements |
 
 Arrays take memory when they're `DIM`med, as much as they need, and so do
@@ -72,6 +73,19 @@ Ctrl+C or Ctrl+Break stops a running program (`Break`); Shift+PgUp/PgDn
 scroll back through the text; Ctrl+Alt+Del reboots. `SYSTEM` asks whether
 to reboot.
 
+The mouse (PS/2, or USB on the 64-bit build) works as in the SDL window.
+At the prompt, drag with the left button to select text, Ctrl+C copies it
+(instead of breaking) and Ctrl+V types it back, line breaks as Enter; the
+wheel scrolls back through the text. Programs get it too, the QuickBASIC
+way (the DOS mouse driver, INT 33h, through `CALL INTERRUPT(&H33, inregs,
+outregs)` or the usual `CALL ABSOLUTE` mouse routine) or the QB64 way
+(`_MOUSEINPUT`, `_MOUSEX`, `_MOUSEY`, `_MOUSEBUTTON(n)`, `_MOUSEWHEEL`,
+`_MOUSESHOW`, `_MOUSEHIDE`, `_MOUSEMOVE`); while one does, the mouse is
+the program's. The pointer is a reversed character cell in text modes and
+an arrow in graphics modes, as the DOS driver drew them; at the prompt it
+shows while the mouse is in use. `MOUSE.BAS` and `MOUSE33.BAS` on the
+floppy try both ways.
+
 Boot options (on the `multiboot` line in `/boot/grub/grub.cfg`):
 `audio=speaker|hda|ac97|sb|off`, `sb=220,1` (the Sound Blaster's port and
 8-bit DMA channel, as in `BLASTER=A220 D1`), `floppy=off`, `latency=MS`
@@ -97,7 +111,7 @@ The interpreter (`../main.cpp`, `vars.cpp`, `expr.cpp`, `program.cpp`,
   `rbtree.cpp` (std::map without libstdc++'s prebuilt objects).
 - `storage.cpp` (floppy or RAM disk, current directory, paths),
   `fat12.cpp`, `floppy.cpp`.
-- `kernel.cpp`: boot, memory, video, keyboard, timer; `boot.S`/`boot32.S`,
+- `kernel.cpp`: boot, memory, video, keyboard, PS/2 mouse, timer; `boot.S`/`boot32.S`,
   `irq.cpp`, `audio.cpp`, `pci.cpp`, `usb.cpp`.
 
 Tests that run on a Linux host: `tools/fat12_test.sh` (the filesystem,

@@ -1488,6 +1488,57 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         return;
     }
 
+    /* QB64 mouse: _MOUSEINPUT, _MOUSEX, _MOUSEY, _MOUSEBUTTON(n), _MOUSEWHEEL
+     * (basic_gfx.h). Without a window there's no mouse: all 0. */
+    {
+        static const char *const mkw[] = {"_MOUSEINPUT", "_MOUSEX", "_MOUSEY", "_MOUSEBUTTON", "_MOUSEWHEEL", NULL};
+        for (int k = 0; mkw[k]; k++) {
+            if (!kw_match(ps->p, (char *)mkw[k])) continue;
+            ps->p += strlen(mkw[k]);
+            int n = 0;
+            skip_ws_p(ps);
+            if (*ps->p == '(') {                   /* _MOUSEBUTTON(n); QB64 also allows (device) on the others */
+                ps->p++;
+                mpf_t a; mpf_init2(a, g_prec); parse_expr_p(ps, a);
+                n = (int)mpf_get_si(a); mpf_clear(a);
+                skip_ws_p(ps); if (*ps->p == ')') ps->p++;
+            }
+            long v = 0;
+#ifdef USE_SDL_WINDOW
+            switch (k) {
+            case 0: v = gfx_mouse_input(); break;
+            case 1: v = gfx_mouse_x(); break;
+            case 2: v = gfx_mouse_y(); break;
+            case 3: v = gfx_mouse_button(n); break;
+            case 4: v = gfx_mouse_wheel(); break;
+            }
+#else
+            (void)n;
+#endif
+            mpf_set_si(result, v);
+            return;
+        }
+    }
+
+    /* VARSEG(var) / SADD(s$) — stubs: return 0 (no real memory; a program
+     * that pokes mouse code into a string and CALL ABSOLUTEs it gets the
+     * mouse driver anyway, see commands.cpp) */
+    if (kw_match(ps->p, "VARSEG") || kw_match(ps->p, "SADD")) {
+        ps->p += (*ps->p == 'V' || *ps->p == 'v') ? 6 : 4;
+        skip_ws_p(ps);
+        if (*ps->p == '(') {
+            int depth = 1; ps->p++;
+            while (*ps->p && depth > 0) {
+                if (*ps->p == '"') { ps->p++; while (*ps->p && *ps->p != '"') ps->p++; if (*ps->p) ps->p++; continue; }
+                if (*ps->p == '(') depth++;
+                else if (*ps->p == ')') depth--;
+                ps->p++;
+            }
+        }
+        mpf_set_si(result, 0);
+        return;
+    }
+
     /* VARPTR(var) / VARPTR$(var) — stub: return 0 */
     if (kw_match(ps->p, "VARPTR")) {
         ps->p += 6; skip_ws_p(ps);

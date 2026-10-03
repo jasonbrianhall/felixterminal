@@ -160,15 +160,19 @@ static int  s_scrollback_count = 0;                  // total lines written (mon
 static int  s_display_offset = 0;                    // view offset from bottom (0 = show latest)
 
 // ============================================================================
-// Text selection for copy/paste
+// Text selection for copy/paste (SCREEN 0): drag with the left button,
+// Ctrl+C copies, Ctrl+V pastes. Rows and columns are as shown on screen.
 // ============================================================================
-static bool s_selecting  = false;      // mouse drag in progress
+static Cell scrollback_get_cell(int display_row, int col);
+static bool s_selecting  = false;      // a selection is shown
 static int  s_sel_start_row = 0, s_sel_start_col = 0;  // selection anchor
 static int  s_sel_end_row = 0, s_sel_end_col = 0;      // selection end
 static std::string s_selection_text = "";              // cached selection buffer
 static bool s_drag_occurred = false;   // track if mouse actually moved
+static bool s_sel_button = false;      // the left button went down on the text
 
-// Update selection text from grid
+// Update selection text from what's on screen; trailing blanks on each
+// line are dropped, as a terminal does.
 static void update_selection_text() {
     s_selection_text.clear();
     int r1 = std::min(s_sel_start_row, s_sel_end_row);
@@ -179,9 +183,13 @@ static void update_selection_text() {
     for (int r = r1; r <= r2; r++) {
         int col_start = (r == r1) ? c1 : 0;
         int col_end = (r == r2) ? c2 : s_text_cols - 1;
+        std::string line;
         for (int c = col_start; c <= col_end && c < s_text_cols; c++) {
-            s_selection_text += s_grid[r][c].ch;
+            char ch = scrollback_get_cell(r, c).ch;
+            line += ch ? ch : ' ';
         }
+        while (!line.empty() && line.back() == ' ') line.pop_back();
+        s_selection_text += line;
         if (r < r2) s_selection_text += '\n';
     }
 }
@@ -197,6 +205,277 @@ static bool is_cell_selected(int row, int col) {
     if (row == r1) return col >= (s_sel_start_row < s_sel_end_row ? s_sel_start_col : s_sel_end_col);
     if (row == r2) return col <= (s_sel_start_row < s_sel_end_row ? s_sel_end_col : s_sel_start_col);
     return true;
+}
+
+// The left button went down on cell (row, col): a click clears a
+// selection that's showing, otherwise a new one starts here.
+static void sel_press(int row, int col) {
+    s_sel_button = true;
+    s_drag_occurred = false;
+    if (s_selecting) {
+        s_selecting = false;
+        s_sel_button = false;
+    } else {
+        s_selecting = true;
+        s_sel_start_row = s_sel_end_row = row;
+        s_sel_start_col = s_sel_end_col = col;
+        update_selection_text();
+    }
+    s_needs_render = true;
+}
+// Dragged to cell (row, col).
+static void sel_drag(int row, int col) {
+    if (!s_selecting || !s_sel_button) return;
+    if (row == s_sel_end_row && col == s_sel_end_col) return;
+    if (row != s_sel_start_row || col != s_sel_start_col) s_drag_occurred = true;
+    s_sel_end_row = row;
+    s_sel_end_col = col;
+    update_selection_text();
+    s_needs_render = true;
+}
+// The left button came up: a click without a drag selects nothing.
+static void sel_release() {
+    if (!s_sel_button) return;
+    s_sel_button = false;
+    if (!s_drag_occurred) { s_selecting = false; s_needs_render = true; }
+    s_drag_occurred = false;
+}
+// Ctrl+C: the selected text (and the selection goes), or false.
+static bool sel_take(std::string &out) {
+    if (!s_selecting || s_selection_text.empty()) return false;
+    out = s_selection_text;
+    s_selecting = false;
+    s_needs_render = true;
+    return true;
+}
+
+// ============================================================================
+// The mouse, for BASIC programs
+//
+//   QB64:        _MOUSEINPUT, _MOUSEX, _MOUSEY, _MOUSEBUTTON(n), _MOUSEWHEEL,
+//                _MOUSESHOW, _MOUSEHIDE, _MOUSEMOVE x, y
+//   QuickBASIC:  the DOS mouse driver (INT 33h), which programs reach with
+//                CALL INTERRUPT(&H33, inregs, outregs) or CALL ABSOLUTE
+//                (commands.cpp hands those to gfx_mouse_int33)
+//
+// The backend reports where the pointer is as a fraction of the picture,
+// 0..65535 across and down, so the same position serves every SCREEN mode.
+// Once a program uses the mouse it's the program's: no text selection
+// until it stops.
+// ============================================================================
+struct MouseEv { int fx, fy, buttons, wheel; };
+static MouseEv  s_mouse = {32768, 32768, 0, 0};   // now
+static MouseEv  s_mouse_cur = {32768, 32768, 0, 0};   // as _MOUSEINPUT last read it
+static MouseEv  s_mouse_q[64];                    // events _MOUSEINPUT hasn't read
+static unsigned s_mouse_qh, s_mouse_qt;
+static bool     s_mouse_polled = false;           // the program uses _MOUSEINPUT
+static bool     s_mouse_owned  = false;           // the running program uses the mouse
+static int      s_mouse_wheel_acc = 0;            // wheel clicks since _MOUSEWHEEL (no _MOUSEINPUT)
+static int      s_mouse_show = 0;                 // INT 33h show count: drawn while >= 0
+// INT 33h state
+static int s_m33_down_n[3], s_m33_down_x[3], s_m33_down_y[3];
+static int s_m33_up_n[3],   s_m33_up_x[3],   s_m33_up_y[3];
+static int s_m33_xmin, s_m33_xmax = -1, s_m33_ymin, s_m33_ymax = -1;   // max < min: whole screen
+static int s_m33_mick_x, s_m33_mick_y, s_m33_last_vx, s_m33_last_vy;
+
+// Backend: put the pointer at (fx, fy); show or hide the pointer.
+static void mouse_backend_warp(int fx, int fy);
+static void mouse_backend_cursor();
+static bool mouse_cursor_wanted() { return !s_mouse_owned || s_mouse_show >= 0; }
+
+// The mouse driver's coordinates: 8 per text column (640 across at 80 and
+// at 40 columns) and 8 per row in text modes; 640 across in the 320-pixel
+// graphics modes (x counts in twos there, as on a PC); other graphics
+// modes in their own pixels.
+static void mouse_virtual(int *vw, int *vh) {
+    if (s_gfx_active && s_gfx_w > 0) {
+        *vw = s_gfx_w <= 320 ? 640 : s_gfx_w;
+        *vh = s_gfx_h;
+    } else {                                   // 8 x 8 per cell (16 x 8 at 40 columns)
+        *vw = s_text_cols <= 40 ? 640 : s_text_cols * 8;
+        *vh = s_text_rows * 8;
+    }
+}
+static void mouse_to_virtual(int fx, int fy, int *x, int *y) {
+    int vw, vh; mouse_virtual(&vw, &vh);
+    int vx = (int)((long long)fx * vw >> 16), vy = (int)((long long)fy * vh >> 16);
+    if (!s_gfx_active || s_gfx_w <= 320) vx &= ~1;
+    if (!s_gfx_active) { vx -= vx % (vw / std::max(1, s_text_cols)); vy &= ~7; }   // text: the cell's corner
+    if (s_m33_xmax >= s_m33_xmin) vx = std::max(s_m33_xmin, std::min(s_m33_xmax, vx));
+    if (s_m33_ymax >= s_m33_ymin) vy = std::max(s_m33_ymin, std::min(s_m33_ymax, vy));
+    *x = vx; *y = vy;
+}
+
+// Backend: the pointer moved or a button or the wheel changed.
+// buttons: 1 left, 2 right, 4 middle; wheel: clicks, + away from you.
+static void mouse_report(int fx, int fy, int buttons, int wheel) {
+    fx = std::max(0, std::min(65535, fx));
+    fy = std::max(0, std::min(65535, fy));
+    int changed = buttons ^ s_mouse.buttons;
+    if (fx == s_mouse.fx && fy == s_mouse.fy && !changed && !wheel) return;
+    s_mouse.fx = fx; s_mouse.fy = fy; s_mouse.buttons = buttons;
+    MouseEv ev = {fx, fy, buttons, wheel};
+    if (s_mouse_qh - s_mouse_qt >= 64) s_mouse_qt++;            // full: drop the oldest
+    s_mouse_q[s_mouse_qh++ % 64] = ev;
+    s_mouse_wheel_acc += wheel;
+    int vx, vy; mouse_to_virtual(fx, fy, &vx, &vy);
+    s_m33_mick_x += vx - s_m33_last_vx; s_m33_mick_y += vy - s_m33_last_vy;
+    s_m33_last_vx = vx; s_m33_last_vy = vy;
+    static const int bit[3] = {1, 2, 4};                          // left, right, middle
+    for (int b = 0; b < 3; b++) {
+        if (!(changed & bit[b])) continue;
+        if (buttons & bit[b]) { s_m33_down_n[b]++; s_m33_down_x[b] = vx; s_m33_down_y[b] = vy; }
+        else                  { s_m33_up_n[b]++;   s_m33_up_x[b] = vx;   s_m33_up_y[b] = vy; }
+    }
+}
+
+// A program asked about the mouse: it's the program's now.
+static void mouse_claim() {
+    if (s_mouse_owned) return;
+    s_mouse_owned = true;
+    s_selecting = false; s_sel_button = false;
+    s_mouse_qt = s_mouse_qh;                                      // nothing from before it looked
+    s_mouse_wheel_acc = 0;
+    s_needs_render = true;
+    mouse_backend_cursor();
+}
+
+static const MouseEv &mouse_now() { return s_mouse_polled ? s_mouse_cur : s_mouse; }
+
+int gfx_mouse_input(void) {
+    mouse_claim();
+    if (!s_mouse_polled) { s_mouse_polled = true; s_mouse_cur = s_mouse; s_mouse_cur.wheel = 0; }
+    if (s_mouse_qt == s_mouse_qh) { s_mouse_cur.wheel = 0; return 0; }
+    s_mouse_cur = s_mouse_q[s_mouse_qt++ % 64];
+    return -1;
+}
+int gfx_mouse_x(void) {
+    mouse_claim();
+    int fx = mouse_now().fx;
+    if (s_gfx_active && s_gfx_w > 0) return (int)((long long)fx * s_gfx_w >> 16);
+    return (int)((long long)fx * s_text_cols >> 16) + 1;
+}
+int gfx_mouse_y(void) {
+    mouse_claim();
+    int fy = mouse_now().fy;
+    if (s_gfx_active && s_gfx_h > 0) return (int)((long long)fy * s_gfx_h >> 16);
+    return (int)((long long)fy * s_text_rows >> 16) + 1;
+}
+int gfx_mouse_button(int n) {
+    mouse_claim();
+    static const int bit[4] = {0, 1, 2, 4};                       // 1 left, 2 right, 3 middle
+    if (n < 1 || n > 3) return 0;
+    return (mouse_now().buttons & bit[n]) ? -1 : 0;
+}
+int gfx_mouse_wheel(void) {
+    mouse_claim();
+    int w;
+    if (s_mouse_polled) w = s_mouse_cur.wheel;
+    else { w = s_mouse_wheel_acc; s_mouse_wheel_acc = 0; }
+    return w > 0 ? -1 : w < 0 ? 1 : 0;                            // QB64: -1 up, 1 down
+}
+void gfx_mouse_show(int on) {
+    mouse_claim();
+    s_mouse_show = on ? 0 : -1;
+    s_needs_render = true;
+    mouse_backend_cursor();
+}
+void gfx_mouse_move(int x, int y) {
+    mouse_claim();
+    int fx, fy;
+    if (s_gfx_active && s_gfx_w > 0 && s_gfx_h > 0) {
+        fx = (int)(((long long)x * 65536 + 32768) / s_gfx_w);
+        fy = (int)(((long long)y * 65536 + 32768) / s_gfx_h);
+    } else {                                                      // text: column, row from 1
+        fx = (int)(((long long)(x - 1) * 65536 + 32768) / std::max(1, s_text_cols));
+        fy = (int)(((long long)(y - 1) * 65536 + 32768) / std::max(1, s_text_rows));
+    }
+    fx = std::max(0, std::min(65535, fx)); fy = std::max(0, std::min(65535, fy));
+    s_mouse.fx = s_mouse_cur.fx = fx; s_mouse.fy = s_mouse_cur.fy = fy;
+    mouse_backend_warp(fx, fy);
+    s_needs_render = true;
+}
+
+// INT 33h: the registers in, the registers out (as 16-bit signed values,
+// like QuickBASIC's INTEGERs).
+static int m33_word(int v) { v &= 0xFFFF; return v >= 0x8000 ? v - 0x10000 : v; }
+void gfx_mouse_int33(int *ax, int *bx, int *cx, int *dx) {
+    mouse_claim();
+    int fn = *ax & 0xFFFF;
+    int vx, vy;
+    switch (fn) {
+    case 0x00:                                     // reset: installed, 3 buttons, pointer hidden
+    case 0x21:                                     // software reset
+        s_mouse_show = -1;
+        s_m33_xmin = s_m33_ymin = 0; s_m33_xmax = s_m33_ymax = -1;
+        for (int b = 0; b < 3; b++) s_m33_down_n[b] = s_m33_up_n[b] = 0;
+        s_m33_mick_x = s_m33_mick_y = 0;
+        *ax = -1; *bx = 3;
+        mouse_backend_cursor();
+        s_needs_render = true;
+        break;
+    case 0x01:                                     // show the pointer
+        if (s_mouse_show < 0) s_mouse_show++;
+        mouse_backend_cursor(); s_needs_render = true;
+        break;
+    case 0x02:                                     // hide it
+        s_mouse_show--;
+        mouse_backend_cursor(); s_needs_render = true;
+        break;
+    case 0x03:                                     // position and buttons
+        mouse_to_virtual(s_mouse.fx, s_mouse.fy, &vx, &vy);
+        *bx = s_mouse.buttons & 7; *cx = vx; *dx = vy;
+        break;
+    case 0x04: {                                   // move the pointer to (CX, DX)
+        int vw, vh; mouse_virtual(&vw, &vh);
+        int fx = (int)(((long long)(*cx & 0xFFFF) * 65536 + 32768) / vw);
+        int fy = (int)(((long long)(*dx & 0xFFFF) * 65536 + 32768) / std::max(1, vh));
+        fx = std::max(0, std::min(65535, fx)); fy = std::max(0, std::min(65535, fy));
+        s_mouse.fx = fx; s_mouse.fy = fy;
+        mouse_backend_warp(fx, fy);
+        s_needs_render = true;
+        break;
+    }
+    case 0x05:                                     // presses of button BX since last asked
+    case 0x06: {                                   // releases
+        int b = *bx & 0xFFFF;
+        if (b > 2) b = 0;
+        int *n = fn == 5 ? s_m33_down_n : s_m33_up_n;
+        int *x = fn == 5 ? s_m33_down_x : s_m33_up_x;
+        int *y = fn == 5 ? s_m33_down_y : s_m33_up_y;
+        *ax = s_mouse.buttons & 7; *bx = n[b]; *cx = x[b]; *dx = y[b];
+        n[b] = 0;
+        break;
+    }
+    case 0x07:                                     // horizontal range CX..DX
+        s_m33_xmin = std::min(m33_word(*cx), m33_word(*dx)); s_m33_xmax = std::max(m33_word(*cx), m33_word(*dx));
+        break;
+    case 0x08:                                     // vertical range CX..DX
+        s_m33_ymin = std::min(m33_word(*cx), m33_word(*dx)); s_m33_ymax = std::max(m33_word(*cx), m33_word(*dx));
+        break;
+    case 0x0B:                                     // motion since last asked
+        *cx = s_m33_mick_x; *dx = s_m33_mick_y;
+        s_m33_mick_x = s_m33_mick_y = 0;
+        break;
+    case 0x24:                                     // driver version 8.00, PS/2 mouse
+        *bx = 0x0800; *cx = 0x0400;
+        break;
+    default:                                       // the rest (cursor shape, speed...): accepted, ignored
+        break;
+    }
+    *ax = m33_word(*ax); *bx = m33_word(*bx); *cx = m33_word(*cx); *dx = m33_word(*dx);
+}
+
+// The program stopped: the mouse goes back to selecting text.
+void gfx_mouse_program_end(void) {
+    if (!s_mouse_owned && s_mouse_show >= 0) return;
+    s_mouse_owned = false;
+    s_mouse_polled = false;
+    s_mouse_show = 0;
+    s_m33_xmin = s_m33_ymin = 0; s_m33_xmax = s_m33_ymax = -1;
+    s_mouse_qt = s_mouse_qh;
+    s_needs_render = true;
+    mouse_backend_cursor();
 }
 
 // ============================================================================
@@ -587,6 +866,27 @@ void gfx_palette_reset_pub() {
 
 BASIC_NS_END
 
+// The mouse: window pixels to a fraction of the picture (graphics fill the
+// window; the text grid starts at its top-left corner).
+static int mouse_fx(int x) {
+    int w = s_gfx_active ? s_win_w : s_text_cols * s_cell_w;
+    return (int)((long long)x * 65536 / std::max(1, w));
+}
+static int mouse_fy(int y) {
+    int h = s_gfx_active ? s_win_h : s_text_rows * s_cell_h;
+    return (int)((long long)y * 65536 / std::max(1, h));
+}
+static void mouse_backend_warp(int fx, int fy) {
+    if (!s_window) return;
+    int w = s_gfx_active ? s_win_w : s_text_cols * s_cell_w;
+    int h = s_gfx_active ? s_win_h : s_text_rows * s_cell_h;
+    if (SDL_GetMouseFocus() == s_window)
+        SDL_WarpMouseInWindow(s_window, (int)((long long)fx * w >> 16), (int)((long long)fy * h >> 16));
+}
+static void mouse_backend_cursor() {
+    SDL_ShowCursor(mouse_cursor_wanted() ? SDL_ENABLE : SDL_DISABLE);
+}
+
 bool gfx_sdl_pump() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -610,10 +910,9 @@ bool gfx_sdl_pump() {
             SDL_Keycode sym = e.key.keysym.sym;
             if (sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
                 // Ctrl+C — copy selection to clipboard (or break if no selection)
-                if (s_selecting && !s_selection_text.empty()) {
-                    SDL_SetClipboardText(s_selection_text.c_str());
-                    s_selecting = false;  // Clear selection after copy
-                    s_needs_render = true;
+                std::string text;
+                if (sel_take(text)) {
+                    SDL_SetClipboardText(text.c_str());
                 } else {
                     // No selection: send SIGINT break
                     BASIC_NS::g_break = 1;
@@ -624,8 +923,11 @@ bool gfx_sdl_pump() {
                 if (SDL_HasClipboardText()) {
                     char *clipboard = SDL_GetClipboardText();
                     if (clipboard) {
-                        for (const char *p = clipboard; *p; p++)
-                            key_push((unsigned char)*p);
+                        // Line breaks (\n, \r\n or \r) type Enter
+                        for (const char *p = clipboard; *p; p++) {
+                            if (*p == '\r' && p[1] == '\n') continue;
+                            key_push(*p == '\n' || *p == '\r' ? '\r' : (unsigned char)*p);
+                        }
                         SDL_free(clipboard);
                     }
                 }
@@ -669,69 +971,52 @@ bool gfx_sdl_pump() {
             for (const char *p = e.text.text; *p; p++)
                 key_push((unsigned char)*p);
             break;
-        case SDL_MOUSEWHEEL:
+        case SDL_MOUSEWHEEL: {
+            int mx, my, delta = e.wheel.y;
+            if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) delta = -delta;
+            SDL_GetMouseState(&mx, &my);
             if (!s_gfx_active && (SDL_GetModState() & KMOD_CTRL)) {
                 // Ctrl+scroll in SCREEN 0: resize font → changes cols/rows
-                int delta = (e.wheel.y > 0) ? 1 : -1;
+                int step = (delta > 0) ? 1 : -1;
                 if (s_font_size_override == 0)
                     s_font_size_override = s_cell_h;
-                s_font_size_override = std::max(6, std::min(72, s_font_size_override + delta));
+                s_font_size_override = std::max(6, std::min(72, s_font_size_override + step));
                 ft_set_size_for_window();
+                s_needs_render = true;
+            } else if (s_mouse_owned) {
+                mouse_report(mouse_fx(mx), mouse_fy(my), s_mouse.buttons, delta);
+            } else if (delta) {
+                // Wheel at the prompt: through the history, 3 lines a click
+                int lines_in_scrollback = std::min(s_scrollback_count, SCROLLBACK_LINES);
+                s_display_offset = std::max(0, std::min(s_display_offset + delta * 3,
+                                                        lines_in_scrollback - s_text_rows));
                 s_needs_render = true;
             }
             break;
+        }
         case SDL_MOUSEBUTTONDOWN:
-            if (!s_gfx_active && e.button.button == SDL_BUTTON_LEFT) {
-                int col = (e.button.x - TEXT_PAD) / s_cell_w;
-                int row = (e.button.y - TEXT_PAD) / s_cell_h;
-                col = std::max(0, std::min(col, s_text_cols - 1));
-                row = std::max(0, std::min(row, s_text_rows - 1));
-                
-                // If already have a selection, toggle it off
-                if (s_selecting) {
-                    s_selecting = false;
-                    s_drag_occurred = false;
-                    s_needs_render = true;
-                } else {
-                    // Start new selection
-                    s_selecting = true;
-                    s_drag_occurred = false;
-                    s_sel_start_row = s_sel_end_row = row;
-                    s_sel_start_col = s_sel_end_col = col;
-                    update_selection_text();
-                    s_needs_render = true;
-                }
-            }
-            break;
-        case SDL_MOUSEMOTION:
-            if (!s_gfx_active && s_selecting) {
-                // Update selection end point
-                int col = (e.motion.x - TEXT_PAD) / s_cell_w;
-                int row = (e.motion.y - TEXT_PAD) / s_cell_h;
-                col = std::max(0, std::min(col, s_text_cols - 1));
-                row = std::max(0, std::min(row, s_text_rows - 1));
-                
-                // Check if we actually moved
-                if (row != s_sel_start_row || col != s_sel_start_col) {
-                    s_drag_occurred = true;
-                    s_sel_end_row = row;
-                    s_sel_end_col = col;
-                    update_selection_text();
-                    s_needs_render = true;
-                }
-            }
-            break;
         case SDL_MOUSEBUTTONUP:
-            if (!s_gfx_active && e.button.button == SDL_BUTTON_LEFT) {
-                // If no drag occurred, clear selection
-                if (!s_drag_occurred) {
-                    s_selecting = false;
-                    s_needs_render = true;
-                }
-                // If drag occurred, keep selection visible
-                s_drag_occurred = false;
+        case SDL_MOUSEMOTION: {
+            int mx = e.type == SDL_MOUSEMOTION ? e.motion.x : e.button.x;
+            int my = e.type == SDL_MOUSEMOTION ? e.motion.y : e.button.y;
+            // Buttons from the events themselves: a quick click is a press
+            // and a release in the same batch of events
+            static int buttons = 0;
+            if (e.type != SDL_MOUSEMOTION) {
+                int bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2
+                        : e.button.button == SDL_BUTTON_MIDDLE ? 4 : 0;
+                if (e.type == SDL_MOUSEBUTTONDOWN) buttons |= bit; else buttons &= ~bit;
             }
+            mouse_report(mouse_fx(mx), mouse_fy(my), buttons, 0);
+            // Selecting text: SCREEN 0, while no program is using the mouse
+            if (s_gfx_active || s_mouse_owned) break;
+            int col = std::max(0, std::min(mx / std::max(1, s_cell_w), s_text_cols - 1));
+            int row = std::max(0, std::min(my / std::max(1, s_cell_h), s_text_rows - 1));
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) sel_press(row, col);
+            else if (e.type == SDL_MOUSEMOTION) sel_drag(row, col);
+            else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) sel_release();
             break;
+        }
         default: break;
         }
     }

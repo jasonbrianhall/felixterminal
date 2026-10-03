@@ -5,6 +5,7 @@
 #include "sound_player.hpp"
 
 namespace StandaloneBasic { extern volatile int g_break; }   // ../main.cpp
+extern volatile bool g_bm_selection;   // kernel.cpp: text is selected, so Ctrl+C copies it
 // The PIT runs at 240 Hz: `fine_ticks` counts every interrupt (sound is
 // topped up that often), `ticks` every 4th (60 Hz, the game's frame clock).
 volatile uint32_t ticks, fine_ticks;
@@ -28,11 +29,24 @@ extern "C" void irq_keyboard() {
         uint8_t code = b & 0x7F;
         bool down = !(b & 0x80);
         if (code == 0x1D) ctrl = down;
-        else if (down && ((ctrl && !e0 && code == 0x2E) || (e0 && code == 0x46))) StandaloneBasic::g_break = 1;
+        else if (down && ((ctrl && !e0 && code == 0x2E && !g_bm_selection) || (e0 && code == 0x46))) StandaloneBasic::g_break = 1;
         e0 = false;
     }
     kbd_buf[kbd_head] = b;
     kbd_head = kbd_head + 1;
+    outb(0x20, 0x20);
+}
+
+// PS/2 mouse (IRQ 12, on the slave PIC): bytes are queued here and put
+// together into packets by kernel.cpp.
+volatile uint8_t mouse_buf[256];
+volatile uint8_t mouse_head, mouse_tail;
+
+extern "C" void irq_mouse() {
+    uint8_t b = inb(0x60);
+    mouse_buf[mouse_head] = b;
+    mouse_head = mouse_head + 1;
+    outb(0xA0, 0x20);
     outb(0x20, 0x20);
 }
 

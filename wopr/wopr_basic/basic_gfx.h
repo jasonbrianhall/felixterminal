@@ -103,6 +103,29 @@ int  gfx_height(void);
 
 void gfx_sprites_clear(void);
 
+/* ── Mouse ─────────────────────────────────────────────────────────────────── */
+
+/* QB64's mouse functions. _MOUSEINPUT reads the next queued mouse event
+ * (-1) or reports there is none (0); _MOUSEX / _MOUSEY / _MOUSEBUTTON /
+ * _MOUSEWHEEL then describe that event (before a program first calls
+ * _MOUSEINPUT, they describe the mouse as it is now). Positions are pixels
+ * in graphics modes, columns and rows (from 1) in SCREEN 0. Buttons: 1
+ * left, 2 right, 3 middle; -1 while held. Wheel: -1 up, 1 down. */
+int  gfx_mouse_input(void);
+int  gfx_mouse_x(void);
+int  gfx_mouse_y(void);
+int  gfx_mouse_button(int n);
+int  gfx_mouse_wheel(void);
+void gfx_mouse_show(int on);          /* _MOUSESHOW (1) / _MOUSEHIDE (0) */
+void gfx_mouse_move(int x, int y);    /* _MOUSEMOVE x, y */
+
+/* The DOS mouse driver, INT 33h: AX is the function; the registers come
+ * back as the driver leaves them (functions 0-8, &HB, &H21, &H24). */
+void gfx_mouse_int33(int *ax, int *bx, int *cx, int *dx);
+
+/* A program stopped: the mouse goes back to selecting text to copy. */
+void gfx_mouse_program_end(void);
+
 #ifdef __cplusplus
 }
 #endif

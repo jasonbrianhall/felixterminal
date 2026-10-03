@@ -171,10 +171,94 @@ void gfx_sdl_toggle_fullscreen() {}
 void gfx_palette_reset_pub() { gfx_palette_reset(); }
 BASIC_NS_END
 
-// Poll the keyboard (kernel.cpp turns scancodes into gfx_bm_key() calls).
-// Shift+PageUp/PageDown scroll through the history, as in the SDL build.
+// ============================================================================
+// The mouse (kernel.cpp: PS/2 or USB, as relative motion). The pointer is
+// kept in screen pixels inside the picture; BASIC sees it as a fraction of
+// the picture (mouse_report). At the prompt (and in any SCREEN 0 program
+// that doesn't use the mouse) the left button selects text, Ctrl+C copies
+// it and Ctrl+V types it back; the wheel scrolls through the history.
+// ============================================================================
+static int  s_mpx = -1, s_mpy = -1;       // pointer, screen pixels (-1: not placed yet)
+static int  s_mbuttons;
+static bool s_mouse_seen;                 // a mouse has reported
+static Uint32 s_mouse_used;               // when it last moved or clicked
+static bool s_pointer_drawn;               // the last render drew the pointer
+static std::string s_clip;                // what Ctrl+C copied
+
+static void mouse_place() {
+    if (s_mpx < 0) { s_mpx = s_disp_x + s_disp_w / 2; s_mpy = s_disp_y + s_disp_h / 2; }
+    s_mpx = std::max(s_disp_x, std::min(s_disp_x + s_disp_w - 1, s_mpx));
+    s_mpy = std::max(s_disp_y, std::min(s_disp_y + s_disp_h - 1, s_mpy));
+}
+static int mouse_fx() { return (int)((long long)(s_mpx - s_disp_x) * 65536 / std::max(1, s_disp_w)); }
+static int mouse_fy() { return (int)((long long)(s_mpy - s_disp_y) * 65536 / std::max(1, s_disp_h)); }
+static void mouse_backend_warp(int fx, int fy) {
+    mouse_place();
+    s_mpx = s_disp_x + (int)((long long)fx * s_disp_w >> 16);
+    s_mpy = s_disp_y + (int)((long long)fy * s_disp_h >> 16);
+    mouse_place();
+}
+static void mouse_backend_cursor() { s_needs_render = true; }
+
+// Show the pointer? A program using the mouse decides (INT 33h show/hide,
+// _MOUSESHOW/_MOUSEHIDE); otherwise it shows while it's being used, and
+// for 3 seconds after.
+static bool pointer_visible() {
+    if (!s_mouse_seen || !mouse_cursor_wanted()) return false;
+    return s_mouse_owned || s_sel_button || SDL_GetTicks() - s_mouse_used < 3000;
+}
+
+static void scroll_lines(int n) {
+    int lines_in_scrollback = std::min(s_scrollback_count, SCROLLBACK_LINES);
+    s_display_offset = std::max(0, std::min(s_display_offset + n, lines_in_scrollback - s_text_rows));
+    s_needs_render = true;
+}
+
+void gfx_bm_mouse(int dx, int dy, int buttons, int wheel) {
+    mouse_place();
+    int k = std::max(1, s_disp_w / 640);                  // the same hand movement on any screen
+    s_mpx += dx * k; s_mpy += dy * k;
+    mouse_place();
+    if (dx || dy || buttons != s_mbuttons || wheel) {
+        s_mouse_seen = true;
+        s_mouse_used = SDL_GetTicks();
+        s_needs_render = true;
+    }
+    int pressed = buttons & ~s_mbuttons, released = s_mbuttons & ~buttons;
+    s_mbuttons = buttons;
+    mouse_report(mouse_fx(), mouse_fy(), buttons, s_mouse_owned ? wheel : 0);
+    if (s_mouse_owned) return;
+    if (wheel) scroll_lines(wheel * 3);
+    if (s_gfx_active) return;
+    int col = std::max(0, std::min(s_text_cols - 1, (s_mpx - s_disp_x) / std::max(1, s_cell_w)));
+    int row = std::max(0, std::min(s_text_rows - 1, (s_mpy - s_disp_y) / std::max(1, s_cell_h)));
+    if (pressed & 1) sel_press(row, col);
+    else if (buttons & 1) sel_drag(row, col);
+    if (released & 1) sel_release();
+}
+
+bool gfx_bm_copy() {
+    std::string t;
+    if (!sel_take(t)) return false;
+    s_clip = t;
+    g_bm_selection = false;
+    return true;
+}
+void gfx_bm_paste() {
+    for (size_t i = 0; i < s_clip.size(); i++) {
+        char c = s_clip[i];
+        if (c == '\r' && i + 1 < s_clip.size() && s_clip[i + 1] == '\n') continue;
+        gfx_bm_key(c == '\n' || c == '\r' ? '\r' : (unsigned char)c);
+    }
+}
+
+// Poll the keyboard and mouse (kernel.cpp turns scancodes into gfx_bm_key()
+// calls, mouse packets into gfx_bm_mouse()). Shift+PageUp/PageDown scroll
+// through the history, as in the SDL build.
 bool gfx_sdl_pump() {
     platform_poll_input();
+    g_bm_selection = s_selecting && !s_selection_text.empty();
+    if (s_pointer_drawn != pointer_visible()) s_needs_render = true;   // it timed out
     return true;
 }
 void gfx_bm_scroll(int pages) {
@@ -295,6 +379,15 @@ static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
         // cells with something in them, so the picture shows through.
         if (s_gfx_active && blank) continue;
         Uint32 fg = s_pal[cell.fg & 15] & 0xFFFFFF, bg = s_pal[cell.bg & 15] & 0xFFFFFF;
+        if (is_cell_selected(row, col)) {                // light blue over it, as in the SDL build
+            auto tint = [](Uint32 c) {
+                Uint32 r = ((c >> 16 & 255) * 155 + 100 * 100) / 255;
+                Uint32 g = ((c >> 8 & 255) * 155 + 150 * 100) / 255;
+                Uint32 b = ((c & 255) * 155 + 255 * 100) / 255;
+                return r << 16 | g << 8 | b;
+            };
+            fg = tint(fg); bg = tint(bg);
+        }
         int x0 = s_disp_x + col * s_cell_w;
         int cy0 = s_disp_y + row * s_cell_h;
         int cw = std::min(s_cell_w, 256), chh = std::min(s_cell_h, 256);
@@ -347,12 +440,41 @@ static void render_strip(int y0, int lines) {
             if (y >= y0 && y < y0 + lines)
                 for (int x = x0; x < x0 + s_cell_w; x++) strip[(size_t)(y - y0) * w + x] = c;
     }
+    // 4. The mouse pointer: in text modes the cell under it in reverse, as
+    // the DOS mouse driver shows it; in graphics modes an arrow
+    if (s_pointer_drawn) {
+        if (!s_gfx_active) {
+            int col = (s_mpx - s_disp_x) / std::max(1, s_cell_w), row = (s_mpy - s_disp_y) / std::max(1, s_cell_h);
+            int cx = s_disp_x + col * s_cell_w, cy = s_disp_y + row * s_cell_h;
+            for (int y = std::max(cy, y0); y < std::min(cy + s_cell_h, y0 + lines); y++)
+                for (int x = cx; x < cx + s_cell_w && x < (int)w; x++) strip[(size_t)(y - y0) * w + x] ^= 0xFFFFFF;
+        } else {
+            static const char *const arrow[] = {
+                "X..........", "XX.........", "XOX........", "XOOX.......", "XOOOX......", "XOOOOX.....",
+                "XOOOOOX....", "XOOOOOOX...", "XOOOOOOOX..", "XOOOOOXXXX.", "XOOXOOX....", "XOX.XOOX...",
+                "XX..XOOX...", "X....XOOX..", ".....XOOX..", "......XX...",
+            };
+            int k = std::max(1, s_disp_h / 400);
+            for (int r = 0; r < 16 * k; r++) {
+                int y = s_mpy + r;
+                if (y < y0 || y >= y0 + lines || y >= (int)fb_height()) continue;
+                for (int c = 0; c < 11 * k; c++) {
+                    int x = s_mpx + c;
+                    char a = arrow[r / k][c / k];
+                    if (a == '.' || x >= (int)w) continue;
+                    strip[(size_t)(y - y0) * w + x] = a == 'X' ? 0x000000 : 0xFFFFFF;
+                }
+            }
+        }
+    }
     video_band_done();
 }
 
 void gfx_sdl_render() {
     if (!s_needs_render) return;
     s_needs_render = false;
+    s_pointer_drawn = pointer_visible();
+    if (s_pointer_drawn) mouse_place();
     int h = (int)fb_height();
     if (s_layout_changed) {                                      // new mode: repaint the borders too
         video_invalidate();
