@@ -261,6 +261,22 @@ Var *var_get_in(char *name, int sc) {
 
 Var *var_get(char *name) { return var_get_in(name, g_scope); }
 
+/* A TYPE array's fields live in parallel arrays, one per field, named
+ * BASE.FIELD (BASE.FIELD$ for a string field) and dimensioned like BASE --
+ * not one variable per element per field, which ran out of variable slots
+ * (and slowed every lookup) for any sizeable array of records. Null if
+ * BASE(...).FIELD isn't stored that way. */
+Var *field_array(const char *base, const char *field, int *is_str) {
+    char n[MAX_VARNAME];
+    snprintf(n, sizeof n, "%s.%s$", base, field);
+    Var *v = var_find(n);
+    if (v && v->kind == VAR_ARRAY_STR) { *is_str = 1; return v; }
+    n[strlen(n) - 1] = '\0';
+    v = var_find(n);
+    if (v && v->kind == VAR_ARRAY_NUM) { *is_str = 0; return v; }
+    return NULL;
+}
+
 /* ================================================================
  * Array element access (1-based or option-base-based indices)
  * ================================================================ */

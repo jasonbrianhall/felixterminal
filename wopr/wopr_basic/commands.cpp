@@ -791,7 +791,8 @@ static int cmd_locate(Interp *ip, char *args) {
 static int cmd_dim(Interp *ip, char *args);
 static int cmd_return(Interp *ip, char *args);
 static void byref_return(int fi);
-static char *parse_field_varname(char *p, char *out);
+typedef struct { char base[MAX_VARNAME], field[MAX_VARNAME]; int nidx, i, j; } FieldRef;
+static char *parse_field_varname(char *p, char *out, FieldRef *fr);
 static int eval_one_cmp(char **pp);
 
 /* Evaluate a full boolean expression: one or more comparisons joined by AND/OR */
@@ -1904,39 +1905,25 @@ static int cmd_dim(Interp *ip, char *args) {
             /* If it's a user-defined TYPE, create flat field variables */
             TypeDef *td = typedef_find(type_name);
             if (td) {
-                /* Determine the array size (if any) for this var */
-                int arr_count = 1, arr_base = g_option_base;
                 Var *base_v = var_find(name);
-                if (base_v && (base_v->kind == VAR_ARRAY_NUM || base_v->kind == VAR_ARRAY_STR)) {
-                    arr_count = base_v->dim[0] * (base_v->ndim == 2 ? base_v->dim[1] : 1);
-                    arr_base  = 0; /* already-created arrays are 0-based internally */
-                }
-
-                for (int ai = 0; ai < arr_count; ai++) {
-                    int elem_idx = arr_base + ai;
-                    for (int fi = 0; fi < td->nfields; fi++) {
-                        char flatname[MAX_VARNAME];
-                        if (arr_count > 1)
-                            snprintf(flatname, sizeof flatname, "%s.%d.%s",
-                                     name, elem_idx, td->fields[fi].name);
-                        else
-                            snprintf(flatname, sizeof flatname, "%s.%s",
-                                     name, td->fields[fi].name);
-
-                        if (td->fields[fi].is_str) {
-                            char sname[MAX_VARNAME];
-                            snprintf(sname, sizeof sname, "%s$", flatname);
-                            if (!var_find(sname)) {
-                                Var *fv = var_create(sname);
-                                (void)fv;
-                            }
-                        } else {
-                            if (!var_find(flatname)) {
-                                Var *fv = var_create(flatname);
-                                (void)fv;
-                            }
-                        }
-                    }
+                int is_arr = base_v && (base_v->kind == VAR_ARRAY_NUM ||
+                                        base_v->kind == VAR_ARRAY_STR);
+                for (int fi = 0; fi < td->nfields; fi++) {
+                    char flatname[MAX_VARNAME];
+                    snprintf(flatname, sizeof flatname, "%s.%s%s", name,
+                             td->fields[fi].name, td->fields[fi].is_str ? "$" : "");
+                    Var *fv = var_find(flatname);
+                    if (!fv) fv = var_create(flatname);
+                    if (!is_arr) continue;
+                    /* An array of records: one array per field, shaped like
+                     * the base array (see field_array). */
+                    int fs = td->fields[fi].is_str;
+                    if (fv->kind == VAR_STR) { free(fv->str); fv->str = NULL; }
+                    fv->kind = fs ? VAR_ARRAY_STR : VAR_ARRAY_NUM;
+                    fv->ndim = base_v->ndim;
+                    fv->dim[0] = base_v->dim[0]; fv->dim[1] = base_v->dim[1];
+                    if (!var_alloc_array(fv, base_v->arr_len, fs))
+                        basic_stderr("Out of memory for array %s\n", flatname);
                 }
             }
         }
@@ -1956,12 +1943,29 @@ static int cmd_let(Interp *ip, char *args) {
     {
         char *save = p;
         char flatname[MAX_VARNAME];
-        char *after = parse_field_varname(p, flatname);
+        FieldRef fr;
+        char *after = parse_field_varname(p, flatname, &fr);
         if (after) {
             after = sk(after);
             if (*after == '=') {
                 /* It's a field assignment */
                 after = sk(after + 1);
+                int fstr;
+                Var *fa = fr.nidx ? field_array(fr.base, fr.field, &fstr) : NULL;
+                if (fa && fstr) {
+                    char sbuf[1024];
+                    eval_str_expr(after, sbuf, sizeof sbuf);
+                    char **e = arr_str_elem(fa, fr.i, fr.j);
+                    free(*e); *e = str_dup(sbuf);
+                    return 0;
+                }
+                if (fa) {
+                    mpf_t val; mpf_init2(val, g_prec);
+                    eval_expr(after, val);
+                    mpf_set(*arr_num_elem(fa, fr.i, fr.j), val);
+                    mpf_clear(val);
+                    return 0;
+                }
                 int is_str = (flatname[strlen(flatname)-1] == '$') ||
                              strrchr(flatname, '.') != NULL;
                 /* Determine by trying string eval if it looks like a string */
@@ -2676,7 +2680,7 @@ static int cmd_preset(Interp *ip, char *args) {
  * Result written into out (must be MAX_VARNAME bytes).
  * Returns pointer past the parsed text, or NULL on failure.
  * ================================================================ */
-static char *parse_field_varname(char *p, char *out) {
+static char *parse_field_varname(char *p, char *out, FieldRef *fr) {
     /* read base name */
     char base[MAX_VARNAME]; int bi = 0;
     while ((isalnum((unsigned char)*p) || *p == '_') && bi < MAX_VARNAME - 1)
@@ -2684,6 +2688,7 @@ static char *parse_field_varname(char *p, char *out) {
     base[bi] = '\0';
     if (!bi) return NULL;
 
+    fr->nidx = 0;
     /* optional array index */
     char idx_str[32] = "";
     if (*p == '(') {
@@ -2693,12 +2698,14 @@ static char *parse_field_varname(char *p, char *out) {
         int idx1 = (int)mpf_get_si(v);
         mpf_clear(v);
         snprintf(idx_str, sizeof idx_str, "%d", idx1);
+        fr->nidx = 1; fr->i = idx1; fr->j = g_option_base;
         if (*p == ',') {
             p = sk(p + 1);
             mpf_t v2; mpf_init2(v2, g_prec);
             p = sk(eval_expr(p, v2));
             int idx2 = (int)mpf_get_si(v2);
             mpf_clear(v2);
+            fr->nidx = 2; fr->j = idx2;
             char tmp2[16]; snprintf(tmp2, sizeof tmp2, ",%d", idx2);
             strncat(idx_str, tmp2, sizeof idx_str - strlen(idx_str) - 1);
         }
@@ -2715,6 +2722,7 @@ static char *parse_field_varname(char *p, char *out) {
     field[fi] = '\0';
     if (!fi) return NULL;
 
+    strcpy(fr->base, base); strcpy(fr->field, field);
     /* build flat name: BASE.IDX.FIELD or BASE.FIELD */
     if (idx_str[0])
         snprintf(out, MAX_VARNAME, "%s.%s.%s", base, idx_str, field);

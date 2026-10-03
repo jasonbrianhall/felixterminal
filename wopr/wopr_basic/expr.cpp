@@ -438,17 +438,20 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         base2[bi2] = '\0';
         p = sk(p);
         char idx2_str[32] = "";
+        int fi_i = 0, fi_j = g_option_base;
         if (*p == '(') {
             p = sk(p + 1);
             mpf_t vi; mpf_init2(vi, g_prec);
             p = sk(eval_expr(p, vi));
             int id1 = (int)mpf_get_si(vi); mpf_clear(vi);
             snprintf(idx2_str, sizeof idx2_str, "%d", id1);
+            fi_i = id1;
             if (*p == ',') {
                 p = sk(p + 1);
                 mpf_t vi2; mpf_init2(vi2, g_prec);
                 p = sk(eval_expr(p, vi2));
                 int id2 = (int)mpf_get_si(vi2); mpf_clear(vi2);
+                fi_j = id2;
                 char t2[16]; snprintf(t2, sizeof t2, ",%d", id2);
                 strncat(idx2_str, t2, sizeof idx2_str - strlen(idx2_str) - 1);
             }
@@ -461,6 +464,16 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
             while ((isalnum((unsigned char)*p) || *p == '_') && fi2 < MAX_VARNAME - 1)
                 field2[fi2++] = (char)toupper((unsigned char)*p++);
             field2[fi2] = '\0';
+            if (fi2 && idx2_str[0]) {
+                int fstr;
+                Var *fa = field_array(base2, field2, &fstr);
+                if (fa && fstr) {
+                    char *e = *arr_str_elem(fa, fi_i, fi_j);
+                    strncpy(buf, e ? e : "", bufsz - 1); buf[bufsz - 1] = '\0';
+                    return p;
+                }
+                if (fa) { snprintf(buf, bufsz, "%g", mpf_get_d(*arr_num_elem(fa, fi_i, fi_j))); return p; }
+            }
             if (fi2) {
                 /* Try string flat var: BASE.IDX.FIELD$ or BASE.FIELD$ */
                 char flatname2[MAX_VARNAME], sname2[MAX_VARNAME];
@@ -1526,18 +1539,21 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
 
         /* optional array index */
         char idx_str[32] = "";
+        int fi_i = 0, fi_j = g_option_base;
         if (*ps->p == '(') {
             ps->p++; skip_ws_p(ps);
             mpf_t v; mpf_init2(v, g_prec);
             parse_expr_p(ps, v);
             int idx1 = (int)mpf_get_si(v); mpf_clear(v);
             snprintf(idx_str, sizeof idx_str, "%d", idx1);
+            fi_i = idx1;
             skip_ws_p(ps);
             if (*ps->p == ',') {
                 ps->p++; skip_ws_p(ps);
                 mpf_t v2; mpf_init2(v2, g_prec);
                 parse_expr_p(ps, v2);
                 int idx2 = (int)mpf_get_si(v2); mpf_clear(v2);
+                fi_j = idx2;
                 char tmp2[16]; snprintf(tmp2, sizeof tmp2, ",%d", idx2);
                 strncat(idx_str, tmp2, sizeof idx_str - strlen(idx_str) - 1);
                 skip_ws_p(ps);
@@ -1552,6 +1568,15 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
             while ((isalnum((unsigned char)*ps->p) || *ps->p == '_') && fi < MAX_VARNAME - 1)
                 field[fi++] = (char)toupper((unsigned char)*ps->p++);
             field[fi] = '\0';
+            if (fi && idx_str[0]) {
+                int fstr;
+                Var *fa = field_array(base, field, &fstr);
+                if (fa) {
+                    if (fstr) mpf_set_ui(result, 0);   /* string in numeric context */
+                    else mpf_set(result, *arr_num_elem(fa, fi_i, fi_j));
+                    return;
+                }
+            }
             if (fi) {
                 char flatname[MAX_VARNAME];
                 if (idx_str[0])

@@ -191,6 +191,7 @@ int     basic_paced(void);            /* the program is pacing itself with pause
 void    var_free_arrays(Var *v);      /* release an array's elements and storage */
 bool    var_alloc_array(Var *v, int total, int is_str);
 char  **arr_str_elem(Var *v, int i, int j);
+Var    *field_array(const char *base, const char *field, int *is_str);
 
 /* ================================================================
  * Program store
