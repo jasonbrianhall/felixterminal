@@ -241,6 +241,10 @@ static bool glyph_px(unsigned char ch, int x, int y) {
 // (13 wide: 1.6 times) has the font stretched to it. Cells of 14 or 15
 // lines (EGA's 640x350) drop the font's blank top/bottom rows.
 static int s_glyph_x[256], s_glyph_y[256];
+// The same with the padding filled from the nearest font row / column, for
+// the box-drawing and block characters (176-223), which have to meet the
+// next cell's without a gap (Nibbles' walls, a text window's frame).
+static int s_glyph_xe[256], s_glyph_ye[256];
 static int s_glyph_cw = -1, s_glyph_ch = -1;
 static void glyph_axis(int* map, int cell, int font) {
     cell = std::min(cell, 256);
@@ -261,6 +265,18 @@ static void glyph_maps() {
     if (s_glyph_cw == s_cell_w && s_glyph_ch == s_cell_h) return;
     glyph_axis(s_glyph_x, s_cell_w, 8);
     glyph_axis(s_glyph_y, s_cell_h, 16);
+    for (int pass = 0; pass < 2; pass++) {
+        const int* m = pass ? s_glyph_y : s_glyph_x;
+        int* e = pass ? s_glyph_ye : s_glyph_xe;
+        int n = std::min(pass ? s_cell_h : s_cell_w, 256), last = pass ? 15 : 7;
+        int first = -1;
+        for (int i = 0; i < n && first < 0; i++) if (m[i] >= 0) first = m[i];
+        int cur = first < 0 ? 0 : first;
+        for (int i = 0; i < n; i++) {
+            if (m[i] >= 0) cur = m[i];
+            e[i] = m[i] >= 0 ? m[i] : (i < n / 2 ? (first < 0 ? 0 : first) : (cur > last ? last : cur));
+        }
+    }
     s_glyph_cw = s_cell_w; s_glyph_ch = s_cell_h;
 }
 
@@ -272,6 +288,9 @@ static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
         const Cell cell = scrollback_get_cell(row, col);
         unsigned char ch = (unsigned char)cell.ch;
         bool blank = ch == ' ' || ch == 0;
+        bool joins = ch >= 176 && ch <= 223;
+        const int* gxm = joins ? s_glyph_xe : s_glyph_x;
+        const int* gym = joins ? s_glyph_ye : s_glyph_y;
         // Text mode paints every cell's background; in graphics mode only
         // cells with something in them, so the picture shows through.
         if (s_gfx_active && blank) continue;
@@ -282,10 +301,10 @@ static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
         for (int y = 0; y < chh; y++) {
             int sy = cy0 + y - y0;
             if (sy < 0 || sy >= lines) continue;
-            int gy = s_glyph_y[y];
+            int gy = gym[y];
             Uint32* d = &strip[(size_t)sy * w + x0];
             for (int x = 0; x < cw; x++) {
-                int gx = s_glyph_x[x];
+                int gx = gxm[x];
                 d[x] = (!blank && gy >= 0 && gx >= 0 && glyph_px(ch, gx, gy)) ? fg : bg;
             }
         }

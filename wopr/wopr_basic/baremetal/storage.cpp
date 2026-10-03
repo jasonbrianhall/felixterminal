@@ -29,10 +29,18 @@ static bool ram_write(uint32_t lba, uint32_t n, const void* buf) {
     memcpy(ram + lba * 512, buf, n * 512);
     return true;
 }
+static const uint8_t* image;              // a disk image from the boot loader
+static uint32_t image_size;
+void storage_set_image(const void* p, uint32_t size) { image = (const uint8_t*)p; image_size = size; }
+
 static bool ram_format() {
     ram = (uint8_t*)malloc(2880 * 512);
     if (!ram) return false;
     memset(ram, 0, 2880 * 512);
+    if (image && image_size >= 512 && image[510] == 0x55 && image[511] == 0xAA) {
+        memcpy(ram, image, image_size > 2880 * 512 ? 2880 * 512 : image_size);
+        return true;
+    }
     uint8_t* b = ram;
     static const uint8_t bpb[] = {
         0xEB, 0x3C, 0x90, 'F', 'E', 'L', 'I', 'X', ' ', ' ', ' ',
@@ -94,7 +102,8 @@ void storage_init(uint32_t mb_flags, uint32_t boot_device, const char* cmdline) 
     }
     if (ram_format() && fat_mount(ram_disk)) {
         mounted = true;
-        printf("Storage: no boot floppy; files go to a 1.44 MB RAM disk\n");
+        printf(image ? "Storage: disk image loaded into a 1.44 MB RAM disk\n"
+                     : "Storage: no boot floppy; files go to a 1.44 MB RAM disk\n");
     } else {
         printf("Storage: none\n");
     }

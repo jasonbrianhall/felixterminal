@@ -586,6 +586,10 @@ extern "C" void kmain() {
     printf("Sound: %s\n", drv != AUDIO_NONE ? audio_name() : "PC speaker");
     usb_init(cmdline);
     interrupts_init();
+    if ((info.flags & (1 << 3)) && info.mods_count) {   // a disk image (UEFI loader)
+        const uint32_t* mod = (const uint32_t*)(uintptr_t)info.mods_addr;
+        storage_set_image((const void*)(uintptr_t)mod[0], mod[1] - mod[0]);
+    }
     storage_init(info.flags, info.boot_device, cmdline);
     printf("Heap after start-up: %lu KB free\n", (unsigned long)(heap_free_bytes() >> 10));
 

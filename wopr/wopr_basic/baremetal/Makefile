@@ -7,8 +7,16 @@
 #   make              the kernel alone (felixbasic.elf)
 #   make run          boot the kernel directly in QEMU (files on a RAM disk)
 #   make iso          bootable CD / USB image (felixbasic.iso)
+#   make efi          UEFI application (felixbasic.efi) plus felixbasic.img,
+#                     the sample programs on a FAT12 image it loads into the
+#                     RAM disk; copy both to EFI/BOOT/ on a FAT USB stick,
+#                     the .efi as BOOTX64.EFI
+#   make run-efi      boot felixbasic.efi under UEFI firmware (OVMF) in QEMU
+#   make sign KEY=db.key CERT=db.crt
+#                     sign felixbasic.efi for Secure Boot (sbsign)
 #
-# ARCH=x86_64 (default) builds the 64-bit kernel. ARCH=i386 builds a 32-bit
+# ARCH=x86_64 (default) builds the 64-bit kernel, and the UEFI loader
+# (make efi). ARCH=i386 builds a 32-bit
 # one that runs on a 386 or later with a 387 (BASIC numbers are doubles);
 # its outputs are named felixbasic-i386.*. The 32-bit build needs
 # g++-multilib.
@@ -45,7 +53,14 @@ GFXMODE  := auto,1024x768x32,800x600x32,640x480x32,640x480x16,640x480x8
 # The boot loader picks the mode from GFXMODE (no preference in the kernel's
 # header); 640x480 is for QEMU -kernel, which sets none.
 FBDEFS   := -DFB_W=640 -DFB_H=480 -DFB_BPP=32 -DMB_W=0 -DMB_H=0 -DMB_BPP=0
+# PIE=1 builds the position-independent kernel that felixbasic.efi embeds.
+ifeq ($(PIE),1)
+ARCHFLAGS := -fpie -mno-red-zone -msse2
+BOOTDEFS := -DEFI
+else
 ARCHFLAGS := -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -msse2
+BOOTDEFS :=
+endif
 # Arrays take memory when they're DIMmed; these size the fixed tables.
 LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=65536 -DCTRL_STACK_MAX=1024 -DMAX_VARNAME=128 -DMAX_DIR_ENTRIES=512
 else ifeq ($(ARCH),i386)
@@ -100,7 +115,7 @@ all: $(KERNEL)
 
 $(BUILD)/boot.o: $(BOOT_S)
 	@mkdir -p $(BUILD)
-	$(CXX) $(MFLAG) $(FBDEFS) $(if $(filter i386,$(ARCH)),-march=i386 -DCPU_386) -c $< -o $@
+	$(CXX) $(MFLAG) $(FBDEFS) $(BOOTDEFS) $(if $(filter i386,$(ARCH)),-march=i386 -DCPU_386) -c $< -o $@
 
 $(BUILD)/setjmp.o: setjmp.S
 	@mkdir -p $(BUILD)
@@ -149,6 +164,65 @@ $(KERNEL): $(OBJS) linker.ld
 else
 $(KERNEL): $(OBJS) linker.ld
 	ld $(LDFLAGS) $(OBJS) $(LIBGCC) -o $@
+endif
+
+# ---------------------------------------------------------------- UEFI
+# felixbasic.efi = a small UEFI loader (gnu-efi, efi/loader.c) with the
+# kernel embedded. gnu-efi's files live in different places on different
+# distros, so find them. x86_64 only.
+EFI_INC  ?= $(firstword $(wildcard /usr/include/efi))
+EFI_CRT0 ?= $(firstword $(shell find /usr/lib /usr/lib64 \( -name 'crt0-efi-x86_64.o' -o -path '*gnuefi*x64*crt0.o' \) 2>/dev/null))
+EFI_LDS  ?= $(firstword $(shell find /usr/lib /usr/lib64 \( -name 'elf_x86_64_efi.lds' -o -name 'elf_x64_efi.lds' \) 2>/dev/null))
+EFI_LIBS ?= $(shell find /usr/lib /usr/lib64 \( -name libgnuefi.a -o -name libefi.a \) 2>/dev/null | sort -u)
+EFI_BUILD := build/efi
+EFI_CFLAGS := -I$(EFI_INC) -I$(EFI_INC)/x86_64 -I$(EFI_BUILD) -fpic -ffreestanding -fno-stack-protector \
+              -fno-stack-check -fshort-wchar -mno-red-zone -maccumulate-outgoing-args -O2 -Wall
+EFI_IMG  := felixbasic.img
+
+efi: felixbasic.efi $(EFI_IMG)
+
+ifeq ($(ARCH),x86_64)
+# The kernel again, position-independent, built in its own directory.
+$(EFI_BUILD)/kernel.elf: FORCE
+	$(MAKE) --no-print-directory ARCH=x86_64 PIE=1 BUILD=$(EFI_BUILD)/k $(EFI_BUILD)/k/kernel-pie.elf
+	cp $(EFI_BUILD)/k/kernel-pie.elf $@
+
+$(BUILD)/kernel-pie.elf: $(OBJS) efi/kernel.ld
+	ld -nostdlib -pie --no-dynamic-linker -z notext -z max-page-size=0x1000 --no-warn-rwx-segments \
+	   -T efi/kernel.ld $(OBJS) $(LIBGCC) -o $@
+
+$(EFI_BUILD)/kernel.bin $(EFI_BUILD)/kernel_layout.h: $(EFI_BUILD)/kernel.elf
+	objcopy -O binary $< $(EFI_BUILD)/kernel.bin
+	@nm $< | awk '/ __kernel_end$$/ {print "#define KERNEL_MEM_SIZE 0x" $$1} \
+	              / efi_entry64$$/  {print "#define KERNEL_ENTRY 0x" $$1} \
+	              / __rela_start$$/ {print "#define KERNEL_RELA_START 0x" $$1} \
+	              / __rela_end$$/   {print "#define KERNEL_RELA_END 0x" $$1}' > $(EFI_BUILD)/kernel_layout.h
+	@test $$(grep -c define $(EFI_BUILD)/kernel_layout.h) = 4 || { echo "kernel layout symbols missing"; exit 1; }
+
+felixbasic.efi: efi/loader.c efi/image.S $(EFI_BUILD)/kernel.bin $(EFI_BUILD)/kernel_layout.h
+	@test -n "$(EFI_CRT0)" -a -n "$(EFI_LDS)" || { echo "gnu-efi not found (Debian: gnu-efi, Fedora: gnu-efi-devel)"; exit 1; }
+	gcc $(EFI_CFLAGS) -c efi/loader.c -o $(EFI_BUILD)/loader.o
+	gcc -c -DKERNEL_BIN='"$(EFI_BUILD)/kernel.bin"' efi/image.S -o $(EFI_BUILD)/image.o
+	ld -nostdlib -znocombreloc -shared -Bsymbolic -T $(EFI_LDS) $(EFI_CRT0) \
+	   $(EFI_BUILD)/loader.o $(EFI_BUILD)/image.o $(EFI_LIBS) $(EFI_LIBS) -o $(EFI_BUILD)/felixbasic.so
+	objcopy -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym -j .rel -j .rela \
+	        -j '.rel.*' -j '.rela.*' -j .reloc -O efi-app-x86_64 --subsystem=10 $(EFI_BUILD)/felixbasic.so $@
+
+# The sample programs on a FAT12 image, which felixbasic.efi loads into
+# the RAM disk (changes last until the machine restarts).
+$(EFI_IMG): $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
+	rm -f $@
+	$(MKFS_FAT) -C -F 12 -f 2 -r 224 -n FELIXBASIC $@ 1440 >/dev/null
+	for f in $(TESTS)/*.bas $(TESTS)/*.BAS; do [ -e "$$f" ] && mcopy -i $@ "$$f" ::/ ; done; true
+
+# Secure Boot: sign with your own key (enrolled in db, or as a MOK for shim).
+sign: felixbasic.efi
+	@test -n "$(KEY)" -a -n "$(CERT)" || { echo "usage: make sign KEY=db.key CERT=db.crt"; exit 1; }
+	sbsign --key $(KEY) --cert $(CERT) --output felixbasic-signed.efi felixbasic.efi
+else
+felixbasic.efi run-efi sign:
+	@echo "UEFI is x86_64 only; build it without ARCH=i386"; exit 1
+.PHONY: felixbasic.efi
 endif
 
 # ---------------------------------------------------------------- images
@@ -211,6 +285,23 @@ run: $(KERNEL)
 run-iso: $(ISO)
 	$(QEMU) -cdrom $(ISO)
 
+ifeq ($(ARCH),x86_64)
+# Boot felixbasic.efi under UEFI firmware (OVMF) from a folder QEMU presents
+# as a FAT disk. OVMF needs its code image plus a writable copy of the
+# matching variable store.
+OVMF ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+          /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/qemu/ovmf-x86_64.bin))
+OVMF_VARS ?= $(firstword $(wildcard $(subst CODE,VARS,$(OVMF))))
+run-efi: felixbasic.efi $(EFI_IMG)
+	@test -n "$(OVMF)" -a -n "$(OVMF_VARS)" || { echo "OVMF firmware not found (Debian: ovmf, Fedora: edk2-ovmf); set OVMF= and OVMF_VARS="; exit 1; }
+	@rm -rf $(BUILD)/esp && mkdir -p $(BUILD)/esp/EFI/BOOT
+	cp felixbasic.efi $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
+	cp $(EFI_IMG) $(BUILD)/esp/EFI/BOOT/
+	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
+	$(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
+	        -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd -drive format=raw,file=fat:rw:$(BUILD)/esp
+endif
+
 run-floppy: $(FLOPPY)
 	$(QEMU) -drive file=$(FLOPPY),if=floppy,format=raw -boot a
 
@@ -221,6 +312,7 @@ floppies:
 
 clean:
 	rm -rf build felixbasic.elf felixbasic.iso felixbasic-floppy.img \
-	       felixbasic-i386.elf felixbasic-i386.iso felixbasic-i386-floppy.img
+	       felixbasic-i386.elf felixbasic-i386.iso felixbasic-i386-floppy.img \
+	       felixbasic.efi felixbasic-signed.efi felixbasic.img
 
-.PHONY: all iso floppy floppies run run-iso run-floppy clean FORCE
+.PHONY: all iso floppy floppies efi sign run run-iso run-floppy run-efi clean FORCE
