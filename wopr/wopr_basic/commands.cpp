@@ -16,6 +16,7 @@
 /* Forward declarations  defined at global scope in basic_gfx_sdl.cpp. */
 bool gfx_sdl_pump(void);
 void gfx_sdl_render(void);
+void gfx_sdl_pace_statement(void);
 #endif
 
 /* gfx_screen_ex lives in global scope (like all gfx_* functions). */
@@ -773,6 +774,7 @@ static void basic_wait(double secs) {
  * present the screen every 16 ms, as the main loop does. */
 void basic_frame_tick(void) {
 #ifdef USE_SDL_WINDOW
+    ::gfx_sdl_pace_statement();
     static Uint32 last = 0;
     Uint32 now = SDL_GetTicks();
     if (now - last >= 16) {
@@ -2926,11 +2928,13 @@ static int cmd_next(Interp *ip, char *args) {
                 if (ahead_ms >= 2) SDL_Delay((Uint32)(ahead_ms - 1));
                 while (SDL_GetPerformanceCounter() < target) {}
             }
+            /* Keep the window responsive. The screen itself is shown by the
+             * interpreter loop every 16 ms: shown from here, it was always
+             * at the same point of whatever loop is running. */
             Uint32 ms = SDL_GetTicks();
-            if (ms - s_for_render >= 16) {                            /* keep the window live */
+            if (ms - s_for_render >= 16) {
                 s_for_render = ms;
                 ::gfx_sdl_pump();
-                if (!basic_paced()) ::gfx_sdl_render();
             }
         }
     }

@@ -178,6 +178,8 @@ static void run_lines(int start_pc, int fresh) {
         int old_pc = ip.pc;
         g_current_pc = old_pc;
         int jumped = dispatch(&ip, g_lines[ip.pc].text);
+        // (NEXT is paced by the FOR loop's own clock)
+        if (strncasecmp(g_lines[old_pc].text, "NEXT", 4) != 0) gfx_sdl_pace_statement();
 
         // Render only every 16ms (~60 FPS), not every statement
         Uint32 now = SDL_GetTicks();

@@ -55,6 +55,9 @@ bool gfx_sdl_pump(void);
  */
 void gfx_sdl_render(void);
 
+/* Called after each statement: paces a program that is polling INKEY$. */
+void gfx_sdl_pace_statement(void);
+
 /*
  * gfx_sdl_mark_dirty — force a re-render on the next gfx_sdl_render() call.
  * Useful after palette changes that don't touch the pixel buffer directly.

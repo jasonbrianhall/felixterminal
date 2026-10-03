@@ -1549,20 +1549,50 @@ int display_get_width(void) {
 }
 
 // Non-blocking key poll (INKEY$)
-int display_inkey(void) {
-    static Uint32 s_last_inkey_render = 0;
-    Uint32 now = SDL_GetTicks();
-    
-    // Only render every ~16ms (60 FPS) during INKEY polling
-    if (now - s_last_inkey_render >= 16) {
-        gfx_sdl_pump();
-        if (!BASIC_NS::basic_paced()) gfx_sdl_render();
-        s_last_inkey_render = now;
+BASIC_NS_END
+
+// While a program polls the keyboard (WHILE INKEY$ = "" ...), it runs at
+// about the speed QBasic did on a 386, a statement every ~20 us, rather
+// than flat out and then asleep inside INKEY$. Flat out, a loop that
+// animates while it waits (Nibbles' sparkling border) got through a whole
+// cycle between frames and was always shown at the same point in it, so
+// nothing seemed to move; and the frames were all drawn from inside INKEY$,
+// at the same place in the loop each time.
+static Uint32 s_poll_ms = 0;            // when INKEY$ last found no key
+#define POLL_STATEMENT_US 20
+
+void gfx_sdl_pace_statement(void) {
+    static int    n = 0;
+    static Uint64 t0 = 0, count = 0;
+    if (!s_poll_ms || SDL_GetTicks() - s_poll_ms > 100) { t0 = 0; return; }   // not polling
+    if (++n < 32) return;
+    n = 0;
+    Uint64 hz  = SDL_GetPerformanceFrequency();
+    Uint64 now = SDL_GetPerformanceCounter();
+    count += 32;
+    Uint64 target = t0 + count * POLL_STATEMENT_US * hz / 1000000;
+    if (t0 == 0 || now > target + hz / 50) {        // > 20 ms behind: start afresh, don't catch up
+        t0 = now; count = 0;
+    } else if (target > now) {
+        Uint64 ahead_ms = (target - now) * 1000 / hz;
+        if (ahead_ms >= 2) SDL_Delay((Uint32)(ahead_ms - 1));
+        while (SDL_GetPerformanceCounter() < target) {}
     }
-    
+}
+BASIC_NS_BEGIN
+
+// Non-blocking key poll (INKEY$). The screen is presented by the
+// interpreter's loop every 16 ms, not here.
+int display_inkey(void) {
+    static Uint32 s_last_pump = 0;
+    Uint32 now = SDL_GetTicks();
+    if (now - s_last_pump >= 8) {
+        gfx_sdl_pump();
+        s_last_pump = now;
+    }
     int c = key_pop();
     if (c < 0) {
-        SDL_Delay(5);   // yield to OS
+        s_poll_ms = now ? now : 1;
         return 0;
     }
     return c;
