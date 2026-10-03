@@ -182,6 +182,8 @@ static int  s_mpx, s_mpy;                 // pointer, screen pixels
 static bool s_mplaced;                    // put in the middle of the picture yet
 static int  s_mbuttons;
 static bool s_mouse_seen;                 // a mouse has reported
+static Uint32 s_mouse_used;               // when it last moved, clicked or scrolled
+#define POINTER_IDLE_MS 3000              // the pointer hides after this long untouched
 static bool s_pointer_drawn;               // the last render drew the pointer
 static std::string s_clip;                // what Ctrl+C copied
 
@@ -200,10 +202,12 @@ static void mouse_backend_warp(int fx, int fy) {
 }
 static void mouse_backend_cursor() { s_needs_render = true; }
 
-// Show the pointer? Once a mouse has reported, always, unless a program
-// using the mouse has hidden it (INT 33h function 2, _MOUSEHIDE).
+// Show the pointer? While the mouse is in use: it hides when it hasn't
+// moved for a few seconds (not while a button is held), and when a
+// program using the mouse has hidden it (INT 33h function 2, _MOUSEHIDE).
 static bool pointer_visible() {
-    return s_mouse_seen && mouse_cursor_wanted();
+    if (!s_mouse_seen || !mouse_cursor_wanted()) return false;
+    return s_mbuttons || SDL_GetTicks() - s_mouse_used < POINTER_IDLE_MS;
 }
 
 static void scroll_lines(int n) {
@@ -219,6 +223,7 @@ void gfx_bm_mouse(int dx, int dy, int buttons, int wheel) {
     mouse_place();
     if (dx || dy || buttons != s_mbuttons || wheel) {
         s_mouse_seen = true;
+        s_mouse_used = SDL_GetTicks();
         s_needs_render = true;
     }
     int pressed = buttons & ~s_mbuttons, released = s_mbuttons & ~buttons;
