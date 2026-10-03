@@ -290,6 +290,8 @@ extern volatile uint32_t ticks, fine_ticks;
 extern volatile uint8_t kbd_buf[256];
 extern volatile uint8_t kbd_head, kbd_tail;
 #define TICK_HZ 60
+#define PIT_HZ  1193182u
+#define PIT_DIV (PIT_HZ / (TICK_HZ * 4))
 
 static void interrupts_init() {
     for (int i = 0; i < 32; i++) set_gate(i, isr_fault);
@@ -306,8 +308,9 @@ static void interrupts_init() {
     outb(0x21, 1);    outb(0xA1, 1);
     outb(0x21, 0xFC); outb(0xA1, 0xFF);
 
-    uint16_t div = 1193182 / (TICK_HZ * 4);            // see irq.cpp: 240 Hz, ticks at 60
-    outb(0x43, 0x36); outb(0x40, div & 0xFF); outb(0x40, div >> 8);
+    // Mode 2 (rate generator): the count runs down once per interrupt, so
+    // platform_us() can read how far into the tick we are.
+    outb(0x43, 0x34); outb(0x40, PIT_DIV & 0xFF); outb(0x40, PIT_DIV >> 8);   // see irq.cpp: 240 Hz, ticks at 60
 
     for (int i = 0; i < 64 && (inb(0x64) & 1); i++) inb(0x60);
     __asm__ volatile("sti");
@@ -418,6 +421,29 @@ void platform_poll_input() {
 // ---------------------------------------------------------------- time
 // The PIT runs at 240 Hz (irq.cpp), which also drives the note player.
 uint32_t platform_ms() { return (uint32_t)((uint64_t)fine_ticks * 1000 / (TICK_HZ * 4)); }
+
+// Microseconds since boot: the ticks so far plus how far the PIT has
+// counted into the current one. TIMER needs this -- at 4 ms a tick, a
+// program that times a short loop (Nibbles does, to set its speed) would
+// see no time pass and divide by zero.
+uint64_t platform_us() {
+    static uint64_t last;
+    uintptr_t fl;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(fl) :: "memory");
+    uint32_t t = fine_ticks;
+    outb(0x43, 0x00);                                  // latch channel 0's count
+    uint8_t lo = inb(0x40), hi = inb(0x40);
+    outb(0x20, 0x0A);                                  // read the PIC's request register:
+    bool pending = inb(0x20) & 1;                      // a tick not yet counted?
+    __asm__ volatile("push %0; popf" :: "r"(fl) : "memory", "cc");
+    uint32_t cnt = (uint32_t)lo | ((uint32_t)hi << 8);
+    uint32_t into = cnt <= PIT_DIV ? PIT_DIV - cnt : 0;
+    if (pending && into < PIT_DIV / 2) t++;            // the count wrapped before we read it
+    uint64_t us = (uint64_t)t * 1000000u / (TICK_HZ * 4) + (uint64_t)into * 1000000u / PIT_HZ;
+    if (us < last) us = last;                          // never run backwards
+    last = us;
+    return us;
+}
 
 // Waiting: keep the keyboard drained and let the CPU sleep between ticks.
 static void wait_ms(uint32_t ms, bool render) {

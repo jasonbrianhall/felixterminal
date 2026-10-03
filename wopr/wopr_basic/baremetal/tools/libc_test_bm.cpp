@@ -19,6 +19,7 @@ void console_write(const char*, size_t) {}
 int console_getchar() { return 0; }
 void platform_sleep_ms(uint32_t) {}
 uint32_t platform_ms() { return 0; }
+uint64_t platform_us() { return 0; }
 bool storage_resolve(const char*, char*, size_t) { return false; }
 bool storage_ready() { return false; }
 bool storage_write_protected() { return false; }

@@ -35,6 +35,7 @@ void console_write(const char* s, size_t n);     // kernel.cpp
 int console_getchar();                            // kernel.cpp: blocking key
 void platform_sleep_ms(uint32_t ms);              // kernel.cpp
 uint32_t platform_ms();                           // kernel.cpp: ms since boot
+uint64_t platform_us();                           // kernel.cpp: microseconds since boot
 
 extern "C" {
 
@@ -865,7 +866,8 @@ static long cmos_seconds() {
 }
 static long boot_seconds = -1;
 static uint32_t boot_ms;
-static void time_sync() { if (boot_seconds < 0) { boot_seconds = cmos_seconds(); boot_ms = platform_ms(); } }
+static uint64_t boot_us;
+static void time_sync() { if (boot_seconds < 0) { boot_seconds = cmos_seconds(); boot_ms = platform_ms(); boot_us = platform_us(); } }
 time_t time(time_t* t) {
     time_sync();
     time_t now = boot_seconds + (platform_ms() - boot_ms) / 1000;
@@ -874,9 +876,9 @@ time_t time(time_t* t) {
 }
 int clock_gettime(clockid_t clk, struct timespec* ts) {
     time_sync();
-    uint32_t ms = platform_ms() - (clk == CLOCK_REALTIME ? boot_ms : 0);
-    ts->tv_sec = (clk == CLOCK_REALTIME ? boot_seconds : 0) + ms / 1000;
-    ts->tv_nsec = (long)(ms % 1000) * 1000000L;
+    uint64_t us = platform_us() - (clk == CLOCK_REALTIME ? boot_us : 0);
+    ts->tv_sec = (clk == CLOCK_REALTIME ? boot_seconds : 0) + (time_t)(us / 1000000u);
+    ts->tv_nsec = (long)(us % 1000000u) * 1000L;
     return 0;
 }
 int gettimeofday(struct timeval* tv, void*) {
