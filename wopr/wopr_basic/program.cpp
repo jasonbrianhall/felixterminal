@@ -507,6 +507,20 @@ void load(char *filename) {
                     }
                     continue;  /* don't store the label line as a statement */
                 }
+                /* "label: statement" (e.g. "normal: DATA 14, 13"): register
+                 * the label for the statement that follows it -- unless the
+                 * word is a keyword, as in "CLS: PRINT". */
+                int is_kw = 0;
+                for (int k = 0; commands[k].keyword; k++)
+                    if (strcasecmp(commands[k].keyword, lname) == 0) { is_kw = 1; break; }
+                if (!is_kw && pending_count < 8 &&
+                    (pending_count + 1) * MAX_VARNAME <= (int)sizeof(pending_buf)) {
+                    strncpy(pending_buf + pending_count * MAX_VARNAME,
+                            lname, MAX_VARNAME - 1);
+                    pending_buf[(pending_count + 1) * MAX_VARNAME - 1] = '\0';
+                    pending_count++;
+                    p = after_colon;
+                }
             }
         }
 
