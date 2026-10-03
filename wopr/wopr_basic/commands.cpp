@@ -2900,27 +2900,38 @@ static int cmd_next(Interp *ip, char *args) {
     if (done) { mpf_clear(f->limit); mpf_clear(f->step); g_ctrl_top = fi; return 0; }
 
 #ifdef USE_SDL_WINDOW
-    /* Pace FOR loops to ~1 million iterations/second (4MHz PC equivalent).
-     * Check wall clock every 1000 iterations and sleep if running ahead. */
+    /* Pace FOR loops at about a million iterations a second, so delay loops
+     * (FOR a = 1 TO n: NEXT) take as long as a program expects -- and as
+     * long as when it timed one to calibrate, as Nibbles does. The clock is
+     * checked every 100 iterations and the loop waits until it's on
+     * schedule. Falling behind (the program did other things between
+     * loops) is forgotten, not banked: banked time let loops run flat out
+     * until it was used up, so games started fast and then slowed down. */
     {
-        static int    s_for_count = 0;
-        static Uint32 s_for_t0    = 0;
-        static long   s_for_total = 0;
-        if (++s_for_count >= 1000) {
+        static int    s_for_count  = 0;
+        static Uint64 s_for_t0     = 0;    /* when this run of iterations began, in ticks */
+        static Uint64 s_for_total  = 0;    /* iterations since then */
+        static Uint32 s_for_render = 0;
+        if (++s_for_count >= 100) {
             s_for_count = 0;
-            s_for_total += 1000;
-            if (s_for_t0 == 0 || s_for_total > 60000000L) {
-                /* First call or reset every ~60 seconds to prevent overflow/drift */
-                s_for_t0    = SDL_GetTicks();
-                s_for_total = 1000;
+            Uint64 hz  = SDL_GetPerformanceFrequency();
+            Uint64 now = SDL_GetPerformanceCounter();
+            s_for_total += 100;
+            Uint64 target = s_for_t0 + s_for_total * hz / 1000000;   /* 1 us per iteration */
+            if (s_for_t0 == 0 || now > target + hz / 50) {           /* > 20 ms behind: start afresh */
+                s_for_t0 = now;
+                s_for_total = 0;
+            } else if (target > now) {
+                Uint64 ahead_ms = (target - now) * 1000 / hz;
+                if (ahead_ms >= 2) SDL_Delay((Uint32)(ahead_ms - 1));
+                while (SDL_GetPerformanceCounter() < target) {}
             }
-            ::gfx_sdl_pump();
-            if (!basic_paced()) ::gfx_sdl_render();
-            /* At 1M iters/sec, 1000 iters should take 1ms */
-            Uint32 target_ms = (Uint32)(s_for_total / 1000);
-            Uint32 elapsed   = SDL_GetTicks() - s_for_t0;
-            if (target_ms > elapsed + 1)
-                SDL_Delay(target_ms - elapsed - 1);
+            Uint32 ms = SDL_GetTicks();
+            if (ms - s_for_render >= 16) {                            /* keep the window live */
+                s_for_render = ms;
+                ::gfx_sdl_pump();
+                if (!basic_paced()) ::gfx_sdl_render();
+            }
         }
     }
 #endif
