@@ -86,6 +86,43 @@ int var_is_str_name(char *name) {
     return name[strlen(name) - 1] == '$';
 }
 
+/* INKEY$'s string for key code ch: "" for none, one character, or for the
+ * arrows (0x1000-0x1003 from the display layer) CHR$(0) + scan code. */
+int inkey_to_str(int ch, char *buf) {
+    static const char arrows[4] = { 'H', 'P', 'K', 'M' };   /* up down left right */
+    if (ch >= 0x1000 && ch <= 0x1003) {
+        buf[0] = BASIC_NUL_CH; buf[1] = arrows[ch - 0x1000]; buf[2] = '\0';
+        return 2;
+    }
+    if (ch <= 0 || ch > 255) { buf[0] = '\0'; return 0; }
+    buf[0] = (char)ch; buf[1] = '\0';
+    return 1;
+}
+
+/* ---------------------------------------------------------------- integers */
+unsigned char g_defint[26];
+
+/* Is a plain variable of this name an integer: A% / A&, or no suffix and a
+ * first letter DEFINT / DEFLNG covers. */
+int var_name_is_int(const char *name) {
+    size_t n = strlen(name);
+    if (!n) return 0;
+    char last = name[n - 1];
+    if (last == '%' || last == '&') return 1;
+    if (last == '$' || last == '!' || last == '#') return 0;
+    int c = toupper((unsigned char)name[0]);
+    return c >= 'A' && c <= 'Z' && g_defint[c - 'A'];
+}
+
+/* Storing into an INTEGER or LONG rounds to the nearest whole number, an
+ * exact half to the even one (CINT's rule). */
+void var_fix_int(Var *v, mpf_t x) {
+    if (!v || !v->is_int) return;
+    double d = mpf_get_d(x), f = floor(d), r = d - f;
+    if (r > 0.5 || (r == 0.5 && fmod(f, 2.0) != 0)) f += 1;
+    mpf_set_d(x, f);
+}
+
 /* ---------------------------------------------------------------- scopes */
 int g_scope  = 0;
 int g_locals = 0;
@@ -151,6 +188,7 @@ static void shared_scan_list(const char *p) {
 }
 
 void scope_program_start(void) {
+    memset(g_defint, 0, sizeof g_defint);
     for (int i = 0; i < g_nshared; i++) free(g_shared[i]);
     g_nshared = 0;
     g_scope = 0;
@@ -246,6 +284,7 @@ static Var *var_create_in(char *name, int sc) {
         v->str  = str_dup("");
     } else {
         v->kind = VAR_NUM;
+        v->is_int = var_name_is_int(name);
         mpf_init2(v->num, g_prec);
         mpf_set_ui(v->num, 0);
     }

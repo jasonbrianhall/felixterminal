@@ -262,9 +262,7 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
 
     /* INKEY$ */
     if (kw_match(p, "INKEY$")) {
-        int ch = display_inkey();
-        buf[0] = ch ? (char)ch : '\0';
-        buf[1] = '\0';
+        inkey_to_str(display_inkey(), buf);
         return p + 6;
     }
 
@@ -311,7 +309,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         if (*p == '(') p++;
         mpf_t n; mpf_init2(n, g_prec);
         p = eval_expr(sk(p), n);
-        buf[0] = (char)mpf_get_si(n); buf[1] = '\0';
+        long cc = mpf_get_si(n);
+        buf[0] = cc == 0 ? BASIC_NUL_CH : (char)cc; buf[1] = '\0';
         mpf_clear(n);
         if (*sk(p) == ')') p = sk(p) + 1;
         return p;
@@ -603,9 +602,7 @@ int is_str_token(char *p) {
 char *eval_str_or_inkey(char *p, char *buf, int bufsz) {
     p = sk(p);
     if (kw_match(p, "INKEY$")) {
-        int ch = display_inkey();
-        buf[0] = ch ? (char)ch : '\0';
-        buf[1] = '\0';
+        inkey_to_str(display_inkey(), buf);
         return p + 6;
     }
     return eval_str_expr(p, buf, bufsz);
@@ -1174,7 +1171,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         ps->p += 3; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
         char sbuf[DEFAULT_BUFFER];
         ps->p = eval_str_expr(ps->p, sbuf, sizeof sbuf);
-        mpf_set_si(result, (unsigned char)sbuf[0]);
+        mpf_set_si(result, sbuf[0] == BASIC_NUL_CH ? 0 : (unsigned char)sbuf[0]);
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
     }

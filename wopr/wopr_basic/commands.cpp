@@ -95,22 +95,149 @@ static void basic_stacktrace(const char *reason) {
     }
 }
 
-static void print_using(char *fmt, double val) {
-    int before = 0, after = 0, has_dot = 0, has_dollar = 0, has_plus = 0;
-    for (char *f = fmt; *f; f++) {
-        if      (*f == '$') has_dollar = 1;
-        else if (*f == '+') has_plus   = 1;
-        else if (*f == '.') has_dot    = 1;
-        else if (*f == '#') { if (has_dot) after++; else before++; }
+/* ================================================================
+ * PRINT USING -- QBasic's format fields:
+ *   numbers  # digit, . point, , thousands (left of the point),
+ *            leading + or trailing + / - for the sign, $$ ** **$ fills,
+ *            ^^^^ exponent
+ *   strings  ! first character, & all of it, \  \ that many characters
+ *   _x       a literal x; anything else is printed as it stands
+ * ================================================================ */
+static int using_is_num_start(const char *f) {
+    if (*f == '#') return 1;
+    if (*f == '.' && f[1] == '#') return 1;
+    if (*f == '+' && (f[1] == '#' || (f[1] == '.' && f[2] == '#') ||
+                      (f[1] == '$' && f[2] == '$') || (f[1] == '*' && f[2] == '*'))) return 1;
+    if (*f == '$' && f[1] == '$') return 1;
+    if (*f == '*' && f[1] == '*') return 1;
+    return 0;
+}
+static int using_is_str_start(const char *f) {
+    if (*f == '!' || *f == '&') return 1;
+    if (*f == '\\') {
+        for (const char *q = f + 1; *q; q++) { if (*q == '\\') return 1; if (*q != ' ') return 0; }
     }
-    char numbuf[64];
-    if (has_dot)
-        snprintf(numbuf, sizeof numbuf, "%*.*f", before + after + 1, after, val);
-    else
-        snprintf(numbuf, sizeof numbuf, "%*d", before, (int)val);
-    if (has_plus && val >= 0) display_putchar('+');
-    if (has_dollar)           display_putchar('$');
-    display_print(numbuf);
+    return 0;
+}
+
+/* Format one number by the numeric field at f; returns the field's length. */
+static int using_number(const char *f, double val, char *out, int outsz) {
+    const char *q = f;
+    int lead_plus = 0, trail_plus = 0, trail_minus = 0, dollar = 0, stars = 0;
+    int before = 0, after = 0, dot = 0, commas = 0, expo = 0;
+    if (*q == '+') { lead_plus = 1; q++; }
+    if (q[0] == '*' && q[1] == '*') { stars = 1; before += 2; q += 2; if (*q == '$') { dollar = 1; q++; } }
+    else if (q[0] == '$' && q[1] == '$') { dollar = 1; before += 1; q += 2; }
+    for (;;) {
+        if (*q == '#') { if (dot) after++; else before++; q++; }
+        else if (*q == ',' && !dot) { commas = 1; before++; q++; }
+        else if (*q == '.' && !dot) { dot = 1; q++; }
+        else break;
+    }
+    if (q[0] == '^' && q[1] == '^' && q[2] == '^' && q[3] == '^') { expo = 1; q += 4; if (*q == '^') q++; }
+    if (!lead_plus) {
+        if (*q == '+') { trail_plus = 1; q++; }
+        else if (*q == '-') { trail_minus = 1; q++; }
+    }
+    int neg = val < 0;
+    double a = neg ? -val : val;
+    char digits[400];
+    if (expo) {
+        int e = 0;
+        if (a != 0) { e = (int)floor(log10(a)) - (before - 1); a /= pow(10.0, e); }
+        if (before < 1) { before = 1; }
+        snprintf(digits, sizeof digits, "%.*fE%+03d", after, a, e);
+    } else {
+        snprintf(digits, sizeof digits, "%.*f", after, a);
+        if (commas) {   /* group the integer part */
+            char *pt = strchr(digits, '.');
+            int ilen = pt ? (int)(pt - digits) : (int)strlen(digits);
+            char g[400]; int gi = 0;
+            for (int k = 0; k < ilen; k++) {
+                g[gi++] = digits[k];
+                int left = ilen - 1 - k;
+                if (left > 0 && left % 3 == 0) g[gi++] = ',';
+            }
+            snprintf(g + gi, sizeof g - gi, "%s", pt ? pt : "");
+            strcpy(digits, g);
+        }
+        /* QBasic drops a lone leading 0 before the point when there's no
+         * room for it: .## shows .50 */
+        if (dot && before == 0 && digits[0] == '0' && digits[1] == '.') memmove(digits, digits + 1, strlen(digits));
+    }
+    char body[440];
+    const char *sign = "";
+    if (lead_plus) sign = neg ? "-" : "+";
+    else if (neg && !trail_minus && !trail_plus) sign = "-";
+    snprintf(body, sizeof body, "%s%s%s", sign, dollar ? "$" : "", digits);
+    int width = before + (dot ? 1 + after : 0) + (lead_plus ? 1 : 0) + (dollar && stars ? 1 : 0) + (expo ? 4 : 0);
+    int blen = (int)strlen(body);
+    int o = 0;
+    if (blen > width && o < outsz - 1) out[o++] = '%';       /* doesn't fit */
+    for (int k = blen; k < width && o < outsz - 1; k++) out[o++] = stars ? '*' : ' ';
+    for (int k = 0; k < blen && o < outsz - 1; k++) out[o++] = body[k];
+    if (trail_plus && o < outsz - 1) out[o++] = neg ? '-' : '+';
+    if (trail_minus && o < outsz - 1) out[o++] = neg ? '-' : ' ';
+    out[o] = '\0';
+    return (int)(q - f);
+}
+
+/* PRINT USING fmt$; values -- the fields take the values in turn, the
+ * format starting over if there are more values than fields. */
+static char *print_using_list(char *fmt, char *p) {
+    char out[2048]; int o = 0;
+    int pos = 0, used_field = 0, flen = (int)strlen(fmt);
+    int trailing = 0;
+    #define EMIT(c) do { if (o < (int)sizeof out - 1) out[o++] = (c); } while (0)
+    for (;;) {
+        /* copy literals up to the next field (or the end of the format) */
+        while (pos < flen && !using_is_num_start(fmt + pos) && !using_is_str_start(fmt + pos)) {
+            if (fmt[pos] == '_' && pos + 1 < flen) { EMIT(fmt[pos + 1]); pos += 2; }
+            else EMIT(fmt[pos++]);
+        }
+        if (pos >= flen) {
+            if (!used_field || !*p || trailing == 0) break;   /* no field at all, or no more values */
+            pos = 0; continue;                                 /* reuse the format */
+        }
+        if (!*p || *p == ':' || *p == '\'') break;             /* out of values: stop at the field */
+        used_field = 1;
+        const char *f = fmt + pos;
+        if (using_is_str_start(f)) {
+            char sbuf[1024];
+            p = sk(eval_str_expr(p, sbuf, sizeof sbuf));
+            int n = (*f == '!') ? 1 : (*f == '&') ? -1 : 0;
+            int w = 1;
+            if (*f == '\\') { const char *q = f + 1; while (*q != '\\') q++; n = (int)(q - f) + 1; w = n; }
+            if (n < 0) { for (char *c = sbuf; *c; c++) EMIT(*c); }
+            else {
+                int sl = (int)strlen(sbuf);
+                for (int k = 0; k < n; k++) EMIT(k < sl ? sbuf[k] : ' ');
+            }
+            pos += (*f == '\\') ? w : 1;
+        } else {
+            mpf_t val; mpf_init2(val, g_prec);
+            p = sk(eval_expr(p, val));
+            char nb[512];
+            pos += using_number(f, mpf_get_d(val), nb, sizeof nb);
+            mpf_clear(val);
+            for (char *c = nb; *c; c++) EMIT(*c);
+        }
+        if (*p == ';' || *p == ',') { p = sk(p + 1); trailing = 1; }
+        else trailing = 0;
+        if (!*p || *p == ':' || *p == '\'') {
+            /* values done: print the literals up to the next field */
+            while (pos < flen && !using_is_num_start(fmt + pos) && !using_is_str_start(fmt + pos)) {
+                if (fmt[pos] == '_' && pos + 1 < flen) { EMIT(fmt[pos + 1]); pos += 2; }
+                else EMIT(fmt[pos++]);
+            }
+            break;
+        }
+    }
+    #undef EMIT
+    out[o] = '\0';
+    display_print(out);
+    if (!trailing) display_newline();
+    return p;
 }
 
 /* ================================================================
@@ -728,15 +855,19 @@ static int cmd_cls(Interp *ip, char *args) {
 static int cmd_width(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
-    mpf_t n; mpf_init2(n, g_prec);
-    p = sk(eval_expr(p, n));
-    int cols = (int)mpf_get_si(n);
-    mpf_clear(n);
-    /* skip optional second argument (rows) */
+    int cols = display_get_width();
+    if (*p != ',') {
+        mpf_t n; mpf_init2(n, g_prec);
+        p = sk(eval_expr(p, n));
+        cols = (int)mpf_get_si(n);
+        mpf_clear(n);
+    }
+    /* optional second argument: rows */
     if (*p == ',') {
         p = sk(p + 1);
         mpf_t r; mpf_init2(r, g_prec);
         eval_expr(p, r);
+        display_text_rows((int)mpf_get_si(r));
         mpf_clear(r);
     }
     display_width(cols);
@@ -746,13 +877,16 @@ static int cmd_width(Interp *ip, char *args) {
 static int cmd_color(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
+    /* COLOR fg / COLOR , bg: what's left out stays as it was */
+    static int cur_fg = 7, cur_bg = 0;
     mpf_t fg, bg; mpf_init2(fg, g_prec); mpf_init2(bg, g_prec);
-    mpf_set_ui(fg, 7); mpf_set_ui(bg, 0);
+    mpf_set_si(fg, cur_fg); mpf_set_si(bg, cur_bg);
     if (!*p) { mpf_clears(fg, bg, NULL); return 0; } /* bare COLOR  no-op */
     if (*p != ',') p = eval_expr(p, fg);
     p = sk(p);
     if (*p == ',') { p = sk(p + 1); if (*p) p = eval_expr(p, bg); }
-    display_color((int)mpf_get_si(fg), (int)mpf_get_si(bg));
+    cur_fg = (int)mpf_get_si(fg); cur_bg = (int)mpf_get_si(bg);
+    display_color(cur_fg, cur_bg);
     mpf_clears(fg, bg, NULL);
     return 0;
 }
@@ -1770,7 +1904,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
             if (v->kind == VAR_STR) free(v->str);
             v->kind = VAR_STR; v->str = a->str; a->str = NULL;
         } else {
-            if (v->kind == VAR_NUM) mpf_set(v->num, a->num);
+            if (v->kind == VAR_NUM) { mpf_set(v->num, a->num); var_fix_int(v, v->num); }
             mpf_clear(a->num);
         }
     }
@@ -1902,6 +2036,9 @@ static int cmd_dim(Interp *ip, char *args) {
             if (*p == '*') { p = sk(p + 1); while (isdigit((unsigned char)*p)) p++; }
             p = sk(p);
 
+            if (strcmp(type_name, "INTEGER") == 0 || strcmp(type_name, "LONG") == 0) v->is_int = 1;
+            else if (strcmp(type_name, "SINGLE") == 0 || strcmp(type_name, "DOUBLE") == 0) v->is_int = 0;
+
             /* If it's a user-defined TYPE, create flat field variables */
             TypeDef *td = typedef_find(type_name);
             if (td) {
@@ -1914,6 +2051,7 @@ static int cmd_dim(Interp *ip, char *args) {
                              td->fields[fi].name, td->fields[fi].is_str ? "$" : "");
                     Var *fv = var_find(flatname);
                     if (!fv) fv = var_create(flatname);
+                    fv->is_int = td->fields[fi].is_int;
                     if (!is_arr) continue;
                     /* An array of records: one array per field, shaped like
                      * the base array (see field_array). */
@@ -1962,6 +2100,7 @@ static int cmd_let(Interp *ip, char *args) {
                 if (fa) {
                     mpf_t val; mpf_init2(val, g_prec);
                     eval_expr(after, val);
+                    var_fix_int(fa, val);
                     mpf_set(*arr_num_elem(fa, fr.i, fr.j), val);
                     mpf_clear(val);
                     return 0;
@@ -1982,6 +2121,7 @@ static int cmd_let(Interp *ip, char *args) {
                     eval_expr(after, val);
                     Var *v = var_get(flatname);
                     mpf_set(v->num, val);
+                    var_fix_int(v, v->num);
                     mpf_clear(val);
                 }
                 return 0;
@@ -2014,8 +2154,8 @@ static int cmd_let(Interp *ip, char *args) {
     } else {
         mpf_t val; mpf_init2(val, g_prec);
         eval_expr(sk(p), val);
-        if (is_arr) { Var *v = var_get(name); mpf_set(*arr_num_elem(v, arr_i, arr_j), val); }
-        else        { Var *v = var_get(name); mpf_set(v->num, val); }
+        if (is_arr) { Var *v = var_get(name); var_fix_int(v, val); mpf_set(*arr_num_elem(v, arr_i, arr_j), val); }
+        else        { Var *v = var_get(name); mpf_set(v->num, val); var_fix_int(v, v->num); }
         mpf_clear(val);
     }
     return 0;
@@ -2033,25 +2173,10 @@ static int cmd_print(Interp *ip, char *args) {
 
     if (kw_match(p, "USING")) {
         p = sk(p + 5);
-        char fmt[128]; int fi = 0;
-        if (*p == '"') {
-            p++;
-            while (*p && *p != '"' && fi < (int)sizeof(fmt) - 1) fmt[fi++] = *p++;
-            if (*p == '"') p++;
-        }
-        fmt[fi] = '\0';
-        p = sk(p); if (*p == ';') p = sk(p + 1);
-        int trailing = 0;
-        while (*p) {
-            mpf_t val; mpf_init2(val, g_prec);
-            p = sk(eval_expr(p, val));
-            print_using(fmt, mpf_get_d(val));
-            mpf_clear(val);
-            if (*p == ';') { p = sk(p + 1); trailing = 1; }
-            else           { trailing = 0; break; }
-        }
-
-        if (!trailing) display_newline();
+        char fmt[1024];
+        p = sk(eval_str_expr(p, fmt, sizeof fmt));   /* a literal or any string expression */
+        if (*p == ';' || *p == ',') p = sk(p + 1);
+        print_using_list(fmt, p);
         return 0;
     }
 
@@ -2236,7 +2361,7 @@ static int cmd_input(Interp *ip, char *args) {
         while (v_end > v_start && isspace((unsigned char)v_end[-1])) *--v_end = '\0';
         Var *v = var_get(name);
         if (var_is_str_name(name)) { free(v->str); v->str = str_dup(v_start); }
-        else                       { mpf_set_d(v->num, atof(v_start)); }
+        else                       { mpf_set_d(v->num, atof(v_start)); var_fix_int(v, v->num); }
         p = sk(p); if (*p == ',') p = sk(p + 1); else break;
     }
     return 0;
@@ -2317,7 +2442,7 @@ static int cmd_input_file(Interp *ip, char *args) {
         if (*val == '"') { val++; char *q = strchr(val, '"'); if (q) *q = '\0'; }
         Var *v = var_get(name);
         if (var_is_str_name(name)) { free(v->str); v->str = str_dup(val); }
-        else                       { mpf_set_d(v->num, atof(val)); }
+        else                       { mpf_set_d(v->num, atof(val)); var_fix_int(v, v->num); }
         p = sk(p); if (*p == ',') p = sk(p + 1); else break;
     }
     return 0;
@@ -2743,7 +2868,7 @@ static int cmd_for(Interp *ip, char *args) {
     if (strncasecmp(p, "TO", 2) == 0) p = sk(p + 2);
     p = sk(eval_expr(p, limit));
     if (strncasecmp(p, "STEP", 4) == 0) { p = sk(p + 4); eval_expr(p, step); }
-    Var *v = var_get(vname); mpf_set(v->num, start);
+    Var *v = var_get(vname); mpf_set(v->num, start); var_fix_int(v, v->num);
 
     if (g_ctrl_top >= CTRL_STACK_MAX) { basic_stacktrace("Stack overflow"); return -1; }
     CtrlFrame *f = &g_ctrl[g_ctrl_top++];
@@ -3152,8 +3277,8 @@ static int cmd_read(Interp *ip, char *args) {
                 free(*slot); *slot = str_dup(item);
             } else { free(v->str); v->str = str_dup(item); }
         } else {
-            if (is_arr) mpf_set_d(*arr_num_elem(v, arr_i, arr_j), atof(item));
-            else        mpf_set_d(v->num, atof(item));
+            if (is_arr) { mpf_t *e = arr_num_elem(v, arr_i, arr_j); mpf_set_d(*e, atof(item)); var_fix_int(v, *e); }
+            else        { mpf_set_d(v->num, atof(item)); var_fix_int(v, v->num); }
         }
         p = sk(p); if (*p == ',') p = sk(p + 1); else break;
     }
@@ -3224,7 +3349,26 @@ static int cmd_on(Interp *ip, char *args) {
 /* ================================================================
  * DEFINT / DEFSNG / DEFDBL / DEFSTR stubs
  * ================================================================ */
-static int cmd_defint(Interp *ip, char *args) { (void)ip;(void)args; return 0; }
+/* DEFINT A-Z, B: mark (or unmark) the letters' default type as integer. */
+static int def_letters(char *args, int is_int) {
+    char *p = sk(args);
+    while (isalpha((unsigned char)*p)) {
+        int a = toupper((unsigned char)*p) - 'A', b = a;
+        p = sk(p + 1);
+        if (*p == '-') {
+            p = sk(p + 1);
+            if (isalpha((unsigned char)*p)) { b = toupper((unsigned char)*p) - 'A'; p = sk(p + 1); }
+        }
+        if (a > b) { int t = a; a = b; b = t; }
+        for (int i = a; i <= b; i++) g_defint[i] = (unsigned char)is_int;
+        if (*p != ',') break;
+        p = sk(p + 1);
+    }
+    return 0;
+}
+static int cmd_defint(Interp *ip, char *args) { (void)ip; return def_letters(args, 1); }
+static int cmd_defsng(Interp *ip, char *args) { (void)ip; return def_letters(args, 0); }
+static int cmd_defstr(Interp *ip, char *args) { (void)ip; (void)args; return 0; }  /* names keep their $ */
 
 /* ================================================================
  * Command registration table
@@ -3312,8 +3456,10 @@ const Command commands[] = {
     { "DEF",        cmd_def        },
     { "DEFDBL",     cmd_defdbl     },
     { "DEFINT",     cmd_defint     },
-    { "DEFSNG",     cmd_defint     },
-    { "DEFSTR",     cmd_defint     },
+    { "DEFSNG",     cmd_defsng     },
+    { "DEFDBL",     cmd_defsng     },
+    { "DEFLNG",     cmd_defint     },
+    { "DEFSTR",     cmd_defstr     },
     { "ON ERROR",   cmd_on_error   },
     { "ON",         cmd_on         },
     { "RESUME",     cmd_resume     },

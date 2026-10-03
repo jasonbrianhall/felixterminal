@@ -180,6 +180,8 @@ void display_color(int fg, int bg)
 #endif
 }
 
+void display_text_rows(int rows) { (void)rows; }
+
 void display_width(int cols)
 {
 #if defined(FELIX_BASIC)
@@ -304,7 +306,26 @@ int display_inkey(void)
 #elif !defined(_WIN32)
     unsigned char c;
     ssize_t n = read(STDIN_FILENO, &c, 1);
-    if (n == 1) return (int)c;
+    if (n == 1) {
+        /* Arrow keys arrive as ESC [ A..D (or ESC O A..D): hand them on as
+         * the codes the other display layers use (0x1000 up .. 0x1003 right). */
+        if (c == 27) {
+            unsigned char seq[2];
+            usleep(2000);
+            if (read(STDIN_FILENO, &seq[0], 1) == 1) {
+                if ((seq[0] == '[' || seq[0] == 'O') && read(STDIN_FILENO, &seq[1], 1) == 1) {
+                    switch (seq[1]) {
+                    case 'A': return 0x1000;
+                    case 'B': return 0x1001;
+                    case 'D': return 0x1002;
+                    case 'C': return 0x1003;
+                    }
+                }
+                return 0;            /* some other escape sequence: ignore it */
+            }
+        }
+        return (int)c;
+    }
     usleep(1000);
     return 0;
 #else

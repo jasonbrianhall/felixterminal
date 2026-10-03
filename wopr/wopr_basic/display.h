@@ -28,6 +28,8 @@ void display_color(int fg, int bg);
 
 /* WIDTH cols — set terminal width (40 or 80) */
 void display_width(int cols);
+/* WIDTH , rows — text rows (25, 43, 50); call before display_width */
+void display_text_rows(int rows);
 
 /* Print a raw string (no newline) */
 void display_print(char *s);

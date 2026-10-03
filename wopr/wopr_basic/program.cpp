@@ -268,9 +268,12 @@ void load(char *filename) {
                             tf->name[fi++] = (char)toupper((unsigned char)*fp++);
                         tf->name[fi] = '\0';
                         while (isspace((unsigned char)*fp)) fp++;
+                        tf->is_str = tf->is_int = 0;
                         if (strncasecmp(fp, "AS", 2) == 0) {
                             fp += 2; while (isspace((unsigned char)*fp)) fp++;
                             tf->is_str = (strncasecmp(fp, "STRING", 6) == 0) ? 1 : 0;
+                            tf->is_int = strncasecmp(fp, "INTEGER", 7) == 0 ||
+                                         strncasecmp(fp, "LONG", 4) == 0;
                         }
                         if (tf->name[0]) td->nfields++;
                     }
@@ -453,9 +456,12 @@ void load(char *filename) {
                     tf->name[fi] = '\0';
                     /* check AS STRING vs numeric */
                     while (isspace((unsigned char)*p)) p++;
+                    tf->is_str = tf->is_int = 0;
                     if (strncasecmp(p, "AS", 2) == 0) {
                         p += 2; while (isspace((unsigned char)*p)) p++;
                         tf->is_str = (strncasecmp(p, "STRING", 6) == 0) ? 1 : 0;
+                        tf->is_int = strncasecmp(p, "INTEGER", 7) == 0 ||
+                                     strncasecmp(p, "LONG", 4) == 0;
                     }
                     if (tf->name[0]) td->nfields++;
                 }

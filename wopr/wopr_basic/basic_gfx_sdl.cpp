@@ -146,6 +146,7 @@ struct Cell { char ch; Uint8 fg, bg; };
 static Cell s_grid[TEXT_ROWS_MAX][TEXT_COLS_MAX];
 static int  s_text_cols  = TEXT_COLS_DEF;
 static int  s_text_rows  = TEXT_ROWS_DEF;
+static int  s_text_lock_rows = 0;   // SCREEN 0 after WIDTH: a fixed cols x rows grid (0: fit the window)
 static int  s_cur_row    = 0, s_cur_col = 0;
 static int  s_cur_fg     = 7, s_cur_bg  = 0;
 static bool s_cursor_vis = false;
@@ -361,7 +362,26 @@ static void ft_set_size_for_window() {
     } else {
         // Text mode (SCREEN 0): font size drives how many cols/rows fit.
         int target;
-        if (s_font_size_override > 0) {
+        if (s_text_lock_rows > 0 && s_font_size_override <= 0) {
+            // After WIDTH: keep the program's grid (QBasic's 80x25) and
+            // scale the font to fill the window with it.
+            int cols = s_text_cols <= 40 ? 40 : 80, rows = s_text_lock_rows;
+            int avail_w = s_win_w - 2 * TEXT_PAD;
+            int avail_h = s_win_h - 2 * TEXT_PAD;
+            int lo = 6, hi = avail_h / rows;
+            if (hi < lo) hi = lo;
+            while (lo < hi) {
+                int mid = (lo + hi + 1) / 2;
+                FT_Set_Pixel_Sizes(s_ft_face, 0, (FT_UInt)mid);
+                int adv = (int)(s_ft_face->size->metrics.max_advance >> 6);
+                int ht  = (int)(s_ft_face->size->metrics.height >> 6);
+                if (adv > 0 && ht > 0 && adv * cols <= avail_w && ht * rows <= avail_h)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            target = lo;
+        } else if (s_font_size_override > 0) {
             target = s_font_size_override;
         } else {
             // Auto: pick largest size that fits at least 80×25
@@ -386,7 +406,10 @@ static void ft_set_size_for_window() {
         // Compute how many cols/rows actually fit at this font size, within limits
         int adv = (int)(s_ft_face->size->metrics.max_advance >> 6);
         int ht  = (int)(s_ft_face->size->metrics.height >> 6);
-        if (adv > 0 && ht > 0) {
+        if (s_text_lock_rows > 0 && s_font_size_override <= 0) {
+            s_text_cols = s_text_cols <= 40 ? 40 : 80;
+            s_text_rows = s_text_lock_rows;
+        } else if (adv > 0 && ht > 0) {
             int cols = (s_win_w - 2 * TEXT_PAD) / adv;
             int rows = (s_win_h - 2 * TEXT_PAD) / ht;
             cols = std::max(40,  std::min(TEXT_COLS_MAX, cols));
@@ -422,6 +445,44 @@ bool gfx_sdl_load_font(const char *path) {
     ft_set_size_for_window();
     return true;
 }
+
+// CP437 (the IBM PC character set QBasic programs are written in) to
+// Unicode, for looking glyphs up in the font: CHR$(219) is a full block,
+// CHR$(196) a box line, CHR$(24) an up arrow, and so on.
+static const unsigned short s_cp437[256] = {
+    0x0000, 0x263A, 0x263B, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
+    0x25D8, 0x25CB, 0x25D9, 0x2642, 0x2640, 0x266A, 0x266B, 0x263C,
+    0x25BA, 0x25C4, 0x2195, 0x203C, 0x00B6, 0x00A7, 0x25AC, 0x21A8,
+    0x2191, 0x2193, 0x2192, 0x2190, 0x221F, 0x2194, 0x25B2, 0x25BC,
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
+    0x0028, 0x0029, 0x002A, 0x002B, 0x002C, 0x002D, 0x002E, 0x002F,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F,
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    0x0048, 0x0049, 0x004A, 0x004B, 0x004C, 0x004D, 0x004E, 0x004F,
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+    0x0058, 0x0059, 0x005A, 0x005B, 0x005C, 0x005D, 0x005E, 0x005F,
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+    0x0068, 0x0069, 0x006A, 0x006B, 0x006C, 0x006D, 0x006E, 0x006F,
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007A, 0x007B, 0x007C, 0x007D, 0x007E, 0x2302,
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
+    0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+    0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
+    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+    0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA,
+    0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+    0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
+    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B,
+    0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4,
+    0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+    0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
+    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+};
 
 static const Glyph &glyph_get(int cp) {
     auto it = s_glyph_cache.find(cp);
@@ -687,7 +748,7 @@ static void render_text_cell(int row, int col) {
     // backgrounds show and old glyphs are properly erased.
     // In graphics mode, only draw bg for cells with actual content so the
     // graphics pixel buffer shows through empty cells.
-    if (!s_gfx_active || (ch >= 0x20 && ch != ' ')) {
+    if (!s_gfx_active || (ch != 0 && ch != ' ' && ch != 255)) {
         SDL_SetRenderDrawBlendMode(s_renderer, SDL_BLENDMODE_NONE);
         SDL_SetRenderDrawColor(s_renderer,
             (bg>>16)&0xFF, (bg>>8)&0xFF, bg&0xFF, 255);
@@ -695,9 +756,23 @@ static void render_text_cell(int row, int col) {
         SDL_RenderFillRect(s_renderer, &bgr);
     }
 
+    // The block characters fill exact parts of the cell, so neighbouring
+    // cells join up (Nibbles draws its whole playfield with these); the
+    // font's own versions leave gaps between rows.
+    if (ch >= 219 && ch <= 223) {
+        Uint32 fg = s_pal[cell.fg & 15];
+        SDL_Rect r = { cx, cy, s_cell_w, s_cell_h };
+        if (ch == 220) { r.y += s_cell_h / 2; r.h -= s_cell_h / 2; }      // lower half
+        else if (ch == 221) r.w = s_cell_w / 2;                           // left half
+        else if (ch == 222) { r.x += s_cell_w / 2; r.w -= s_cell_w / 2; } // right half
+        else if (ch == 223) r.h = s_cell_h / 2;                           // upper half
+        SDL_SetRenderDrawBlendMode(s_renderer, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(s_renderer, (fg>>16)&0xFF, (fg>>8)&0xFF, fg&0xFF, 255);
+        SDL_RenderFillRect(s_renderer, &r);
+    }
     // Draw the character if it's printable
-    if (ch >= 0x20 && ch != ' ') {
-        const Glyph &g = glyph_get(ch);
+    else if (ch != 0 && ch != ' ' && ch != 255) {
+        const Glyph &g = glyph_get(s_cp437[ch]);
         if (!g.bm.empty()) {
             // Cache keyed by (codepoint, font generation, palette generation, fg color)
             struct Key {
@@ -917,10 +992,17 @@ static void text_putchar(char c) {
 
     if (c == '\n') { text_newline(); return; }
     if (c == '\r') { s_cur_col = 0;  return; }
-    if (uc < 0x20) return;
+    // Control codes QBasic shows as CP437 symbols (smileys, arrows, ...);
+    // the rest (bell, tab, cursor moves, ESC) aren't put on the screen.
+    if (uc < 0x20 && !((uc >= 1 && uc <= 6) || (uc >= 14 && uc <= 26))) return;
+    // A character in the last column leaves the cursor just past it; the
+    // wrap (and a scroll, on the bottom row) waits for the next character,
+    // as in QBasic -- so PRINT CHR$(219); at row 25, column 80 doesn't
+    // scroll the screen.
+    if (s_cur_col >= s_text_cols) text_newline();
     if (s_cur_col < s_text_cols && s_cur_row < s_text_rows)
         s_grid[s_cur_row][s_cur_col] = {c, (Uint8)s_cur_fg, (Uint8)s_cur_bg};
-    if (++s_cur_col >= s_text_cols) text_newline();
+    s_cur_col++;
     s_needs_render = true;
 }
 
@@ -1057,6 +1139,8 @@ void gfx_palette(int idx, int r, int g, int b) {
 }
 
 void gfx_cls(int color) {
+    // In SCREEN 0, CLS clears to the COLOR statement's background.
+    if (!s_gfx_active) color = s_cur_bg;
     // Update the current background colour so subsequent text output
     // (PRINT, LOCATE, etc.) uses the same colour as the cleared screen.
     s_cur_bg = color & 15;
@@ -1418,8 +1502,16 @@ void display_color(int fg, int bg) {
 }
 
 void display_width(int cols) {
+    if (s_text_lock_rows <= 0) s_text_lock_rows = TEXT_ROWS_DEF;
     s_text_cols = (cols <= 40) ? 40 : 80;
     s_needs_render = true;
+    if (!s_gfx_active) ft_set_size_for_window();
+}
+
+// WIDTH , rows: 25, 43 or 50 text rows (applied by the display_width call
+// that follows).
+void display_text_rows(int rows) {
+    if (rows == 25 || rows == 43 || rows == 50) s_text_lock_rows = rows;
 }
 
 void display_print(char *s) {
@@ -1502,6 +1594,7 @@ int display_getline(char *buf, int bufsz) {
     int  cursor = 0;
     int  hist_pos = s_hist_count;
 
+    if (s_cur_col >= s_text_cols) text_newline();   // a wrap left pending
     // Remember where on the grid this input line started
     int start_row = s_cur_row;
     int start_col = s_cur_col;

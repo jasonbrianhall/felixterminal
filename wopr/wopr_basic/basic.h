@@ -163,6 +163,7 @@ typedef struct {
     mpf_t  *arr_num;
     char  **arr_str;                  /* the strings themselves are malloc'd too */
     int     scope;                    /* 0: the main program; n: the n-th procedure call deep */
+    int     is_int;                   /* INTEGER/LONG: numbers stored here round to whole */
 } Var;
 
 extern Var* g_vars;
@@ -192,6 +193,14 @@ void    var_free_arrays(Var *v);      /* release an array's elements and storage
 bool    var_alloc_array(Var *v, int total, int is_str);
 char  **arr_str_elem(Var *v, int i, int j);
 Var    *field_array(const char *base, const char *field, int *is_str);
+/* Strings are NUL-terminated, so CHR$(0) is stored as this byte instead
+ * (CP437 255, which also displays as a blank). INKEY$ returns it followed
+ * by the scan code for extended keys, e.g. CHR$(0) + "H" for Up. */
+#define BASIC_NUL_CH ((char)0xFF)
+int     inkey_to_str(int ch, char *buf);
+extern unsigned char g_defint[26];      /* DEFINT/DEFLNG letters */
+int     var_name_is_int(const char *name);
+void    var_fix_int(Var *v, mpf_t x);   /* round x as QBasic does if v is an integer */
 
 /* ================================================================
  * Program store
@@ -258,6 +267,7 @@ extern int       g_ctrl_top;
 typedef struct {
     char name[MAX_VARNAME];
     int  is_str;   /* 1 = string field, 0 = numeric */
+    int  is_int;   /* AS INTEGER / AS LONG */
 } TypeField;
 
 typedef struct {
