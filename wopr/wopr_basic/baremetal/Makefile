@@ -2,11 +2,14 @@
 #
 #   make floppy       1.44 MB boot floppy (felixbasic-floppy.img): GRUB, the
 #                     kernel and the sample programs from ../test, on FAT12;
-#                     LOAD/SAVE/FILES work on the same disk
+#                     LOAD/SAVE/FILES work on the same disk. The x86_64 one
+#                     boots on UEFI too (EFI/BOOT/BOOTX64.EFI)
 #   make run-floppy   boot the floppy in QEMU
 #   make              the kernel alone (felixbasic.elf)
 #   make run          boot the kernel directly in QEMU (files on a RAM disk)
-#   make iso          bootable CD / USB image (felixbasic.iso)
+#   make iso          bootable CD / USB image (felixbasic.iso), BIOS and UEFI
+#                     (when grub-efi-amd64-bin is installed), with the
+#                     sample programs on the RAM disk
 #   make efi          UEFI application (felixbasic.efi) plus felixbasic.img,
 #                     the sample programs on a FAT12 image it loads into the
 #                     RAM disk; copy both to EFI/BOOT/ on a FAT USB stick,
@@ -177,9 +180,9 @@ EFI_LIBS ?= $(shell find /usr/lib /usr/lib64 \( -name libgnuefi.a -o -name libef
 EFI_BUILD := build/efi
 EFI_CFLAGS := -I$(EFI_INC) -I$(EFI_INC)/x86_64 -I$(EFI_BUILD) -fpic -ffreestanding -fno-stack-protector \
               -fno-stack-check -fshort-wchar -mno-red-zone -maccumulate-outgoing-args -O2 -Wall
-EFI_IMG  := felixbasic.img
+DISK_IMG  := felixbasic.img
 
-efi: felixbasic.efi $(EFI_IMG)
+efi: felixbasic.efi $(DISK_IMG)
 
 ifeq ($(ARCH),x86_64)
 # The kernel again, position-independent, built in its own directory.
@@ -208,9 +211,9 @@ felixbasic.efi: efi/loader.c efi/image.S $(EFI_BUILD)/kernel.bin $(EFI_BUILD)/ke
 	objcopy -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym -j .rel -j .rela \
 	        -j '.rel.*' -j '.rela.*' -j .reloc -O efi-app-x86_64 --subsystem=10 $(EFI_BUILD)/felixbasic.so $@
 
-# The sample programs on a FAT12 image, which felixbasic.efi loads into
-# the RAM disk (changes last until the machine restarts).
-$(EFI_IMG): $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
+# The sample programs on a FAT12 image, which felixbasic.efi and the CD
+# load into the RAM disk (changes last until the machine restarts).
+$(DISK_IMG): $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
 	rm -f $@
 	$(MKFS_FAT) -C -F 12 -f 2 -r 224 -n FELIXBASIC $@ 1440 >/dev/null
 	for f in $(TESTS)/*.bas $(TESTS)/*.BAS; do [ -e "$$f" ] && mcopy -i $@ "$$f" ::/ ; done; true
@@ -231,9 +234,10 @@ $(BUILD)/grub.cfg: grub.cfg
 	sed 's/@GFXMODE@/$(GFXMODE)/' $< > $@
 
 iso: $(ISO)
-$(ISO): $(KERNEL) $(BUILD)/grub.cfg
+$(ISO): $(KERNEL) $(BUILD)/grub.cfg $(DISK_IMG)
 	@rm -rf $(BUILD)/iso && mkdir -p $(BUILD)/iso/boot/grub
 	cp $(KERNEL) $(BUILD)/iso/boot/felixbasic.elf
+	cp $(DISK_IMG) $(BUILD)/iso/boot/felixbasic.img
 	cp $(BUILD)/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $@ $(BUILD)/iso 2>/dev/null
 
@@ -242,7 +246,9 @@ $(ISO): $(KERNEL) $(BUILD)/grub.cfg
 # (gzipped; GRUB unpacks it), grub.cfg and the sample programs as files.
 # Needs mtools and dosfstools.
 floppy: $(FLOPPY)
-$(FLOPPY): $(KERNEL) $(BUILD)/grub.cfg $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
+# EFI_APP=felixbasic-signed.efi puts the signed one on (after make sign).
+EFI_APP ?= felixbasic.efi
+$(FLOPPY): $(KERNEL) $(BUILD)/grub.cfg $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS) $(if $(filter x86_64,$(ARCH)),$(EFI_APP))
 	$(GRUB_MKIMAGE) -O i386-pc -o $(BUILD)/core.img -p /boot/grub \
 	    biosdisk fat gzio normal configfile multiboot vbe video video_fb boot
 	gzip -9 -n -c $(KERNEL) > $(BUILD)/kernel.gz
@@ -251,6 +257,7 @@ $(FLOPPY): $(KERNEL) $(BUILD)/grub.cfg $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
 	mmd -i $@ ::/boot ::/boot/grub
 	mcopy -i $@ $(BUILD)/kernel.gz ::/boot/felixbasic.elf
 	mcopy -i $@ $(BUILD)/grub.cfg ::/boot/grub/grub.cfg
+	$(if $(filter x86_64,$(ARCH)),mmd -i $@ ::/EFI ::/EFI/BOOT && mcopy -i $@ $(EFI_APP) ::/EFI/BOOT/BOOTX64.EFI)
 	for f in $(TESTS)/*.bas $(TESTS)/*.BAS; do [ -f "$$f" ] && mcopy -i $@ "$$f" "::/$$(basename "$$f")"; done; true
 	cp $(GRUB_I386)/boot.img $(BUILD)/boot.img
 	dd if=$@ of=$(BUILD)/boot.img bs=1 skip=3 seek=3 count=59 conv=notrunc status=none
@@ -292,11 +299,11 @@ ifeq ($(ARCH),x86_64)
 OVMF ?= $(firstword $(wildcard /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
           /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/qemu/ovmf-x86_64.bin))
 OVMF_VARS ?= $(firstword $(wildcard $(subst CODE,VARS,$(OVMF))))
-run-efi: felixbasic.efi $(EFI_IMG)
+run-efi: felixbasic.efi $(DISK_IMG)
 	@test -n "$(OVMF)" -a -n "$(OVMF_VARS)" || { echo "OVMF firmware not found (Debian: ovmf, Fedora: edk2-ovmf); set OVMF= and OVMF_VARS="; exit 1; }
 	@rm -rf $(BUILD)/esp && mkdir -p $(BUILD)/esp/EFI/BOOT
 	cp felixbasic.efi $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
-	cp $(EFI_IMG) $(BUILD)/esp/EFI/BOOT/
+	cp $(DISK_IMG) $(BUILD)/esp/EFI/BOOT/
 	cp $(OVMF_VARS) $(BUILD)/ovmf_vars.fd
 	$(QEMU) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	        -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd -drive format=raw,file=fat:rw:$(BUILD)/esp

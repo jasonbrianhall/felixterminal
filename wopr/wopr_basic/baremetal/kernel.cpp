@@ -71,6 +71,14 @@ uint64_t phys_limit = 0x100000000ull;
 static void heap_init(const MultibootInfo* mbi) {
     const uint64_t k0 = (uintptr_t)__kernel_start & ~0xFFFull;
     const uint64_t k1 = ((uintptr_t)__kernel_end + 0xFFF) & ~0xFFFull;
+    // A module (the disk image GRUB or the UEFI loader hands over) stays put
+    // until storage_init has copied it.
+    uint64_t m0 = 0, m1 = 0;
+    if ((mbi->flags & (1 << 3)) && mbi->mods_count) {
+        const uint32_t* mod = (const uint32_t*)(uintptr_t)mbi->mods_addr;
+        m0 = mod[0] & ~0xFFFull;
+        m1 = ((uint64_t)mod[1] + 0xFFF) & ~0xFFFull;
+    }
     uint64_t total = 0;
     auto add = [&](uint64_t a, uint64_t e) {
         if (e > phys_limit) e = phys_limit;
@@ -79,6 +87,10 @@ static void heap_init(const MultibootInfo* mbi) {
         if (a < k1 && e > k0) {                              // skip the kernel image
             if (a < k0) { heap_add((void*)(uintptr_t)a, (size_t)(k0 - a)); total += k0 - a; }
             a = k1;
+        }
+        if (a < m1 && e > m0) {                              // and the disk image module
+            if (a < m0) { heap_add((void*)(uintptr_t)a, (size_t)(m0 - a)); total += m0 - a; }
+            a = m1;
         }
         if (e > a) { heap_add((void*)(uintptr_t)a, (size_t)(e - a)); total += e - a; }
     };

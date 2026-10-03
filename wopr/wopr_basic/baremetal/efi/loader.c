@@ -3,9 +3,11 @@
 // Takes the framebuffer from the Graphics Output Protocol, copies the
 // embedded position-independent kernel below 4 GiB, applies its
 // relocations, exits boot services and jumps to it with the same
-// Multiboot-style information GRUB would have provided. If felixbasic.img
-// (a 1.44 MB FAT12 disk image) sits next to felixbasic.efi, it's passed
-// along as a module and becomes the RAM disk BASIC's files live on.
+// Multiboot-style information GRUB would have provided. BASIC's files: if
+// felixbasic.img (a 1.44 MB FAT12 disk image) sits next to felixbasic.efi,
+// it's passed along as a module and becomes the RAM disk; booted from the
+// Felix BASIC floppy itself (or that image written to a USB stick), the
+// whole disk is, programs and all.
 #include <efi.h>
 #include <efilib.h>
 
@@ -96,6 +98,22 @@ static void* read_file(EFI_HANDLE image, CHAR16* name, UINTN* size) {
     return buf;
 }
 
+// The disk we were loaded from, whole, if it's floppy-sized and FAT.
+static void* read_boot_disk(EFI_HANDLE dev, UINTN* size) {
+    EFI_GUID bio = BLOCK_IO_PROTOCOL;
+    EFI_BLOCK_IO* b;
+    if (EFI_ERROR(uefi_call_wrapper(ST_->BootServices->HandleProtocol, 3, dev, &bio, (void**)&b))) return NULL;
+    if (!b->Media || !b->Media->MediaPresent || b->Media->BlockSize != 512) return NULL;
+    UINT64 bytes = (b->Media->LastBlock + 1) * 512;
+    if (bytes < 512 || bytes > 2880 * 512) return NULL;
+    UINT8* buf = alloc_low((UINTN)bytes);
+    if (!buf) return NULL;
+    if (EFI_ERROR(uefi_call_wrapper(b->ReadBlocks, 5, b, b->Media->MediaId, 0, (UINTN)bytes, buf))) return NULL;
+    if (buf[510] != 0x55 || buf[511] != 0xAA) return NULL;
+    *size = (UINTN)bytes;
+    return buf;
+}
+
 EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     InitializeLib(image, st);
     ST_ = st;
@@ -114,6 +132,11 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
 
     UINTN disk_size = 0;
     UINT8* disk = read_file(image, img_path, &disk_size);     // optional
+    int from_floppy = 0;
+    if (!disk) {
+        disk = read_boot_disk(li->DeviceHandle, &disk_size);
+        from_floppy = disk != NULL;
+    }
 
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = setup_gop();
     if (!gop) { fail(L"no 32-bit graphics mode available"); return EFI_UNSUPPORTED; }
@@ -150,6 +173,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     mbi->flags = (1 << 2) | (1 << 3) | (1 << 12);
     mbi->cmdline = (UINT32)(UINTN)cmdline;
     mbi->mods_count = disk ? 1 : 0;
+    if (from_floppy) {          // as GRUB says for drive A:: the kernel uses a real floppy drive if there is one
+        mbi->flags |= 1 << 1;
+        mbi->boot_device = 0x00FFFFFF;
+    }
     mbi->mods_addr = (UINT32)(UINTN)mod;
     mbi->fb_addr = gop->Mode->FrameBufferBase;
     mbi->fb_width = gop->Mode->Info->HorizontalResolution;
