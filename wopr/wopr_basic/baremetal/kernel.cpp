@@ -462,6 +462,8 @@ void platform_sleep_ms(uint32_t ms) { gfx_sdl_render(); wait_ms(ms, true); }
 extern "C" {
 Uint32 SDL_GetTicks(void) { return platform_ms(); }
 void SDL_Delay(Uint32 ms) { wait_ms(ms, false); }
+Uint64 SDL_GetPerformanceCounter(void) { return platform_us(); }
+Uint64 SDL_GetPerformanceFrequency(void) { return 1000000; }
 void SDL_Log(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
