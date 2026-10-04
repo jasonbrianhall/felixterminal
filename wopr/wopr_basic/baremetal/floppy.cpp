@@ -77,6 +77,12 @@ bool reset() {
     for (int i = 0; i < 20; i++) outb(0x80, 0);          // > 4 us in reset (not by reading MSR:
                                                          // QEMU leaves reset on that, without the interrupt)
     outb(DOR, dor());
+    // Let the controller finish coming out of reset before asking about
+    // it. A SENSE INTERRUPT sent first only gets "invalid command", and on
+    // PCem it also cancels the reset's own interrupt, so none of the four
+    // ever turn up (the floppy then looks absent). Real 82077s want the
+    // wait too.
+    delay_ms(10);
     int got = 0;                                         // one interrupt per drive (4)
     for (uint32_t t = now(); got < 4 && now() - t < 500;) {
         uint8_t st0, pcn;
@@ -167,7 +173,12 @@ bool floppy_init() {
     case 3: rate = 2; spt = 9;  break;                   // 3.5" 720 KB
     case 4: rate = 0; spt = 18; break;                   // 3.5" 1.44 MB
     case 5: rate = 3; spt = 36; break;                   // 3.5" 2.88 MB
-    default: printf("Floppy: no drive A:\n"); return false;
+    default:
+        // CMOS says no drive, yet we were booted from A: (only then are we
+        // called). Emulators leave the type to the BIOS setup, which may
+        // never have been saved: assume the usual 3.5" 1.44 MB drive.
+        printf("Floppy: CMOS has no drive A: type; assuming 1.44 MB\n");
+        rate = 0; spt = 18; break;
     }
     heads = 2; total = spt * heads * 80;
     if (inb(MSR) == 0xFF || !reset() || !recalibrate()) {
