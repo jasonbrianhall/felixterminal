@@ -213,15 +213,22 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt) {
     return any;
 }
 
-static bool hda_init() {
-    PciDevice d;
-    if (!pci_find_class(0x04, 0x03, -1, &d)) return false;
+static bool hda_try(const PciDevice& d) {
+    uint32_t id = pci_read(d, 0x00);
+    uint16_t vendor = id & 0xFFFF;
     uint32_t bar = pci_read(d, 0x10);
     uint64_t base = bar & 0xFFFFFFF0;
     if ((bar & 0x6) == 0x4) base |= (uint64_t)pci_read(d, 0x14) << 32;
     if (base == 0 || base >= phys_limit) { printf("HDA: BAR out of reach\n"); return false; }
     hda = (volatile uint8_t*)(uintptr_t)base;
     pci_write(d, 0x04, pci_read(d, 0x04) | 0x06);    // memory + bus master
+    // AMD/ATI controllers: have the controller snoop the CPU caches, as
+    // Linux does (misc control 2, offset 0x42), or it can read stale
+    // commands and sound from memory.
+    if (vendor == 0x1022 || vendor == 0x1002) {
+        uint32_t v = pci_read(d, 0x40);
+        pci_write(d, 0x40, (v & ~(0x07u << 16)) | (0x02u << 16));
+    }
 
     // Controller reset.
     w32(0x08, r32(0x08) & ~1u);
@@ -261,7 +268,12 @@ static bool hda_init() {
     bool routed = false;
     for (int cad = 0; cad < 15; cad++)
         if (codecs & (1 << cad)) routed |= hda_setup_codec(cad, tag, fmt);
-    if (!routed) { printf("HDA: no usable output pin\n"); return false; }
+    if (!routed) {
+        w8(0x4C, 0); w8(0x5C, 0);                     // stop CORB/RIRB: try the next controller
+        printf("HDA: %02x:%02x.%x has no analog output (HDMI only?)\n", d.bus, d.dev, d.fn);
+        return false;
+    }
+    printf("HDA: using %02x:%02x.%x\n", d.bus, d.dev, d.fn);
 
     // Stream reset, then program the BDL over the shared ring.
     w8(sd + 0, r8(sd + 0) | 1);
@@ -282,6 +294,15 @@ static bool hda_init() {
     w8(sd + 0x02, tag << 4);                          // stream number (CTL bits 23:20)
     w8(sd + 0x00, 0x02);                              // run
     return true;
+}
+
+// Graphics cards' HDMI audio shows up as an HD Audio controller too, often
+// before the motherboard's: take the first one with an analog output.
+static bool hda_init() {
+    PciDevice d;
+    for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++)
+        if (hda_try(d)) return true;
+    return false;
 }
 
 static uint32_t hda_play_pos() {
