@@ -1,9 +1,11 @@
 // xHCI USB keyboard driver (polled, boot protocol).
 //
-// Takes the controller from the BIOS, resets it, enumerates keyboards on the
-// root ports (and ones plugged in later), and turns their 8-byte boot reports
-// into the same PS/2 set-1 scancodes the rest of the kernel already handles.
-// Hubs aren't supported: keyboards must be on a root port.
+// Takes the controller from the BIOS, resets it, enumerates keyboards and
+// mice on the root ports and behind USB 2 hubs (hubs in hubs too, and ones
+// plugged in later), and turns keyboards' 8-byte boot reports into the same
+// PS/2 set-1 scancodes the rest of the kernel already handles. A USB 3
+// hub's SuperSpeed half is left alone: keyboards and mice show up on its
+// USB 2 half, which is an ordinary hub.
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -13,6 +15,7 @@
 #include "usb.hpp"
 
 void kbd_push(uint8_t b);                 // kernel.cpp: feeds the scancode queue
+extern volatile uint32_t ticks;           // irq.cpp: 60 Hz
 void mouse_push(int dx, int dy, int buttons, int wheel);   // kernel.cpp: relative motion, buttons, wheel
 
 static void io_delay(int n) { while (n--) inb(0x80); }   // ~1 us each
@@ -114,17 +117,40 @@ static size_t csz;                         // context size: 32 or 64 bytes
 static volatile uint64_t* dcbaa;
 static int max_slots, num_ports;
 
+// Everything plugged in that we drive: keyboards, mice and the hubs they
+// hang off. Where a device is: the root port its tree starts at, the route
+// string down through the hubs (4 bits a tier), and, for a low/full-speed
+// device behind a high-speed hub, that hub's slot and port (its transaction
+// translator).
+enum Kind { KBD, MOUSE, HUB };
 struct Keyboard {
     bool active;
-    int port, slot, speed, dci, mps;
+    Kind kind;
+    bool mouse;                            // kind == MOUSE (kept for the report code)
+    int port;                              // root port
+    uint32_t route;
+    int depth;                             // hub tier below the root (0: on a root port)
+    int parent;                            // index of the hub it's on, -1: a root port
+    int hub_port;                          // its port on that hub
+    int tt_slot, tt_port;                  // transaction translator, 0: none
+    int slot, speed, dci, mps;
     volatile uint8_t* out_ctx;
     volatile uint8_t* in_ctx;
     Ring ep0, intr;
     volatile uint8_t* reports;             // one 8-byte buffer per ring slot
     uint8_t prev[8];
-    bool mouse;                            // boot-protocol mouse instead of keyboard
+    // mice in report protocol: where the fields are in a report (bits; -1 none)
+    bool rp;                               // report protocol (else boot: buttons, dx, dy[, wheel])
+    int rid;                               // report ID carrying the mouse fields, 0 none
+    int b_off, b_n, x_off, x_sz, y_off, y_sz, w_off, w_sz;
+    // hubs
+    int nports, ttt;
+    uint32_t dirty;                        // ports with a change waiting (bit n = port n)
+    uint8_t fails[32];                     // failed set-ups per port: stop retrying after a few
+    uint32_t power_good_ms;
+    char where[24];                        // "port 3" / "port 3.2" for messages
 };
-#define MAX_KBD 4
+#define MAX_KBD 16
 static Keyboard kbds[MAX_KBD];
 static bool port_dirty[256];
 static bool ready;
@@ -149,6 +175,15 @@ static const struct { uint8_t usage; uint16_t code; } keymap[] = {
     {0x3C, 0x3D}, {0x3D, 0x3E}, {0x3E, 0x3F}, {0x3F, 0x40}, {0x40, 0x41}, {0x41, 0x42},
     {0x42, 0x43}, {0x43, 0x44}, {0x44, 0x57}, {0x45, 0x58}, {0x4F, 0x14D}, {0x50, 0x14B},
     {0x51, 0x150}, {0x52, 0x148}, {0x58, 0x11C},
+    {0x39, 0x3A},                                          // Caps Lock
+    {0x47, 0x46}, {0x48, 0x145},                           // Scroll Lock, Pause
+    {0x49, 0x152}, {0x4A, 0x147}, {0x4B, 0x149},           // Insert, Home, Page Up
+    {0x4C, 0x153}, {0x4D, 0x14F}, {0x4E, 0x151},           // Delete, End, Page Down
+    {0x53, 0x45},                                          // Num Lock
+    {0x54, 0x135}, {0x55, 0x37}, {0x56, 0x4A}, {0x57, 0x4E},   // keypad / * - +
+    {0x59, 0x4F}, {0x5A, 0x50}, {0x5B, 0x51}, {0x5C, 0x4B}, {0x5D, 0x4C},   // keypad 1-5
+    {0x5E, 0x4D}, {0x5F, 0x47}, {0x60, 0x48}, {0x61, 0x49}, {0x62, 0x52},   // keypad 6-9, 0
+    {0x63, 0x53}, {0x64, 0x56},                            // keypad ., non-US backslash
 };
 
 static void emit(uint16_t code, bool down) {
@@ -159,10 +194,32 @@ static void emit_usage(uint8_t usage, bool down) {
     for (auto& k : keymap) if (k.usage == usage) { emit(k.code, down); return; }
 }
 
-static void handle_report(Keyboard& k, const volatile uint8_t* r) {
-    if (k.mouse) {                                         // buttons, dx, dy (boot protocol)
-        // Most mice add the wheel as a 4th byte even in the boot protocol;
-        // a 3-byte report leaves it 0 (queue_report clears the buffer).
+// A field of `size` bits at bit `off` of a report, sign-extended.
+static int report_field(const volatile uint8_t* r, int len, int off, int size) {
+    if (off < 0 || size <= 0 || size > 32 || (off + size + 7) / 8 > len) return 0;
+    uint32_t v = 0;
+    for (int i = 0; i < size; i++)
+        if (r[(off + i) / 8] & (1 << ((off + i) % 8))) v |= 1u << i;
+    if (size < 32 && (v & (1u << (size - 1)))) v |= ~0u << size;   // negative
+    return (int)v;
+}
+
+static void handle_report(Keyboard& k, const volatile uint8_t* r, int len = 8) {
+    if (k.mouse) {
+        if (k.rp) {                                        // report protocol: as its descriptor says
+            if (k.rid) {
+                if (len < 1 || r[0] != k.rid) return;     // another of its reports (media keys...)
+                r++; len--;
+            }
+            int buttons = 0;
+            for (int i = 0; i < k.b_n && i < 3; i++)
+                if (report_field(r, len, k.b_off + i, 1) & 1) buttons |= 1 << i;
+            mouse_push(report_field(r, len, k.x_off, k.x_sz), report_field(r, len, k.y_off, k.y_sz),
+                       buttons, report_field(r, len, k.w_off, k.w_sz));
+            return;
+        }
+        // Boot protocol: buttons, dx, dy. Some mice add the wheel as a 4th
+        // byte even so; a 3-byte report leaves it 0 (queue_report clears the buffer).
         mouse_push((int8_t)r[1], (int8_t)r[2], r[0] & 7, (int8_t)r[3]);
         return;
     }
@@ -193,11 +250,12 @@ static void handle_report(Keyboard& k, const volatile uint8_t* r) {
     memcpy(k.prev, cur, 8);
 }
 
+#define REPORT_BYTES 64                    // per ring slot: room for report-protocol mice
 static void queue_report(Keyboard& k) {
     int idx = k.intr.enq;
-    for (int i = 0; i < 8; i++) k.reports[idx * 8 + i] = 0;
-    uint64_t buf = phys(k.reports + idx * 8);
-    ring_push(k.intr, (uint32_t)buf, (uint32_t)(buf >> 32), 8,
+    for (int i = 0; i < REPORT_BYTES; i++) k.reports[idx * REPORT_BYTES + i] = 0;
+    uint64_t buf = phys(k.reports + idx * REPORT_BYTES);
+    ring_push(k.intr, (uint32_t)buf, (uint32_t)(buf >> 32), REPORT_BYTES,
               TRB_NORMAL << 10 | (1 << 5) | (1 << 2));     // IOC, ISP
 }
 
@@ -221,10 +279,18 @@ static void dispatch(const Trb& e) {
         if (!k.active || k.slot != slot || k.dci != ep) continue;
         uint64_t trb = (uint64_t)e.d1 << 32 | e.d0;
         int idx = (int)((trb - phys(k.intr.trb)) / sizeof(Trb));
-        if (idx >= 0 && idx < RING_TRBS && (cc == 1 || cc == 13))
-            handle_report(k, k.reports + idx * 8);
+        if (idx >= 0 && idx < RING_TRBS && (cc == 1 || cc == 13)) {
+            const volatile uint8_t* r = k.reports + idx * REPORT_BYTES;
+            int len = REPORT_BYTES - (int)(e.d2 & 0xFFFFFF);         // minus what wasn't filled
+            if (k.kind == HUB) k.dirty |= (uint32_t)(r[0] | r[1] << 8 | r[2] << 16) & ~1u;   // bit 0: the hub itself
+            else handle_report(k, r, len);
+        }
         if (cc == 1 || cc == 13) queue_report(k);
-        else { release_all(k); k.active = false; printf("USB: %s on port %d stopped (code %d)\n", k.mouse ? "mouse" : "keyboard", k.port, cc); }
+        else {
+            if (k.kind != HUB) release_all(k);
+            k.active = false;
+            printf("USB: %s on %s stopped (code %d)\n", k.kind == HUB ? "hub" : k.mouse ? "mouse" : "keyboard", k.where, cc);
+        }
         db[slot] = k.dci;
     }
 }
@@ -274,6 +340,62 @@ static bool control(Keyboard& k, uint8_t type, uint8_t req, uint16_t value, uint
     return cc == 1 || cc == 13;
 }
 
+// ---------------------------------------------------------------- HID reports
+// Just enough of a HID report descriptor parser to find a mouse's buttons,
+// X, Y and wheel: the boot protocol has no wheel on most mice.
+static bool parse_mouse_report(Keyboard& k, const volatile uint8_t* d, int n) {
+    int page = 0, size = 0, count = 0, id = 0;
+    int usages[16], nusages = 0, umin = -1, umax = -1;
+    int bitpos[16] = {0};                                  // per report ID (low 4 bits)
+    k.rid = 0; k.b_off = k.x_off = k.y_off = k.w_off = -1; k.b_n = k.x_sz = k.y_sz = k.w_sz = 0;
+    int mouse_id = -1;
+    for (int i = 0; i < n;) {
+        uint8_t pre = d[i++];
+        if (pre == 0xFE) { if (i + 1 >= n) break; i += 2 + d[i]; continue; }   // long item
+        int len = (pre & 3) == 3 ? 4 : (pre & 3), type = (pre >> 2) & 3, tag = pre >> 4;
+        if (i + len > n) break;
+        uint32_t v = 0;
+        for (int b = 0; b < len; b++) v |= (uint32_t)d[i + b] << (8 * b);
+        i += len;
+        if (type == 1) {                                   // global
+            if (tag == 0) page = (int)v;
+            else if (tag == 7) size = (int)v;
+            else if (tag == 8) id = (int)v & 0xFF;
+            else if (tag == 9) count = (int)v;
+        } else if (type == 2) {                            // local
+            if (tag == 0 && nusages < 16) usages[nusages++] = (int)(len == 4 ? v & 0xFFFF : v);
+            else if (tag == 1) umin = (int)v;
+            else if (tag == 2) umax = (int)v;
+        } else if (type == 0) {                            // main
+            if (tag == 8) {                                // Input
+                int& pos = bitpos[id & 15];
+                bool constant = v & 1;
+                for (int f = 0; f < count; f++) {
+                    int u = nusages ? usages[f < nusages ? f : nusages - 1] : umin >= 0 ? umin + f : -1;
+                    if (umax >= 0 && umin >= 0 && u > umax) u = umax;
+                    int off = pos + f * size;
+                    if (!constant && (mouse_id < 0 || mouse_id == id)) {
+                        if (page == 9 && u >= 1 && u <= 8) {
+                            if (k.b_off < 0) k.b_off = off - (u - 1);
+                            if (u > k.b_n) k.b_n = u;
+                        } else if (page == 1 && (v & 2)) { // variable
+                            if (u == 0x30) { k.x_off = off; k.x_sz = size; mouse_id = id; }
+                            else if (u == 0x31) { k.y_off = off; k.y_sz = size; }
+                            else if (u == 0x38) { k.w_off = off; k.w_sz = size; }
+                        }
+                    }
+                }
+                pos += count * size;
+            }
+            nusages = 0; umin = umax = -1;                 // locals end with each main item
+        }
+    }
+    if (k.x_off < 0 || k.y_off < 0) return false;
+    k.rid = mouse_id > 0 ? mouse_id : 0;
+    if (k.b_off < 0) k.b_n = 0;
+    return true;
+}
+
 // ---------------------------------------------------------------- enumeration
 static bool reset_port(int port) {
     uint32_t sc = portsc(port);
@@ -288,81 +410,22 @@ static bool reset_port(int port) {
     return portsc(port) & PORT_PED;
 }
 
-static void setup_port(int port) {
-    for (auto& k : kbds) if (k.active && k.port == port) return;
-    Keyboard* kp = nullptr;
-    for (auto& k : kbds) if (!k.active) { kp = &k; break; }
-    if (!kp) return;
-    Keyboard& k = *kp;
-    memset((void*)&k, 0, sizeof(k));
-    if (!reset_port(port)) return;
-    k.port = port;
-    k.speed = (portsc(port) >> 10) & 0xF;               // 1 FS, 2 LS, 3 HS, 4+ SS
+static const char* speed_name(int s) { return s == 2 ? "low" : s == 1 ? "full" : s == 3 ? "high" : "super"; }
 
-    Trb ev;
-    if (command(0, 0, 0, TRB_ENABLE_SLOT << 10, &ev) != 1) { printf("USB: port %d: no slot\n", port); return; }
-    k.slot = ev.d3 >> 24;
-    if (k.slot < 1 || k.slot > max_slots) return;
+// The slot context's words 0-2: speed, route, root port, transaction
+// translator and, for a hub, its port count. `entries` is the last
+// endpoint context in use.
+static void fill_slot(const Keyboard& k, int entries) {
+    volatile uint32_t* sl = ctx(k.in_ctx, 1);
+    sl[0] = (k.route & 0xFFFFF) | (uint32_t)k.speed << 20 | (uint32_t)entries << 27 |
+            (k.kind == HUB ? 1u << 26 : 0);
+    sl[1] = (uint32_t)k.port << 16 | (k.kind == HUB ? (uint32_t)k.nports << 24 : 0);
+    sl[2] = (uint32_t)k.tt_slot | (uint32_t)k.tt_port << 8 | (k.kind == HUB ? (uint32_t)k.ttt << 16 : 0);
+    sl[3] = 0;
+}
 
-    k.out_ctx = (volatile uint8_t*)dma_alloc(32 * csz, 64);
-    k.in_ctx  = (volatile uint8_t*)dma_alloc(33 * csz, 64);
-    k.reports = (volatile uint8_t*)dma_alloc(RING_TRBS * 8, 64);
-    if (!k.out_ctx || !k.in_ctx || !k.reports || !ring_init(k.ep0) || !ring_init(k.intr)) return;
-    dcbaa[k.slot] = phys(k.out_ctx);
-
-    // Address Device: slot context + endpoint 0.
-    int mps0 = k.speed == 2 || k.speed == 1 ? 8 : k.speed == 3 ? 64 : 512;
-    ctx(k.in_ctx, 0)[1] = 0x3;                          // add slot + EP0
-    volatile uint32_t* slot = ctx(k.in_ctx, 1);
-    slot[0] = (uint32_t)k.speed << 20 | 1u << 27;
-    slot[1] = (uint32_t)port << 16;
-    volatile uint32_t* ep0 = ctx(k.in_ctx, 2);
-    ep0[1] = 3 << 1 | 4 << 3 | (uint32_t)mps0 << 16;    // CErr 3, control, max packet
-    uint64_t r0 = phys(k.ep0.trb) | 1;
-    ep0[2] = (uint32_t)r0; ep0[3] = (uint32_t)(r0 >> 32);
-    ep0[4] = 8;
-    uint64_t ic = phys(k.in_ctx);
-    int cc = command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_ADDRESS_DEVICE << 10 | (uint32_t)k.slot << 24, nullptr);
-    if (cc != 1) { printf("USB: port %d: address failed (%d)\n", port, cc); return; }
-    delay_ms(2);
-
-    static volatile uint8_t desc[256] __attribute__((aligned(64)));
-    if (!control(k, 0x80, 6, 0x0100, 0, 8, desc)) { printf("USB: port %d: no descriptor\n", port); return; }
-    int mps = desc[7];
-    if (mps && mps != mps0 && k.speed < 4) {            // fix EP0 max packet size
-        memset((void*)ctx(k.in_ctx, 0), 0, csz);
-        ctx(k.in_ctx, 0)[1] = 0x2;
-        ep0[1] = (ep0[1] & 0xFFFF) | (uint32_t)mps << 16;
-        command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_EVALUATE_CTX << 10 | (uint32_t)k.slot << 24, nullptr);
-    }
-    if (!control(k, 0x80, 6, 0x0200, 0, 9, desc)) return;
-    int total = desc[2] | desc[3] << 8;
-    if (total > (int)sizeof(desc)) total = sizeof(desc);
-    if (!control(k, 0x80, 6, 0x0200, 0, total, desc)) return;
-    int config = desc[5];
-
-    // Find a boot keyboard interface and its interrupt IN endpoint.
-    int iface = -1, ep_addr = 0, ep_mps = 8, ep_interval = 10;
-    bool in_kbd = false, is_mouse = false;
-    for (int i = 0; i + 1 < total && desc[i] >= 2; i += desc[i]) {
-        uint8_t type = desc[i + 1];
-        if (type == 4) {
-            // HID boot interface: protocol 1 = keyboard, 2 = mouse.
-            in_kbd = iface < 0 && desc[i + 5] == 3 && desc[i + 6] == 1 && (desc[i + 7] == 1 || desc[i + 7] == 2);
-            if (in_kbd) { iface = desc[i + 2]; is_mouse = desc[i + 7] == 2; }
-        } else if (type == 5 && in_kbd && !ep_addr && (desc[i + 2] & 0x80) && (desc[i + 3] & 3) == 3) {
-            ep_addr = desc[i + 2];
-            ep_mps = (desc[i + 4] | desc[i + 5] << 8) & 0x7FF;
-            ep_interval = desc[i + 6];
-        }
-    }
-    if (iface < 0 || !ep_addr) { printf("USB: port %d: not a keyboard or mouse\n", port); return; }
-
-    if (!control(k, 0x00, 9, config, 0, 0, nullptr)) return;          // SET_CONFIGURATION
-    control(k, 0x21, 0x0B, 0, iface, 0, nullptr);                      // SET_PROTOCOL boot
-    control(k, 0x21, 0x0A, 0, iface, 0, nullptr);                      // SET_IDLE (may stall)
-
-    // Configure the interrupt IN endpoint.
+// Interrupt IN endpoint `ep_addr` as the device's report/status ring.
+static bool configure_intr(Keyboard& k, int ep_addr, int ep_mps, int ep_interval, int entries = 0) {
     k.dci = (ep_addr & 0xF) * 2 + 1;
     k.mps = ep_mps;
     int interval;
@@ -375,24 +438,250 @@ static void setup_port(int port) {
     }
     memset((void*)k.in_ctx, 0, 33 * csz);
     ctx(k.in_ctx, 0)[1] = 1 | 1u << k.dci;
-    slot = ctx(k.in_ctx, 1);
-    slot[0] = (uint32_t)k.speed << 20 | (uint32_t)k.dci << 27;
-    slot[1] = (uint32_t)port << 16;
+    fill_slot(k, entries > k.dci ? entries : k.dci);
     volatile uint32_t* ep = ctx(k.in_ctx, 1 + k.dci);
     ep[0] = (uint32_t)interval << 16;
     ep[1] = 3 << 1 | 7 << 3 | (uint32_t)ep_mps << 16;  // CErr 3, interrupt IN
     uint64_t ri = phys(k.intr.trb) | 1;
     ep[2] = (uint32_t)ri; ep[3] = (uint32_t)(ri >> 32);
     ep[4] = 8 | (uint32_t)ep_mps << 16;
-    cc = command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_CONFIGURE_EP << 10 | (uint32_t)k.slot << 24, nullptr);
-    if (cc != 1) { printf("USB: port %d: configure failed (%d)\n", port, cc); return; }
+    uint64_t ic = phys(k.in_ctx);
+    int cc = command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_CONFIGURE_EP << 10 | (uint32_t)k.slot << 24, nullptr);
+    if (cc != 1) { printf("USB: %s: configure failed (%d)\n", k.where, cc); return false; }
+    return true;
+}
 
-    k.mouse = is_mouse;
-    k.active = true;
-    for (int i = 0; i < 8; i++) queue_report(k);
-    db[k.slot] = k.dci;
-    printf("USB: %s on port %d (slot %d, %s speed)\n", k.mouse ? "mouse" : "keyboard", port, k.slot,
-           k.speed == 2 ? "low" : k.speed == 1 ? "full" : k.speed == 3 ? "high" : "super");
+static void hub_port_change(int h, int port);
+static void forget(int i);
+
+// A device that's just been reset and enabled, wherever it is: give it a
+// slot and an address, and set it up as a keyboard, mouse or hub.
+static void setup_device(int root_port, int parent, int hub_port, int speed) {
+    for (auto& k : kbds)                               // already there?
+        if (k.active && k.port == root_port && k.parent == parent && (parent < 0 || k.hub_port == hub_port)) return;
+    int ki = -1;
+    for (int i = 0; i < MAX_KBD; i++) if (!kbds[i].active) { ki = i; break; }
+    if (ki < 0) { printf("USB: too many devices\n"); return; }
+    Keyboard& k = kbds[ki];
+    memset((void*)&k, 0, sizeof(k));
+    k.port = root_port;
+    k.parent = parent;
+    k.hub_port = hub_port;
+    k.speed = speed;
+    if (parent < 0) {
+        snprintf(k.where, sizeof k.where, "port %d", root_port);
+    } else {
+        const Keyboard& h = kbds[parent];
+        k.depth = h.depth + 1;
+        k.route = h.route | (uint32_t)(hub_port > 15 ? 15 : hub_port) << (4 * h.depth);
+        snprintf(k.where, sizeof k.where, "%s.%d", h.where, hub_port);
+        if (speed == 1 || speed == 2) {                 // low/full speed: through a translator
+            if (h.speed == 3) { k.tt_slot = h.slot; k.tt_port = hub_port; }
+            else { k.tt_slot = h.tt_slot; k.tt_port = h.tt_port; }
+        }
+    }
+
+    Trb ev;
+    if (command(0, 0, 0, TRB_ENABLE_SLOT << 10, &ev) != 1) { printf("USB: %s: no slot\n", k.where); return; }
+    k.slot = ev.d3 >> 24;
+    if (k.slot < 1 || k.slot > max_slots) return;
+
+    k.out_ctx = (volatile uint8_t*)dma_alloc(32 * csz, 64);
+    k.in_ctx  = (volatile uint8_t*)dma_alloc(33 * csz, 64);
+    k.reports = (volatile uint8_t*)dma_alloc(RING_TRBS * REPORT_BYTES, 64);
+    if (!k.out_ctx || !k.in_ctx || !k.reports || !ring_init(k.ep0) || !ring_init(k.intr)) return;
+    dcbaa[k.slot] = phys(k.out_ctx);
+
+    // Address Device: slot context + endpoint 0.
+    int mps0 = k.speed == 2 || k.speed == 1 ? 8 : k.speed == 3 ? 64 : 512;
+    ctx(k.in_ctx, 0)[1] = 0x3;                          // add slot + EP0
+    fill_slot(k, 1);
+    volatile uint32_t* ep0 = ctx(k.in_ctx, 2);
+    ep0[1] = 3 << 1 | 4 << 3 | (uint32_t)mps0 << 16;    // CErr 3, control, max packet
+    uint64_t r0 = phys(k.ep0.trb) | 1;
+    ep0[2] = (uint32_t)r0; ep0[3] = (uint32_t)(r0 >> 32);
+    ep0[4] = 8;
+    uint64_t ic = phys(k.in_ctx);
+    int cc = command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_ADDRESS_DEVICE << 10 | (uint32_t)k.slot << 24, nullptr);
+    if (cc != 1) { printf("USB: %s: address failed (%d)\n", k.where, cc); return; }
+    delay_ms(2);
+
+    static volatile uint8_t desc[256] __attribute__((aligned(64)));
+    if (!control(k, 0x80, 6, 0x0100, 0, 8, desc)) { printf("USB: %s: no descriptor\n", k.where); return; }
+    int mps = desc[7];
+    bool hub = desc[4] == 9;                            // device class: hub
+    if (mps && mps != mps0 && k.speed < 4) {            // fix EP0 max packet size
+        memset((void*)ctx(k.in_ctx, 0), 0, csz);
+        ctx(k.in_ctx, 0)[1] = 0x2;
+        ep0[1] = (ep0[1] & 0xFFFF) | (uint32_t)mps << 16;
+        command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_EVALUATE_CTX << 10 | (uint32_t)k.slot << 24, nullptr);
+    }
+    if (!control(k, 0x80, 6, 0x0200, 0, 9, desc)) return;
+    int total = desc[2] | desc[3] << 8;
+    if (total > (int)sizeof(desc)) total = sizeof(desc);
+    if (!control(k, 0x80, 6, 0x0200, 0, total, desc)) return;
+    int config = desc[5];
+
+    // Every boot keyboard and mouse interface (one receiver can be both, as
+    // can a keyboard with a touchpad), or a hub's, each with its interrupt
+    // IN endpoint.
+    struct Iface { int num, ep_addr, ep_mps, ep_interval; bool mouse; int rdesc_len; };
+    Iface found[4];
+    int nfound = 0;
+    bool in_iface = false;
+    for (int i = 0; i + 1 < total && desc[i] >= 2; i += desc[i]) {
+        uint8_t type = desc[i + 1];
+        if (type == 4) {
+            if (desc[i + 3] != 0) { in_iface = false; continue; }   // alternate settings: the first will do
+            if (hub) in_iface = nfound == 0 && desc[i + 5] == 9;
+            // HID boot interface: protocol 1 = keyboard, 2 = mouse.
+            else in_iface = nfound < 4 && desc[i + 5] == 3 && desc[i + 6] == 1 && (desc[i + 7] == 1 || desc[i + 7] == 2);
+            if (in_iface) found[nfound++] = {desc[i + 2], 0, 8, 10, !hub && desc[i + 7] == 2, 0};
+        } else if (type == 0x21 && in_iface && desc[i] >= 9 && desc[i + 6] == 0x22) {   // HID: report descriptor size
+            found[nfound - 1].rdesc_len = desc[i + 7] | desc[i + 8] << 8;
+        } else if (type == 5 && in_iface && !found[nfound - 1].ep_addr && (desc[i + 2] & 0x80) && (desc[i + 3] & 3) == 3) {
+            Iface& f = found[nfound - 1];
+            f.ep_addr = desc[i + 2];
+            f.ep_mps = (desc[i + 4] | desc[i + 5] << 8) & 0x7FF;
+            f.ep_interval = desc[i + 6];
+        }
+    }
+    int usable = 0;
+    for (int i = 0; i < nfound; i++) if (found[i].ep_addr) found[usable++] = found[i];
+    nfound = usable;
+    if (!nfound) { printf("USB: %s: not a keyboard, mouse or hub\n", k.where); return; }
+    int iface = found[0].num, ep_addr = found[0].ep_addr, ep_mps = found[0].ep_mps, ep_interval = found[0].ep_interval;
+    if (hub && k.speed >= 4) {                          // a USB 3 hub's SuperSpeed half
+        printf("USB: %s: USB 3 hub (its USB 2 side carries keyboards and mice)\n", k.where);
+        return;
+    }
+    if (hub && k.depth >= 5) { printf("USB: %s: hubs nested too deep\n", k.where); return; }
+
+    if (!control(k, 0x00, 9, config, 0, 0, nullptr)) return;          // SET_CONFIGURATION
+
+    if (hub) {
+        // Hub descriptor: port count, characteristics (TT think time), power-on delay.
+        if (!control(k, 0xA0, 6, 0x2900, 0, 9, desc)) { printf("USB: %s: no hub descriptor\n", k.where); return; }
+        k.kind = HUB;
+        k.nports = desc[2] > 31 ? 31 : desc[2];
+        k.ttt = (desc[3] >> 5) & 3;
+        k.power_good_ms = desc[5] * 2u;
+        if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return;
+        k.active = true;
+        for (int i = 0; i < 8; i++) queue_report(k);
+        db[k.slot] = k.dci;
+        printf("USB: hub on %s (%d ports, %s speed)\n", k.where, k.nports, speed_name(k.speed));
+        for (int p = 1; p <= k.nports; p++) control(k, 0x23, 3, 8, p, 0, nullptr);   // SET_FEATURE PORT_POWER
+        delay_ms((int)k.power_good_ms + 100);           // power good, then connect debounce
+        for (int p = 1; p <= k.nports; p++) hub_port_change(ki, p);
+        return;
+    }
+
+    // One entry per interface; they share the device's slot and contexts,
+    // each with its own endpoint, ring and reports. Endpoint 0 is the first's.
+    int entries = 0;
+    for (int i = 0; i < nfound; i++) {
+        int dci = (found[i].ep_addr & 0xF) * 2 + 1;
+        if (dci > entries) entries = dci;
+    }
+    for (int i = 0; i < nfound; i++) {
+        Keyboard* e = &k;
+        if (i > 0) {
+            int ei = -1;
+            for (int j = 0; j < MAX_KBD; j++) if (!kbds[j].active && &kbds[j] != &k) { ei = j; break; }
+            if (ei < 0) { printf("USB: too many devices\n"); break; }
+            e = &kbds[ei];
+            *e = k;                                         // same device: location, slot, contexts
+            e->active = false;
+            e->reports = (volatile uint8_t*)dma_alloc(RING_TRBS * REPORT_BYTES, 64);
+            if (!e->reports || !ring_init(e->intr)) break;
+            memset(e->prev, 0, sizeof e->prev);
+        }
+        // Mice: report protocol if their report descriptor makes sense (for
+        // the wheel), else boot protocol, as for keyboards.
+        e->rp = false;
+        if (found[i].mouse && found[i].rdesc_len > 0) {
+            static volatile uint8_t rd[512] __attribute__((aligned(64)));
+            int rl = found[i].rdesc_len > 512 ? 512 : found[i].rdesc_len;
+            if (control(k, 0x81, 6, 0x2200, found[i].num, rl, rd) && parse_mouse_report(*e, rd, rl))
+                e->rp = true;
+        }
+        control(k, 0x21, 0x0B, e->rp ? 1 : 0, found[i].num, 0, nullptr);   // SET_PROTOCOL report / boot
+        control(k, 0x21, 0x0A, 0, found[i].num, 0, nullptr);          // SET_IDLE (may stall)
+        if (!configure_intr(*e, found[i].ep_addr, found[i].ep_mps, found[i].ep_interval, entries)) continue;
+        e->kind = found[i].mouse ? MOUSE : KBD;
+        e->mouse = found[i].mouse;
+        e->active = true;
+        for (int r = 0; r < 8; r++) queue_report(*e);
+        db[e->slot] = e->dci;
+        printf("USB: %s on %s (slot %d, %s speed%s%s)\n", e->mouse ? "mouse" : "keyboard", e->where, e->slot,
+               speed_name(e->speed), e->rp ? (e->w_off >= 0 ? ", wheel" : ", no wheel") : "",
+               nfound > 1 ? ", one of several on it" : "");
+    }
+}
+
+// Drop device i and everything plugged into it (if it's a hub).
+static void forget(int i) {
+    Keyboard& k = kbds[i];
+    if (!k.active) return;
+    for (int j = 0; j < MAX_KBD; j++)
+        if (kbds[j].active && kbds[j].parent == i) forget(j);
+    int slot = k.slot;
+    for (int j = 0; j < MAX_KBD; j++) {                   // it and the device's other interfaces
+        Keyboard& o = kbds[j];
+        if (!o.active || o.slot != slot) continue;
+        if (o.kind != HUB) release_all(o);
+        o.active = false;
+        printf("USB: %s on %s unplugged\n", o.kind == HUB ? "hub" : o.mouse ? "mouse" : "keyboard", o.where);
+    }
+    command(0, 0, 0, 10 << 10 | (uint32_t)slot << 24, nullptr);     // disable slot
+}
+
+// Port `port` of hub h: something plugged in or out (or the first look).
+static void hub_port_change(int h, int port) {
+    Keyboard& hb = kbds[h];
+    static volatile uint8_t st[4] __attribute__((aligned(64)));
+    if (!hb.active || !control(hb, 0xA3, 0, 0, port, 4, st)) return;            // GET_STATUS
+    uint16_t status = st[0] | st[1] << 8, change = st[2] | st[3] << 8;
+    static const uint8_t clear[] = {16, 17, 18, 19, 20};                        // C_PORT_* features
+    for (int b = 0; b < 5; b++)
+        if (change & (1 << (b == 4 ? 4 : b))) control(hb, 0x23, 1, clear[b], port, 0, nullptr);
+    int existing = -1;
+    for (int j = 0; j < MAX_KBD; j++)
+        if (kbds[j].active && kbds[j].parent == h && kbds[j].hub_port == port) existing = j;
+    bool connected = status & 1;
+    if (existing >= 0 && (!connected || (change & 1))) { forget(existing); existing = -1; }
+    if (!connected) { hb.fails[port] = 0; return; }
+    if (existing >= 0 || hb.fails[port] >= 3) return;
+    printf("USB: %s.%d: something connected (status %04x)\n", hb.where, port, status);
+    hb.fails[port]++;                                                           // cleared on success
+
+    // Reset the port, wait for it to finish, and see how fast the device is.
+    if (!control(hb, 0x23, 3, 4, port, 0, nullptr)) return;                   // SET_FEATURE PORT_RESET
+    bool done = false;
+    for (int i = 0; i < 50 && !done; i++) {
+        delay_ms(10);
+        if (!control(hb, 0xA3, 0, 0, port, 4, st)) return;
+        done = (st[2] | st[3] << 8) & (1 << 4);                                // C_PORT_RESET
+    }
+    control(hb, 0x23, 1, 20, port, 0, nullptr);                                 // clear C_PORT_RESET
+    status = st[0] | st[1] << 8;
+    if (!done || !(status & 2)) {
+        printf("USB: %s.%d: port didn't enable after reset (status %04x, %s)\n", hb.where, port, status,
+               done ? "reset done" : "reset never finished");
+        return;
+    }
+    delay_ms(10);                                                               // reset recovery
+    int speed = (status & (1 << 9)) ? 2 : (status & (1 << 10)) ? 3 : 1;         // low / high / full
+    setup_device(hb.port, h, port, speed);
+    for (int j = 0; j < MAX_KBD; j++)
+        if (kbds[j].active && kbds[j].parent == h && kbds[j].hub_port == port) hb.fails[port] = 0;
+}
+
+static void setup_port(int port) {
+    for (auto& k : kbds) if (k.active && k.port == port && k.parent < 0) return;
+    if (!reset_port(port)) return;
+    setup_device(port, -1, 0, (portsc(port) >> 10) & 0xF);    // 1 FS, 2 LS, 3 HS, 4+ SS
 }
 
 // ---------------------------------------------------------------- init
@@ -490,8 +779,8 @@ bool usb_init(const char* cmdline) {
     for (int p = 1; p <= num_ports; p++)
         if (portsc(p) & PORT_CCS) setup_port(p);
     int n = 0;
-    for (auto& k : kbds) n += k.active;
-    printf("USB: xHCI with %d ports, %d device%s\n", num_ports, n, n == 1 ? "" : "s");
+    for (auto& k : kbds) n += k.active && k.kind != HUB;
+    printf("USB: xHCI with %d ports, %d keyboard/mouse device%s\n", num_ports, n, n == 1 ? "" : "s");
     return true;
 }
 
@@ -507,13 +796,26 @@ void usb_poll() {
         if (sc & PORT_CCS) {
             if (sc & PORT_CSC || !(sc & PORT_PED)) setup_port(p);
         } else {
-            for (auto& k : kbds)
-                if (k.active && k.port == p) {
-                    release_all(k);
-                    k.active = false;
-                    command(0, 0, 0, 10 << 10 | (uint32_t)k.slot << 24, nullptr);   // disable slot
-                    printf("USB: %s on port %d unplugged\n", k.mouse ? "mouse" : "keyboard", p);
-                }
+            for (int i = 0; i < MAX_KBD; i++)
+                if (kbds[i].active && kbds[i].port == p && kbds[i].parent < 0) forget(i);
+        }
+    }
+    // Once a second, look at every hub port anyway: some hubs are slow to
+    // report a device after their ports are powered, and a missed status
+    // change would leave the keyboard unseen.
+    static uint32_t last_scan;
+    if (ticks - last_scan >= 60) {
+        last_scan = ticks;
+        for (auto& k : kbds)
+            if (k.active && k.kind == HUB)
+                for (int p = 1; p <= k.nports; p++) k.dirty |= 1u << p;
+    }
+    for (int h = 0; h < MAX_KBD; h++) {                 // hubs' ports
+        while (kbds[h].active && kbds[h].kind == HUB && kbds[h].dirty) {
+            uint32_t d = kbds[h].dirty;
+            kbds[h].dirty = 0;
+            for (int p = 1; p <= kbds[h].nports; p++)
+                if (d & (1u << p)) hub_port_change(h, p);
         }
     }
 }
