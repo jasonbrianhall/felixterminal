@@ -31,6 +31,8 @@
 # sound_bm.cpp, libc.cpp, storage.cpp and kernel.cpp stand in for SDL audio,
 # the C library and the operating system. Nothing from libc or libstdc++ is
 # linked.
+# 
+# Version 20261004
 
 ARCH     ?= x86_64
 CXX      ?= g++
