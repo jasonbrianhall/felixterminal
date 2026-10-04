@@ -42,6 +42,19 @@ typedef struct { UINT64 r_offset, r_info; INT64 r_addend; } Elf64_Rela;
 
 static EFI_SYSTEM_TABLE* ST_;
 
+// Our own memset/memcpy rather than gnu-efi's SetMem/CopyMem: gnu-efi 4.x
+// builds those with the Microsoft calling convention (GNU_EFI_USE_MS_ABI)
+// and 3.x with the System V one, and nothing tells us which library we
+// were linked with. Called the wrong way, SetMem zeroes the wrong memory
+// and the loader crashes. Volatile so GCC doesn't turn them back into a
+// call to memset/memcpy.
+static void fill(void* p, UINTN n, UINT8 v) { volatile UINT8* d = p; while (n--) *d++ = v; }
+static void copy(void* to, const void* from, UINTN n) {
+    volatile UINT8* d = to;
+    const UINT8* s = from;
+    while (n--) *d++ = *s++;
+}
+
 static void fail(CHAR16* msg) {
     Print(L"\r\nfelixbasic.efi: %s\r\nPress any key to return.\r\n", msg);
     UINTN idx;
@@ -198,15 +211,22 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     UINTN image_size = kernel_image_end - kernel_image;
     Print(L"  kernel:       %d bytes (%d in memory) at 0x%lx, entry +0x%lx\r\n",
           image_size, (UINTN)KERNEL_MEM_SIZE, (UINT64)(UINTN)kbase, (UINT64)KERNEL_ENTRY);
-    CopyMem(kbase, (void*)kernel_image, image_size);
-    SetMem(kbase + image_size, KERNEL_MEM_SIZE - image_size, 0);
+    copy(kbase, (void*)kernel_image, image_size);
+    fill(kbase + image_size, KERNEL_MEM_SIZE - image_size, 0);
     for (Elf64_Rela* r = (Elf64_Rela*)(kbase + KERNEL_RELA_START); r < (Elf64_Rela*)(kbase + KERNEL_RELA_END); r++) {
-        if ((r->r_info & 0xFFFFFFFF) != 8) { fail(L"unexpected relocation type in kernel"); return EFI_LOAD_ERROR; }
+        UINT32 type = (UINT32)(r->r_info & 0xFFFFFFFF);
+        if (type == 0) continue;                                  // R_X86_64_NONE
+        if (type != 8) {                                          // R_X86_64_RELATIVE is all we can do
+            Print(L"\r\nkernel relocation %d at +0x%lx (symbol %d) isn't R_X86_64_RELATIVE (8).\r\n",
+                  type, r->r_offset, (UINT32)(r->r_info >> 32));
+            fail(L"unexpected relocation type in kernel; rebuild with the current Makefile");
+            return EFI_LOAD_ERROR;
+        }
         *(UINT64*)(kbase + r->r_offset) = (UINT64)(UINTN)kbase + r->r_addend;
     }
 
     // Multiboot-style boot information, in the same page.
-    SetMem(mbi, 4096, 0);
+    fill(mbi, 4096, 0);
     struct MultibootModule* mod = (struct MultibootModule*)((UINT8*)mbi + 512);
     char* cmdline = (char*)mbi + 1024;
     if (disk) {
