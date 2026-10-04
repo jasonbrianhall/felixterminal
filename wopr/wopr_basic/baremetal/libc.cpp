@@ -500,12 +500,13 @@ int vsprintf(char* buf, const char* f, va_list ap) { return vsnprintf(buf, (size
 int sprintf(char* buf, const char* f, ...) {
     va_list ap; va_start(ap, f); int n = vsprintf(buf, f, ap); va_end(ap); return n;
 }
-static void serial_sink(const char* s, size_t n, void*) { while (n--) serial_putc(*s++); }
+extern "C" void klog_add(const char* s, size_t n);   // kernel.cpp: kept for DMESG
+static void serial_sink(const char* s, size_t n, void*) { klog_add(s, n); while (n--) serial_putc(*s++); }
 // printf is the kernel's log: the serial port only (BASIC's own PRINT goes
 // through the display; basic_printf is redirected there).
 int vprintf(const char* f, va_list ap) { Out o{}; o.sink = serial_sink; format(o, f, ap); return (int)o.len; }
 int printf(const char* f, ...) { va_list ap; va_start(ap, f); int n = vprintf(f, ap); va_end(ap); return n; }
-int puts(const char* s) { serial_puts(s); serial_putc('\n'); return 0; }
+int puts(const char* s) { klog_add(s, strlen(s)); klog_add("\n", 1); serial_puts(s); serial_putc('\n'); return 0; }
 
 // ================================================================ stdio
 // A FILE is read whole into memory when opened for input, and written whole

@@ -563,6 +563,26 @@ void SDL_Log(const char* fmt, ...) {
 }
 
 // ---------------------------------------------------------------- console
+// The kernel's own messages (printf: start-up, USB plugging, disk errors)
+// go to the serial port, which a real PC rarely has. They're kept here too,
+// the last 16 KB, for DMESG at the BASIC prompt and the pause boot option.
+static char klog[16384];
+static size_t klog_len;                         // total ever written
+extern "C" void klog_add(const char* s, size_t n) {    // libc.cpp: printf
+    for (size_t i = 0; i < n; i++) klog[klog_len++ % sizeof klog] = s[i];
+}
+// The log, oldest first, as one string (main.cpp: DMESG).
+extern "C" const char* platform_boot_log(void) {
+    static char out[sizeof klog + 1];
+    size_t n = klog_len < sizeof klog ? klog_len : sizeof klog;
+    size_t start = klog_len - n;
+    for (size_t i = 0; i < n; i++) out[i] = klog[(start + i) % sizeof klog];
+    out[n] = 0;
+    char* p = out;
+    if (klog_len > sizeof klog) while (*p && *p != '\n') p++;   // drop a partial first line
+    return *p == '\n' ? p + 1 : p;
+}
+
 // stdout/stderr (error messages, LIST to the screen...) and stdin.
 void console_write(const char* s, size_t n) {
     char buf[256];
@@ -711,6 +731,16 @@ extern "C" void kmain() {
     storage_init(info.flags, info.boot_device, cmdline);
     boot_mark(10);                                      // disks
     printf("Heap after start-up: %lu KB free\n", (unsigned long)(heap_free_bytes() >> 10));
+    // Boot option pause: hold the start-up messages on screen until a key
+    // (they're also kept for DMESG).
+    for (const char* p = cmdline; p && *p; p++)
+        if (!strncmp(p, "pause", 5) && (p == cmdline || p[-1] == ' ')) {
+            StandaloneBasic::display_print((char*)platform_boot_log());
+            StandaloneBasic::display_print((char*)"\nPress a key to start BASIC.");
+            gfx_sdl_render();
+            StandaloneBasic::display_getchar();
+            break;
+        }
 
     static char arg0[] = "basic";
     static char* argv[] = {arg0, nullptr};

@@ -44,6 +44,9 @@ static char *strcasestr(char *haystack, char *needle) {
     volatile sig_atomic_t   BASIC_BREAK_SYM         = 0;
 #endif
 
+#ifdef BASIC_BAREMETAL
+extern "C" const char* platform_boot_log(void);   /* baremetal/kernel.cpp: DMESG */
+#endif
 BASIC_NS_BEGIN
 
 /* Global precision variable */
@@ -411,6 +414,12 @@ return 0;
             clear_program();
             display_print("\nOk\n");
 
+#ifdef BASIC_BAREMETAL
+        } else if (strncasecmp(p,"DMESG",5)==0 && !isalnum((unsigned char)p[5])) {
+            /* The start-up messages (and anything printed since), kept by the kernel. */
+            display_print((char*)platform_boot_log());
+
+#endif
         } else if (strncasecmp(p,"PWD",3)==0 && !isalnum((unsigned char)p[3])) {
             char cwd[DEFAULT_BUFFER];
             if (getcwd(cwd, sizeof cwd)) { char out[DEFAULT_BUFFER+2]; snprintf(out, sizeof out, "%s\n", cwd); display_print(out); }
@@ -661,6 +670,9 @@ return 0;
                 "  RMDIR \"path\"     Remove a directory\n"
                 "\n"
                 "SYSTEM\n"
+#ifdef BASIC_BAREMETAL
+                "  DMESG            Show the start-up messages again\n"
+#endif
                 "  SYSTEM / EXIT / QUIT / BYE   Exit Felix BASIC\n"
             );
 
