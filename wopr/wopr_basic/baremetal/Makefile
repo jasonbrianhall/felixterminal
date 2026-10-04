@@ -211,13 +211,6 @@ felixbasic.efi: efi/loader.c efi/image.S $(EFI_BUILD)/kernel.bin $(EFI_BUILD)/ke
 	objcopy -j .text -j .sdata -j .data -j .rodata -j .dynamic -j .dynsym -j .rel -j .rela \
 	        -j '.rel.*' -j '.rela.*' -j .reloc -O efi-app-x86_64 --subsystem=10 $(EFI_BUILD)/felixbasic.so $@
 
-# The sample programs on a FAT12 image, which felixbasic.efi and the CD
-# load into the RAM disk (changes last until the machine restarts).
-$(DISK_IMG): $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
-	rm -f $@
-	$(MKFS_FAT) -C -F 12 -f 2 -r 224 -n FELIXBASIC $@ 1440 >/dev/null
-	for f in $(TESTS)/*.bas $(TESTS)/*.BAS; do [ -e "$$f" ] && mcopy -i $@ "$$f" ::/ ; done; true
-
 # Secure Boot: sign with your own key (enrolled in db, or as a MOK for shim).
 sign: felixbasic.efi
 	@test -n "$(KEY)" -a -n "$(CERT)" || { echo "usage: make sign KEY=db.key CERT=db.crt"; exit 1; }
@@ -229,6 +222,14 @@ felixbasic.efi run-efi sign:
 endif
 
 # ---------------------------------------------------------------- images
+# The sample programs on a FAT12 image, which felixbasic.efi and the CD
+# load into the RAM disk (changes last until the machine restarts).
+# Outside the x86_64 block: the i386 CD needs it too.
+$(DISK_IMG): $(wildcard $(TESTS)/*.bas $(TESTS)/*.BAS)
+	rm -f $@
+	$(MKFS_FAT) -C -F 12 -f 2 -r 224 -n FELIXBASIC $@ 1440 >/dev/null
+	for f in $(TESTS)/*.bas $(TESTS)/*.BAS; do [ -e "$$f" ] && mcopy -i $@ "$$f" ::/ ; done; true
+
 $(BUILD)/grub.cfg: grub.cfg
 	@mkdir -p $(BUILD)
 	sed 's/@GFXMODE@/$(GFXMODE)/' $< > $@
