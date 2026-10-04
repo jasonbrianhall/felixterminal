@@ -87,9 +87,17 @@ shows while the mouse is in use. `MOUSE.BAS` and `MOUSE33.BAS` on the
 floppy try both ways.
 
 Boot options (on the `multiboot` line in `/boot/grub/grub.cfg`):
-`audio=speaker|hda|ac97|sb|off`, `sb=220,1` (the Sound Blaster's port and
+`audio=speaker|hda|hdmi|analog|ac97|sb|off`, `hda=BB:DD.F` (which HD Audio
+controller, as `lspci` shows it), `sb=220,1` (the Sound Blaster's port and
 8-bit DMA channel, as in `BLASTER=A220 D1`), `floppy=off`, `latency=MS`
-(sound card buffering).
+(sound card buffering). Sound starts on the built-in speakers/headphones
+if there are any, else a monitor's speakers (HDMI/DisplayPort), AC'97, a
+Sound Blaster, or the PC speaker; `audio=hdmi` tries the monitor first.
+**Ctrl+F1** at any time opens a menu of every output found at boot (each
+controller's jacks and HDMI/DisplayPort, with the monitor's name) to
+switch between them; the new one plays a short beep. `pause` holds the start-up messages on
+screen until a key is pressed; `DMESG` at the BASIC prompt shows them again
+any time.
 
 ## How it's put together
 
