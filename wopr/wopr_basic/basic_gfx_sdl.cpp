@@ -1603,55 +1603,41 @@ void gfx_paint(int x, int y, int fill_color, int border_color) {
     Uint32 fill   = color_to_pixel(fill_color);
     Uint32 border = color_to_pixel(border_color);
 
-    /* Border fill: paint all connected pixels that are NOT the border color.
-     * Unlike flood fill, interior pixel colors are irrelevant — only the
-     * border color stops the fill. Seed must not be border or already filled. */
-    if (px_get(x, y) == border || px_get(x, y) == fill) return;
+    /* QuickBASIC PAINT is a border fill: every pixel connected to the seed
+     * that is NOT the border colour gets painted, whatever colour it is now
+     * -- including pixels that already have the fill colour, which must not
+     * act as a wall. Visited pixels are tracked separately so the fill
+     * colour itself never stops or loops the scan. */
+    if (px_get(x, y) == border) return;
 
-    struct Span { int x0, x1, y, dy; };
-    std::vector<Span> stk;
-    stk.push_back({x, x, y,      1});
-    stk.push_back({x, x, y - 1, -1});
+    const int W = s_gfx_w, H = s_gfx_h;
+    std::vector<Uint32> &pg = s_pages[s_apage];
+    std::vector<uint8_t> seen((size_t)W * H, 0);
+    auto open = [&](int px, int py) {
+        size_t i = (size_t)py * W + px;
+        return !seen[i] && pg[i] != border;
+    };
 
+    std::vector<std::pair<int,int>> stk;
+    stk.push_back({x, y});
     while (!stk.empty()) {
-        auto [x0, x1, sy, dy] = stk.back(); stk.pop_back();
-        if (sy < 0 || sy >= s_gfx_h) continue;
+        auto [sx, sy] = stk.back(); stk.pop_back();
+        if (!open(sx, sy)) continue;
 
-        /* Extend left until border */
-        int nx0 = x0;
-        while (nx0 > 0 && px_get(nx0 - 1, sy) != border) nx0--;
-        /* Extend right until border */
-        int nx1 = x1;
-        while (nx1 < s_gfx_w - 1 && px_get(nx1 + 1, sy) != border) nx1++;
-
-        /* Fill the span */
-        for (int i = nx0; i <= nx1; i++)
-            s_pages[s_apage][(size_t)(sy * s_gfx_w + i)] = fill;
-
-        /* Push child spans in forward direction */
-        int ny = sy + dy;
-        if (ny >= 0 && ny < s_gfx_h) {
-            int i = nx0;
-            while (i <= nx1) {
-                while (i <= nx1 && px_get(i, ny) == border) i++;
-                if (i > nx1) break;
-                int js = i;
-                while (i <= nx1 && px_get(i, ny) != border) i++;
-                stk.push_back({js, i - 1, ny, dy});
-            }
+        int x0 = sx, x1 = sx;
+        while (x0 > 0     && open(x0 - 1, sy)) x0--;
+        while (x1 < W - 1 && open(x1 + 1, sy)) x1++;
+        for (int i = x0; i <= x1; i++) {
+            size_t k = (size_t)sy * W + i;
+            pg[k] = fill; seen[k] = 1;
         }
-
-        /* Push spans that extend beyond seed range in reverse direction */
-        ny = sy - dy;
-        if (ny >= 0 && ny < s_gfx_h) {
-            int i = nx0;
-            while (i <= nx1) {
-                while (i <= nx1 && px_get(i, ny) == border) i++;
-                if (i > nx1) break;
-                int js = i;
-                while (i <= nx1 && px_get(i, ny) != border) i++;
-                if (js < x0 || i - 1 > x1)
-                    stk.push_back({js, i - 1, ny, -dy});
+        /* One seed per open run on the rows above and below */
+        for (int ny = sy - 1; ny <= sy + 1; ny += 2) {
+            if (ny < 0 || ny >= H) continue;
+            bool in_run = false;
+            for (int i = x0; i <= x1; i++) {
+                if (open(i, ny)) { if (!in_run) { stk.push_back({i, ny}); in_run = true; } }
+                else in_run = false;
             }
         }
     }

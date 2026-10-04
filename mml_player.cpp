@@ -287,7 +287,8 @@ static std::vector<MmlNote> parse_mml(const char *mml, MmlState &st) {
             if (*p == ',') { p++; p += parse_int(p, &len, st.length); }
             if (*p == '.') { dot = true; p++; }
             MmlNote n;
-            n.freq          = midi > 0 ? midi_to_freq(midi) : 0.f;
+            // N1 = O0 C ... N84 = O6 B, on the same scale as the letters
+            n.freq          = (midi > 0 && midi <= 84) ? midi_to_freq(midi + 35) : 0.f;
             n.samples_total = note_duration(len, dot, st.tempo);
             n.volume        = st.volume / 15.f * 0.8f;
             n.articulation  = st.articulation;
@@ -324,8 +325,8 @@ static std::vector<MmlNote> parse_mml(const char *mml, MmlState &st) {
             if (n_digits > 0 && tmp >= 1 && tmp <= 64) { len = tmp; p += n_digits; }
             if (*p == '.') { dot = true; p++; }
 
-            // MIDI note number: C4 = 60
-            int midi = (st.octave + 1) * 12 + semi;
+            // QBasic pitch: O2 C = middle C (MIDI 60), O2 A = 440 Hz
+            int midi = (st.octave + 3) * 12 + semi;
             if (midi < 0)  midi = 0;
             if (midi > 127) midi = 127;
 

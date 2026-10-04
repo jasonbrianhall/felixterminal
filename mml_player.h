@@ -13,7 +13,7 @@
 //   L n                    Default note length (1,2,4,8,16,32,64)
 //   T n                    Tempo in BPM (32-255, default 120)
 //   V n                    Volume (0-15, default 8)
-//   N n                    Play note by MIDI number (0-84)
+//   N n                    Play note n (1-84 = O0 C .. O6 B, 0 = rest)
 //   MN / ML / MS           Music Normal / Legato / Staccato (articulation)
 //   MB / MF                Music Background / Foreground (ignored — always async)
 //   . after length         Dotted note (x1.5 duration)

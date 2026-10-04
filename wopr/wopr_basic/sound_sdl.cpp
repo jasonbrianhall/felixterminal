@@ -318,8 +318,9 @@ void sound_play(char *mml) {
             if (*p == '.') { ms *= 1.5; p++; }
             int tone_ms = (int)(ms * tone_frac);
             int gap_ms  = (int)(ms * (1.0 - tone_frac));
-            if (n == 0) q_push(0.0, (int)ms, 0);
-            else        q_push(midi_to_freq(n), tone_ms, gap_ms);
+            /* N1 = O0 C, N84 = O6 B: same scale as the letter notes */
+            if (n == 0 || n > 84) q_push(0.0, (int)ms, 0);
+            else                  q_push(midi_to_freq(n + 35), tone_ms, gap_ms);
 
         } else {
             /* Note: A-G with optional sharp/flat and optional length */
@@ -340,8 +341,10 @@ void sound_play(char *mml) {
             double ms = (60000.0 / tempo) * (4.0 / dur);
             if (*p == '.') { ms *= 1.5; p++; }
 
-            /* MIDI note: C4 = MIDI 60 */
-            int midi = (octave + 1) * 12 + semitone;
+            /* QBasic's pitch: O2 C is middle C (MIDI 60) and O2 A is
+             * 440 Hz, the same scale QB64 uses -- so the default O4 is two
+             * octaves above middle C, not at it. */
+            int midi = (octave + 3) * 12 + semitone;
             if (midi < 0)  midi = 0;
             if (midi > 127) midi = 127;
 

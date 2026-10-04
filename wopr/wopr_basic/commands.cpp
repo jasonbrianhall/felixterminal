@@ -905,11 +905,21 @@ static int cmd_width(Interp *ip, char *args) {
     return 0;
 }
 
+/* The colours COLOR last set; what a COLOR statement leaves out stays as it was */
+static int cur_fg = 7, cur_bg = 0;
+
+/* Back to plain white on black with a visible cursor, as QBasic shows the
+ * immediate window after Ctrl+Break: a program stopped mid COLOR 14,14
+ * (Nibbles drawing its snake) mustn't leave the prompt invisible. */
+void basic_reset_text_color(void) {
+    cur_fg = 7; cur_bg = 0;
+    display_color(cur_fg, cur_bg);
+    display_cursor(1);
+}
+
 static int cmd_color(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
-    /* COLOR fg / COLOR , bg: what's left out stays as it was */
-    static int cur_fg = 7, cur_bg = 0;
     mpf_t fg, bg; mpf_init2(fg, g_prec); mpf_init2(bg, g_prec);
     mpf_set_si(fg, cur_fg); mpf_set_si(bg, cur_bg);
     if (!*p) { mpf_clears(fg, bg, NULL); return 0; } /* bare COLOR  no-op */

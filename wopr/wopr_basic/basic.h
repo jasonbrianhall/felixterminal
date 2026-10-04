@@ -188,6 +188,7 @@ Var    *var_get_in(char *name, int scope);
 void    sprite_forget(Var *v);        /* commands.cpp: a variable going away */
 mpf_t  *arr_num_elem(Var *v, int i, int j);
 void    basic_frame_tick(void);       /* present the screen now and then */
+void    basic_reset_text_color(void); /* commands.cpp: COLOR 7,0 + cursor on, after a break */
 int     basic_paced(void);            /* the program is pacing itself with pauses */
 void    var_free_arrays(Var *v);      /* release an array's elements and storage */
 bool    var_alloc_array(Var *v, int total, int is_str);

@@ -252,6 +252,7 @@ static void run_lines(int start_pc, int fresh) {
     // Shared break handling
     if (g_break) {
         g_cont_pc = ip.pc;
+        basic_reset_text_color();
         display_newline();
         display_print("Break\n");
         g_break = 0;

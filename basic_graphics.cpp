@@ -154,29 +154,50 @@ static int canvas_point(int x, int y) {
     return ((int)p[0] << 16) | ((int)p[1] << 8) | p[2];
 }
 
-static void canvas_paint(int x, int y, int fill_color, int border_color) {
-    int target = canvas_point(x, y);
-    if (target < 0) return;
-    float fr, fg, fb; resolve_color(fill_color, &fr, &fg, &fb);
-    int fill_packed = ((int)(fr*255)<<16)|((int)(fg*255)<<8)|(int)(fb*255);
-    if (target == fill_packed) return;
-    int border_packed = -1;
-    if (border_color >= 0) {
-        float br, bg, bb; resolve_color(border_color, &br, &bg, &bb);
-        border_packed = ((int)(br*255)<<16)|((int)(bg*255)<<8)|(int)(bb*255);
-    }
+struct PaintSpan { int x0, x1, y; };
+
+// QuickBASIC PAINT is a border fill: every pixel connected to the seed that
+// is NOT the border colour is painted, whatever colour it is now. Pixels that
+// already have the fill colour (or any other non-border colour) must not act
+// as a wall. Border omitted = the fill colour. Visited pixels are tracked
+// separately so the fill colour never stops or loops the scan. Returns the
+// painted spans so the hardware layer can draw exactly those.
+static std::vector<PaintSpan> canvas_paint(int x, int y, int fill_color, int border_color) {
+    std::vector<PaintSpan> spans;
+    const int W = s_scr_w, H = s_scr_h;
+    if (x < 0 || y < 0 || x >= W || y >= H) return spans;
+    if (border_color < 0) border_color = fill_color;
+    float br, bg, bb; resolve_color(border_color, &br, &bg, &bb);
+    int border_packed = ((int)(br*255)<<16)|((int)(bg*255)<<8)|(int)(bb*255);
+    if (canvas_point(x, y) == border_packed) return spans;
+
+    std::vector<uint8_t> seen((size_t)W * H, 0);
+    auto open = [&](int px, int py) {
+        return !seen[(size_t)py * W + px] && canvas_point(px, py) != border_packed;
+    };
     std::vector<std::pair<int,int>> stk;
     stk.push_back({x, y});
     while (!stk.empty()) {
-        auto [cx, cy] = stk.back(); stk.pop_back();
-        int cv = canvas_point(cx, cy);
-        if (cv < 0 || cv == fill_packed) continue;
-        if (border_packed >= 0 && cv == border_packed) continue;
-        if (cv != target) continue;
-        canvas_pset(cx, cy, fill_color);
-        stk.push_back({cx-1,cy}); stk.push_back({cx+1,cy});
-        stk.push_back({cx,cy-1}); stk.push_back({cx,cy+1});
+        auto [sx, sy] = stk.back(); stk.pop_back();
+        if (!open(sx, sy)) continue;
+        int x0 = sx, x1 = sx;
+        while (x0 > 0     && open(x0 - 1, sy)) x0--;
+        while (x1 < W - 1 && open(x1 + 1, sy)) x1++;
+        for (int i = x0; i <= x1; i++) {
+            seen[(size_t)sy * W + i] = 1;
+            canvas_pset(i, sy, fill_color);
+        }
+        spans.push_back({x0, x1, sy});
+        for (int ny = sy - 1; ny <= sy + 1; ny += 2) {
+            if (ny < 0 || ny >= H) continue;
+            bool in_run = false;
+            for (int i = x0; i <= x1; i++) {
+                if (open(i, ny)) { if (!in_run) { stk.push_back({i, ny}); in_run = true; } }
+                else in_run = false;
+            }
+        }
     }
+    return spans;
 }
 
 // ============================================================================
@@ -538,34 +559,14 @@ static void execute_cmd(const std::vector<std::string> &a) {
     } else if (cmd == "paint") {
         int x=argi(a,1),y=argi(a,2),c=clamp_color(argi(a,3)),bc=a.size()>4?clamp_color(argi(a,4)):-1;
         float r,g,b; resolve_color(c,&r,&g,&b);
-        // Run flood fill on software canvas first
-        canvas_paint(x,y,c,bc);
-        // Hardware: scan canvas rows and emit filled horizontal spans.
-        // We look for runs of the fill color and draw them as rects.
-        float fr=(uint8_t)(r*255), fg_=(uint8_t)(g*255), fb=(uint8_t)(b*255);
-        (void)fr; (void)fg_; (void)fb;
-        uint8_t tr=(uint8_t)(r*255), tg=(uint8_t)(g*255), tb=(uint8_t)(b*255);
-        for (int row = 0; row < s_scr_h; row++) {
-            int col = 0;
-            while (col < s_scr_w) {
-                const uint8_t *p = s_canvas.data() + (row*s_scr_w+col)*4;
-                if (p[0]==tr && p[1]==tg && p[2]==tb) {
-                    int start = col;
-                    while (col < s_scr_w) {
-                        const uint8_t *q = s_canvas.data()+(row*s_scr_w+col)*4;
-                        if (q[0]!=tr||q[1]!=tg||q[2]!=tb) break;
-                        col++;
-                    }
-                    // Draw span [start, col) on this row
-                    float px = basic_x(start, s_win_w);
-                    float py = basic_y(row,   s_win_h);
-                    float pw = basic_sx(col-start, s_win_w);
-                    float ph = basic_sy(1, s_win_h) + 1.f;
-                    draw_rect(px, py, pw, ph, r, g, b, 1.f);
-                } else {
-                    col++;
-                }
-            }
+        // Border fill on the software canvas, then draw exactly the
+        // painted spans on the hardware layer.
+        for (const PaintSpan &sp : canvas_paint(x,y,c,bc)) {
+            float px = basic_x(sp.x0, s_win_w);
+            float py = basic_y(sp.y,  s_win_h);
+            float pw = basic_sx(sp.x1 - sp.x0 + 1, s_win_w);
+            float ph = basic_sy(1, s_win_h) + 1.f;
+            draw_rect(px, py, pw, ph, r, g, b, 1.f);
         }
 
     } else if (cmd == "cls") {

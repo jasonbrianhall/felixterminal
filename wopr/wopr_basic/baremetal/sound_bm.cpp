@@ -89,8 +89,8 @@ void sound_play(char* mml) {
             while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
             double ms = (60000.0 / tempo) * (4.0 / length);
             if (*p == '.') { ms *= 1.5; p++; }
-            if (n == 0) q_push(0.0, (int)ms, 0);
-            else q_push(midi_to_freq(n), (int)(ms * tone_frac), (int)(ms * (1.0 - tone_frac)));
+            if (n == 0 || n > 84) q_push(0.0, (int)ms, 0);   /* N1 = O0 C */
+            else q_push(midi_to_freq(n + 35), (int)(ms * tone_frac), (int)(ms * (1.0 - tone_frac)));
         } else {
             int ni = note_index(cmd);
             if (ni < 0) continue;
@@ -102,7 +102,7 @@ void sound_play(char* mml) {
             if (dur < 1 || dur > 64) dur = length;
             double ms = (60000.0 / tempo) * (4.0 / dur);
             if (*p == '.') { ms *= 1.5; p++; }
-            int midi = (octave + 1) * 12 + semitone;
+            int midi = (octave + 3) * 12 + semitone;   /* QBasic: O2 A = 440 Hz */
             if (midi < 0) midi = 0;
             if (midi > 127) midi = 127;
             int tone_ms = (int)(ms * tone_frac);
