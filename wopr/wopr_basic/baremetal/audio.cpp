@@ -163,7 +163,6 @@ static int route_to_dac(int cad, int nid, int depth) {
     return -1;
 }
 
-static char hda_label[48];        // what the last successful setup plays through
 
 // ---- HDMI / DisplayPort output (the graphics card's or chipset's codec)
 // A digital pin carries sound only when a monitor is attached (presence
@@ -217,44 +216,53 @@ static void hdmi_infoframe(int cad, int pin, bool dp) {
     verb(cad, pin, 0x730, 0);
     verb(cad, pin, 0x732, 0xC0);                              // send it, best effort
 }
-// The first digital pin with a monitor on it: route it from a converter and
-// set the converter to digital. Returns true if one was set up.
-static bool hdmi_setup(int cad, int start, int count, uint8_t stream_tag, uint16_t fmt) {
-    for (int n = start; n < start + count && n < 128; n++) {
-        Widget& w = widgets[n];
-        if (w.type != 4) continue;
-        uint32_t pcaps = param(cad, n, 0x0C);
-        if (!(pcaps & (1 << 4)) || !(pcaps & ((1 << 7) | (1u << 24)))) continue;   // digital output pins only
-        uint32_t cfg = verb(cad, n, 0xF1C, 0);
-        if ((cfg >> 30) == 1) continue;                       // not wired up
-        if (!hdmi_present(cad, n, pcaps)) continue;           // no monitor on it
-        char name[32];
-        int type = hdmi_eld(cad, n, name, sizeof name);
-        bool dp = type == 1 || (type < 0 && !(pcaps & (1 << 7)));
-        verb(cad, n, 0x705, 0);                               // pin to D0
-        int cvt = route_to_dac(cad, n, 0);
-        if (cvt < 0) continue;
-        verb4(cad, cvt, 0x2, fmt);                            // converter format
-        verb(cad, cvt, 0x72D, 1);                             // 2 channels
-        verb(cad, cvt, 0x706, stream_tag << 4);               // stream tag, channel 0
-        verb(cad, cvt, 0x70D, 0x01);                          // digital converter on
-        verb(cad, cvt, 0x705, 0);
-        unmute_out(cad, cvt);
-        verb(cad, n, 0x734, 0x00);                            // channel 0 -> slot 0
-        verb(cad, n, 0x734, 0x11);                            // channel 1 -> slot 1
-        if (w.caps & (1 << 2)) unmute_out(cad, n);
-        verb(cad, n, 0x707, 0x40);                            // pin out enable
-        hdmi_infoframe(cad, n, dp);
-        printf("HDA: codec %d pin %d -> converter %d (%s%s%s%s)\n", cad, n, cvt, dp ? "DisplayPort" : "HDMI",
-               name[0] ? ", \"" : "", name, name[0] ? "\"" : "");
-        snprintf(hda_label, sizeof hda_label, "%s%s%s%s", dp ? "DisplayPort" : "HDMI",
-                 name[0] ? " \"" : "", name, name[0] ? "\"" : "");
-        return true;
-    }
-    return false;
+// What hda_setup_codec does with each audio function group it finds.
+enum HdaMode { HDA_ANALOG, HDA_DIGITAL, HDA_LIST };
+static HdaMode hda_mode;
+static int want_cad, want_pin;                  // HDA_DIGITAL: the pin to play through
+// HDA_LIST results: whether there's an analog output, and every HDMI/DP pin.
+struct HdaPin { uint8_t cad, nid; bool dp, present; char name[32]; };
+static HdaPin list_pins[16];
+static int list_npins;
+static bool list_analog;
+
+static bool is_digital_out(uint32_t pcaps) { return (pcaps & (1 << 4)) && (pcaps & ((1 << 7) | (1u << 24))); }
+static bool is_analog_out(int cad, int n, uint32_t pcaps) {
+    if (!(pcaps & (1 << 4)) || (pcaps & ((1 << 7) | (1u << 24)))) return false;
+    uint32_t cfg = verb(cad, n, 0xF1C, 0);
+    int conn = cfg >> 30, dev = (cfg >> 20) & 0xF;
+    return conn != 1 && (dev == 0x0 || dev == 0x1 || dev == 0x2);   // line out, speaker, HP
 }
 
-static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt, bool digital) {
+// Digital pin n: route it from a converter, switch the converter to digital
+// and tell the monitor (if any) what's coming. Played through whether or not
+// a monitor answers: some only show up once there's a signal.
+static bool hdmi_config_pin(int cad, int n, uint8_t stream_tag, uint16_t fmt) {
+    Widget& w = widgets[n];
+    uint32_t pcaps = param(cad, n, 0x0C);
+    char name[32];
+    int type = hdmi_eld(cad, n, name, sizeof name);
+    bool dp = type == 1 || (type < 0 && !(pcaps & (1 << 7)));
+    verb(cad, n, 0x705, 0);                               // pin to D0
+    int cvt = route_to_dac(cad, n, 0);
+    if (cvt < 0) { printf("HDA: codec %d pin %d: no converter reaches it\n", cad, n); return false; }
+    verb4(cad, cvt, 0x2, fmt);                            // converter format
+    verb(cad, cvt, 0x72D, 1);                             // 2 channels
+    verb(cad, cvt, 0x706, stream_tag << 4);               // stream tag, channel 0
+    verb(cad, cvt, 0x70D, 0x01);                          // digital converter on
+    verb(cad, cvt, 0x705, 0);
+    unmute_out(cad, cvt);
+    verb(cad, n, 0x734, 0x00);                            // channel 0 -> slot 0
+    verb(cad, n, 0x734, 0x11);                            // channel 1 -> slot 1
+    if (w.caps & (1 << 2)) unmute_out(cad, n);
+    verb(cad, n, 0x707, 0x40);                            // pin out enable
+    hdmi_infoframe(cad, n, dp);
+    printf("HDA: codec %d pin %d -> converter %d (%s%s%s%s)\n", cad, n, cvt, dp ? "DisplayPort" : "HDMI",
+           name[0] ? ", \"" : "", name, name[0] ? "\"" : "");
+    return true;
+}
+
+static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt) {
     uint32_t sub = param(cad, 0, 0x04);
     int fg_start = (sub >> 16) & 0xFF, fg_count = sub & 0xFF;
     bool any = false;
@@ -282,22 +290,32 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt, bool digi
             }
         }
 
-        if (digital) {                                        // HDMI / DisplayPort
-            if (hdmi_setup(cad, start, count, stream_tag, fmt)) return true;
+        if (hda_mode == HDA_DIGITAL) {                        // one HDMI / DisplayPort pin
+            if (cad == want_cad && want_pin >= start && want_pin < start + count && widgets[want_pin].type == 4)
+                return hdmi_config_pin(cad, want_pin, stream_tag, fmt);
             continue;
         }
 
-        // Route every connected analog output pin.
         for (int n = start; n < start + count && n < 128; n++) {
             Widget& w = widgets[n];
             if (w.type != 4) continue;                               // pin complex
             uint32_t pcaps = param(cad, n, 0x0C);
-            if (!(pcaps & (1 << 4))) continue;                       // not output capable
-            if (pcaps & ((1 << 7) | (1u << 24))) continue;           // HDMI / DisplayPort: see hdmi_setup
+            if (hda_mode == HDA_LIST) {                              // just note what's there
+                if (is_analog_out(cad, n, pcaps)) list_analog = true;
+                else if (is_digital_out(pcaps) && (verb(cad, n, 0xF1C, 0) >> 30) != 1 &&
+                         list_npins < (int)(sizeof list_pins / sizeof list_pins[0])) {
+                    HdaPin& p = list_pins[list_npins++];
+                    p.cad = (uint8_t)cad; p.nid = (uint8_t)n;
+                    p.present = hdmi_present(cad, n, pcaps);
+                    int type = hdmi_eld(cad, n, p.name, sizeof p.name);
+                    p.dp = type == 1 || (type < 0 && !(pcaps & (1 << 7)));
+                }
+                continue;
+            }
+            // HDA_ANALOG: route every connected analog output pin.
+            if (!is_analog_out(cad, n, pcaps)) continue;
             uint32_t cfg = verb(cad, n, 0xF1C, 0);
-            int conn = cfg >> 30, dev = (cfg >> 20) & 0xF;
-            if (conn == 1) continue;                                 // nothing attached
-            if (dev != 0x0 && dev != 0x1 && dev != 0x2) continue;    // line out, speaker, HP
+            int dev = (cfg >> 20) & 0xF;
             int dac = route_to_dac(cad, n, 0);
             if (dac < 0) continue;
             verb(cad, n, 0x707, dev == 0x2 ? 0xC0 : 0x40);           // out enable (+HP amp)
@@ -308,20 +326,21 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt, bool digi
             verb(cad, dac, 0x705, 0);
             printf("HDA: codec %d pin %d -> DAC %d (%s)\n", cad, n, dac,
                    dev == 0 ? "line out" : dev == 1 ? "speaker" : "headphone");
-            if (!any) snprintf(hda_label, sizeof hda_label, "speakers / headphones");
             any = true;
         }
     }
     return any;
 }
 
-static bool hda_try(const PciDevice& d, bool digital) {
+// Reset controller d and start its command rings. Returns its codecs (a bit
+// each), 0 if it won't come up.
+static uint16_t hda_open(const PciDevice& d) {
     uint32_t id = pci_read(d, 0x00);
     uint16_t vendor = id & 0xFFFF;
     uint32_t bar = pci_read(d, 0x10);
     uint64_t base = bar & 0xFFFFFFF0;
     if ((bar & 0x6) == 0x4) base |= (uint64_t)pci_read(d, 0x14) << 32;
-    if (base == 0 || base >= phys_limit) { printf("HDA: BAR out of reach\n"); return false; }
+    if (base == 0 || base >= phys_limit) { printf("HDA: %02x:%02x.%x: BAR out of reach\n", d.bus, d.dev, d.fn); return 0; }
     hda = (volatile uint8_t*)(uintptr_t)base;
     pci_write(d, 0x04, pci_read(d, 0x04) | 0x06);    // memory + bus master
     // AMD/ATI controllers: have the controller snoop the CPU caches, as
@@ -334,12 +353,12 @@ static bool hda_try(const PciDevice& d, bool digital) {
 
     // Controller reset.
     w32(0x08, r32(0x08) & ~1u);
-    if (!wait_bits32(0x08, 1, 0, 100000)) return false;
+    if (!wait_bits32(0x08, 1, 0, 100000)) return 0;
     w32(0x08, r32(0x08) | 1);
-    if (!wait_bits32(0x08, 1, 1, 100000)) return false;
+    if (!wait_bits32(0x08, 1, 1, 100000)) return 0;
     io_delay(2000);                                   // codecs report in within 521 us
     uint16_t codecs = r16(0x0E);
-    if (!codecs) { printf("HDA: no codecs\n"); return false; }
+    if (!codecs) { printf("HDA: %02x:%02x.%x: no codecs\n", d.bus, d.dev, d.fn); return 0; }
 
     // CORB / RIRB, 256 entries each.
     w8(0x4C, 0); w8(0x5C, 0);                         // stop DMA engines
@@ -362,21 +381,39 @@ static bool hda_try(const PciDevice& d, bool digital) {
     // First output stream: descriptors follow the input streams.
     uint16_t gcap = r16(0x00);
     int iss = (gcap >> 8) & 0xF, oss = (gcap >> 12) & 0xF;
-    if (!oss) { printf("HDA: no output streams\n"); return false; }
+    if (!oss) { printf("HDA: %02x:%02x.%x: no output streams\n", d.bus, d.dev, d.fn); return 0; }
     sd = 0x80 + iss * 0x20;
+    return codecs;
+}
+
+// What controller d can play through: list_analog, list_pins.
+static void hda_list(const PciDevice& d) {
+    list_analog = false;
+    list_npins = 0;
+    uint16_t codecs = hda_open(d);
+    if (!codecs) return;
+    hda_mode = HDA_LIST;
+    for (int cad = 0; cad < 15; cad++)
+        if (codecs & (1 << cad)) hda_setup_codec(cad, 1, 0x0011);
+    w8(0x4C, 0); w8(0x5C, 0);                         // CORB / RIRB stopped
+}
+
+// Start playing through controller d: its analog outputs, or (digital) the
+// HDMI/DP pin want_cad/want_pin.
+static bool hda_try(const PciDevice& d, bool digital) {
+    uint16_t codecs = hda_open(d);
+    if (!codecs) return false;
     const uint8_t tag = 1;
     const uint16_t fmt = 0x0011;                      // 48 kHz, 16-bit, 2 channels
-
+    hda_mode = digital ? HDA_DIGITAL : HDA_ANALOG;
     bool routed = false;
-    for (int cad = 0; cad < 15; cad++)
-        if (codecs & (1 << cad) && !(digital && routed)) routed |= hda_setup_codec(cad, tag, fmt, digital);
+    for (int cad = 0; cad < 15 && !(digital && routed); cad++)
+        if (codecs & (1 << cad)) routed |= hda_setup_codec(cad, tag, fmt);
     if (!routed) {
-        w8(0x4C, 0); w8(0x5C, 0);                     // stop CORB/RIRB: try the next controller
-        printf("HDA: %02x:%02x.%x: no %s\n", d.bus, d.dev, d.fn,
-               digital ? "HDMI/DisplayPort output with a monitor on it" : "analog output");
+        w8(0x4C, 0); w8(0x5C, 0);
+        printf("HDA: %02x:%02x.%x: nothing to play through\n", d.bus, d.dev, d.fn);
         return false;
     }
-    printf("HDA: using %02x:%02x.%x\n", d.bus, d.dev, d.fn);
 
     // Stream reset, then program the BDL over the shared ring.
     w8(sd + 0, r8(sd + 0) | 1);
@@ -590,8 +627,8 @@ static bool arg_is(const char* cmdline, const char* want) {
 // monitor is on it), AC'97, a Sound Blaster, and the PC speaker. One plays
 // at a time; audio_select() switches (the Ctrl+F1 menu, kernel.cpp).
 enum OutKind : uint8_t { OUT_SPEAKER, OUT_HDA_ANALOG, OUT_HDA_DIGITAL, OUT_AC97, OUT_SB };
-struct AudioOut { OutKind kind; PciDevice d; char name[64]; };
-#define MAX_OUTS 12
+struct AudioOut { OutKind kind; PciDevice d; uint8_t cad, pin; bool monitor; char name[64]; };
+#define MAX_OUTS 24
 static AudioOut outs[MAX_OUTS];
 static int nouts, cur_out = -1;
 static int latency_ms;
@@ -606,12 +643,13 @@ static const char* hda_vendor(const PciDevice& d) {
     }
 }
 
-static void add_out(OutKind k, const PciDevice* d, const char* name) {
-    if (nouts >= MAX_OUTS) return;
+static AudioOut* add_out(OutKind k, const PciDevice* d, const char* name) {
+    if (nouts >= MAX_OUTS) return nullptr;
     AudioOut& o = outs[nouts++];
     o.kind = k;
     if (d) o.d = *d;
     snprintf(o.name, sizeof o.name, "%s", name);
+    return &o;
 }
 
 static void stop_current() {
@@ -633,7 +671,9 @@ static bool start_out(int i) {
     bool ok = false;
     switch (o.kind) {
     case OUT_HDA_ANALOG:  ok = hda_try(o.d, false); if (ok) driver = AUDIO_HDA; break;
-    case OUT_HDA_DIGITAL: ok = hda_try(o.d, true);  if (ok) driver = AUDIO_HDA; break;
+    case OUT_HDA_DIGITAL:
+        want_cad = o.cad; want_pin = o.pin;
+        ok = hda_try(o.d, true); if (ok) driver = AUDIO_HDA; break;
     case OUT_AC97:        ok = ac97_init();         if (ok) driver = AUDIO_AC97; break;
     case OUT_SB:          ok = sb_init(boot_cmdline); if (ok) driver = AUDIO_SB; break;
     case OUT_SPEAKER:     ok = true; break;
@@ -692,15 +732,30 @@ AudioDriver audio_init(const char* cmdline) {
             if (v >= 5 && v <= 200) latency_ms = v;
         }
 
-    // Find every output: start each one to see that it works, then stop it.
+    // Find every output. HD Audio: each controller's analog jacks, and every
+    // HDMI/DisplayPort pin with a monitor the codec knows about.
     PciDevice d;
     for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++) {
         char name[64];
-        for (int digital = 0; digital < 2; digital++) {
-            if (!hda_try(d, digital)) continue;
-            hda_stop();
-            snprintf(name, sizeof name, "%s %s (%02x:%02x.%x)", hda_vendor(d), hda_label, d.bus, d.dev, d.fn);
-            add_out(digital ? OUT_HDA_DIGITAL : OUT_HDA_ANALOG, &d, name);
+        hda_list(d);
+        if (list_analog) {
+            snprintf(name, sizeof name, "%s speakers/headphones (%02x:%02x.%x)", hda_vendor(d), d.bus, d.dev, d.fn);
+            add_out(OUT_HDA_ANALOG, &d, name);
+        }
+        for (int p = 0; p < list_npins; p++) {
+            const HdaPin& hp = list_pins[p];
+            printf("HDA: %02x:%02x.%x codec %d pin %d: %s%s%s\n", d.bus, d.dev, d.fn, hp.cad, hp.nid,
+                   hp.present ? "monitor present" : "no monitor seen", hp.name[0] ? ", " : "", hp.name);
+            // Only connectors with a monitor the codec knows about: without a
+            // graphics driver to tell it, it usually doesn't (and nothing
+            // would reach the monitor anyway).
+            if (!hp.present && !hp.name[0]) continue;
+            if (hp.name[0]) snprintf(name, sizeof name, "%s %s %d \"%s\" (%02x:%02x.%x)", hda_vendor(d),
+                                     hp.dp ? "DP" : "HDMI", p + 1, hp.name, d.bus, d.dev, d.fn);
+            else snprintf(name, sizeof name, "%s %s %d%s (%02x:%02x.%x)", hda_vendor(d), hp.dp ? "DP" : "HDMI",
+                          p + 1, hp.present ? "" : ", no monitor seen", d.bus, d.dev, d.fn);
+            AudioOut* o = add_out(OUT_HDA_DIGITAL, &d, name);
+            if (o) { o->cad = hp.cad; o->pin = hp.nid; o->monitor = true; }
         }
     }
     if (ac97_init()) { ac97_stop(); add_out(OUT_AC97, nullptr, "AC'97"); }
@@ -718,9 +773,12 @@ AudioDriver audio_init(const char* cmdline) {
             OutKind kind = order[k];
             bool hda_kind = kind == OUT_HDA_ANALOG || kind == OUT_HDA_DIGITAL;
             if (!any && !(hda_kind && want_hda) && !(kind == OUT_AC97 && want_ac) && !(kind == OUT_SB && want_sb)) continue;
+            for (int pass = 0; pass < 2 && cur_out < 0; pass++)    // digital: monitors that answered first
             for (int i = 0; i < nouts && cur_out < 0; i++) {
                 const AudioOut& o = outs[i];
                 if (o.kind != kind) continue;
+                if (kind == OUT_HDA_DIGITAL && pass == 0 && !o.monitor) continue;
+                if (kind != OUT_HDA_DIGITAL && pass == 1) continue;
                 if (hda_kind && hb >= 0 && (o.d.bus != hb || o.d.dev != hd || o.d.fn != hf)) continue;
                 start_out(i);
             }
@@ -762,12 +820,33 @@ int audio_frames_wanted(int nominal) {
     return m < nominal - lim ? nominal - lim : m > nominal + lim ? nominal + lim : m;
 }
 
+// Volume, 0..100 % (and mute), applied to the samples on their way to the
+// card, so it works the same on every output; the PC speaker can only mute.
+static int volume = 100;
+static bool muted;
+int audio_volume() { return muted ? 0 : volume; }
+int audio_volume_setting() { return volume; }
+bool audio_muted() { return muted; }
+void audio_set_volume(int v) { volume = v < 0 ? 0 : v > 100 ? 100 : v; }
+void audio_set_muted(bool m) { muted = m; }
+
 void audio_submit(const int16_t* samples, int n) {
     if (driver == AUDIO_NONE) return;
-    if (driver == AUDIO_SB) { sb_submit(samples, n); return; }
+    int v = audio_volume();
+    // Perceived loudness is roughly logarithmic: square the setting so the
+    // steps sound even (50 % is about a quarter of the amplitude).
+    int gain = v * v;                                  // 0 .. 10000
+    if (driver == AUDIO_SB) {
+        static int16_t tmp[2048];
+        if (n > 2048) n = 2048;
+        for (int i = 0; i < n; i++) tmp[i] = (int16_t)(samples[i] * gain / 10000);
+        sb_submit(tmp, n);
+        return;
+    }
     for (int i = 0; i < n; i++) {
-        ring[write_pos * 2] = samples[i];
-        ring[write_pos * 2 + 1] = samples[i];
+        int16_t x = (int16_t)(samples[i] * gain / 10000);
+        ring[write_pos * 2] = x;
+        ring[write_pos * 2 + 1] = x;
         write_pos = (write_pos + 1) % RING_FRAMES;
     }
 }

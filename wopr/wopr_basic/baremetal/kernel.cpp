@@ -524,8 +524,9 @@ void platform_poll_input() {
 // ---------------------------------------------------------------- audio menu
 // Ctrl+F1, any time: a box over whatever is on screen listing the audio
 // outputs found at boot. Up/Down (or a digit) and Enter switch, with a
-// short beep through the new one; Esc (or Ctrl+F1 again) leaves it. Drawn
-// straight into the framebuffer; what was under the box is put back.
+// short beep through the new one; Left/Right set the volume and M mutes;
+// Esc (or Ctrl+F1 again) leaves it. Drawn straight into the framebuffer;
+// what was under the box is put back.
 static int menu_scale;
 static void fb_px(uint32_t x, uint32_t y, uint32_t rgb) {
     if (x >= fb_w || y >= fb_h) return;
@@ -557,19 +558,19 @@ static void audio_menu() {
     if (!fb || !video_ready) return;
     menu_open = true;
     menu_key = 0;
-    menu_scale = fb_w >= 1024 && fb_h >= 600 ? 2 : 1;
     int n = audio_output_count(), sel = audio_output_current();
     if (n <= 0) { menu_open = false; return; }
+    menu_scale = fb_w >= 1024 && (uint32_t)(n + 8) * 32 <= fb_h ? 2 : 1;   // big text if it fits
     if (sel < 0) sel = 0;
     const int cw = 8 * menu_scale, ch = 16 * menu_scale;
-    int cols = 28;
+    int cols = 40;
     for (int i = 0; i < n; i++) {
         int l = (int)strlen(audio_output_name(i)) + 6;
         if (l > cols) cols = l;
     }
     int maxcols = (int)fb_w / cw - 2;
     if (cols > maxcols) cols = maxcols;
-    uint32_t bw = (uint32_t)(cols + 2) * cw, bh = (uint32_t)(n + 5) * ch;
+    uint32_t bw = (uint32_t)(cols + 2) * cw, bh = (uint32_t)(n + 8) * ch;
     if (bh > fb_h) bh = fb_h;
     uint32_t bx = (fb_w - bw) / 2, by = (fb_h - bh) / 2;
 
@@ -597,8 +598,16 @@ static void audio_menu() {
                 line[pad] = 0;
                 fb_text(bx + cw, by + (uint32_t)(i + 2) * ch, line, i == sel ? HI_FG : FG, i == sel ? HI_BG : BG, cols);
             }
-            fb_text(bx + cw, by + (uint32_t)(n + 3) * ch,
-                    status[0] ? status : "Up/Down, Enter: switch   Esc: close", status[0] ? FG : DIM, BG, cols);
+            // Volume: a bar of 10 steps.
+            int v = audio_volume_setting();
+            char bar[11];
+            for (int b = 0; b < 10; b++) bar[b] = b < (v + 5) / 10 ? '#' : '-';
+            bar[10] = 0;
+            snprintf(line, sizeof line, " Volume [%s] %3d%%%s", bar, v, audio_muted() ? "  MUTED" : "");
+            fb_text(bx + cw, by + (uint32_t)(n + 3) * ch, line, audio_muted() ? 0xFF5555 : FG, BG, cols);
+            fb_text(bx + cw, by + (uint32_t)(n + 5) * ch,
+                    status[0] ? status : "Up/Down Enter: output  Left/Right: volume", status[0] ? FG : DIM, BG, cols);
+            if (!status[0]) fb_text(bx + cw, by + (uint32_t)(n + 6) * ch, "M: mute  Esc: close", DIM, BG, cols);
         }
         drain_keys();
         int k = menu_key;
@@ -607,6 +616,16 @@ static void audio_menu() {
         if (k == 0x148 || k == 0x48) { sel = (sel + n - 1) % n; status[0] = 0; redraw = true; }      // up
         else if (k == 0x150 || k == 0x50) { sel = (sel + 1) % n; status[0] = 0; redraw = true; }     // down
         else if (k == 0x01 || (k == 0x3B && ctrl)) done = true;                                      // Esc, Ctrl+F1
+        else if (k == 0x14B || k == 0x4B || k == 0x14D || k == 0x4D || k == 0x32) {                 // Left, Right, M
+            if (k == 0x32) audio_set_muted(!audio_muted());
+            else {
+                audio_set_volume(audio_volume_setting() + ((k & 0xFF) == 0x4B ? -10 : 10));
+                audio_set_muted(false);
+            }
+            status[0] = 0;
+            redraw = true;
+            if (!audio_muted()) { player_stop(); player_push(88000, 80, 0); }   // hear the new level
+        }
         else if ((k >= 0x02 && k <= 0x0A) || k == 0x1C || k == 0x11C) {                               // 1-9, Enter
             if (k <= 0x0A) { if (k - 0x02 >= n) continue; sel = k - 0x02; }
             player_hold();

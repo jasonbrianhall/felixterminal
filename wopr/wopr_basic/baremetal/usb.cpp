@@ -15,6 +15,7 @@
 #include "usb.hpp"
 
 void kbd_push(uint8_t b);                 // kernel.cpp: feeds the scancode queue
+extern volatile uint32_t ticks;           // irq.cpp: 60 Hz
 void mouse_push(int dx, int dy, int buttons, int wheel);   // kernel.cpp: relative motion, buttons, wheel
 
 static void io_delay(int n) { while (n--) inb(0x80); }   // ~1 us each
@@ -141,6 +142,7 @@ struct Keyboard {
     // hubs
     int nports, ttt;
     uint32_t dirty;                        // ports with a change waiting (bit n = port n)
+    uint8_t fails[32];                     // failed set-ups per port: stop retrying after a few
     uint32_t power_good_ms;
     char where[24];                        // "port 3" / "port 3.2" for messages
 };
@@ -508,7 +510,10 @@ static void hub_port_change(int h, int port) {
         if (kbds[j].active && kbds[j].parent == h && kbds[j].hub_port == port) existing = j;
     bool connected = status & 1;
     if (existing >= 0 && (!connected || (change & 1))) { forget(existing); existing = -1; }
-    if (!connected || existing >= 0) return;
+    if (!connected) { hb.fails[port] = 0; return; }
+    if (existing >= 0 || hb.fails[port] >= 3) return;
+    printf("USB: %s.%d: something connected (status %04x)\n", hb.where, port, status);
+    hb.fails[port]++;                                                           // cleared on success
 
     // Reset the port, wait for it to finish, and see how fast the device is.
     if (!control(hb, 0x23, 3, 4, port, 0, nullptr)) return;                   // SET_FEATURE PORT_RESET
@@ -520,10 +525,16 @@ static void hub_port_change(int h, int port) {
     }
     control(hb, 0x23, 1, 20, port, 0, nullptr);                                 // clear C_PORT_RESET
     status = st[0] | st[1] << 8;
-    if (!done || !(status & 2)) { printf("USB: %s.%d: port didn't enable\n", hb.where, port); return; }
+    if (!done || !(status & 2)) {
+        printf("USB: %s.%d: port didn't enable after reset (status %04x, %s)\n", hb.where, port, status,
+               done ? "reset done" : "reset never finished");
+        return;
+    }
     delay_ms(10);                                                               // reset recovery
     int speed = (status & (1 << 9)) ? 2 : (status & (1 << 10)) ? 3 : 1;         // low / high / full
     setup_device(hb.port, h, port, speed);
+    for (int j = 0; j < MAX_KBD; j++)
+        if (kbds[j].active && kbds[j].parent == h && kbds[j].hub_port == port) hb.fails[port] = 0;
 }
 
 static void setup_port(int port) {
@@ -647,6 +658,16 @@ void usb_poll() {
             for (int i = 0; i < MAX_KBD; i++)
                 if (kbds[i].active && kbds[i].port == p && kbds[i].parent < 0) forget(i);
         }
+    }
+    // Once a second, look at every hub port anyway: some hubs are slow to
+    // report a device after their ports are powered, and a missed status
+    // change would leave the keyboard unseen.
+    static uint32_t last_scan;
+    if (ticks - last_scan >= 60) {
+        last_scan = ticks;
+        for (auto& k : kbds)
+            if (k.active && k.kind == HUB)
+                for (int p = 1; p <= k.nports; p++) k.dirty |= 1u << p;
     }
     for (int h = 0; h < MAX_KBD; h++) {                 // hubs' ports
         while (kbds[h].active && kbds[h].kind == HUB && kbds[h].dirty) {

@@ -23,3 +23,9 @@ int audio_output_count();
 int audio_output_current();
 const char* audio_output_name(int i);
 bool audio_select(int i);
+// Volume, 0..100 %, and mute (the PC speaker can only mute).
+int audio_volume();                       // what's applied: 0 when muted
+int audio_volume_setting();
+bool audio_muted();
+void audio_set_volume(int v);
+void audio_set_muted(bool m);

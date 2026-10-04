@@ -28,7 +28,7 @@ inline uint32_t irq_save() {
 inline void irq_restore(uint32_t f) { if (f & 0x200) __asm__ volatile("sti" ::: "memory"); }
 
 void speaker(uint32_t centi_hz) {
-    if (!centi_hz) { outb(0x61, inb(0x61) & ~3); return; }
+    if (!centi_hz || !audio_volume()) { outb(0x61, inb(0x61) & ~3); return; }   // silence, or muted
     uint32_t div = (uint32_t)(119318200ull / centi_hz);
     if (div < 1) div = 1;
     if (div > 65535) div = 65535;
