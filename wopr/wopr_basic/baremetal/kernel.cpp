@@ -618,6 +618,33 @@ extern "C" void (*__init_array_start[])(), (*__init_array_end[])();
 extern "C" uint32_t fpu_present;                       // boot32.S
 #endif
 
+// Boot progress: stage n draws blocks 1..n along the bottom of the screen
+// straight into the framebuffer, so a machine that hangs before the BASIC
+// prompt still shows how far it got (the prompt then paints over them).
+// Block 1 is the UEFI loader's (efi/loader.c, same layout and colours).
+// 32-bit RGB framebuffers only: what the UEFI loader always sets up.
+static const MultibootInfo* boot_fb;
+static void boot_mark(int n) {
+    static const uint32_t colour[] = {
+        0xFF0000, 0xFF8000, 0xFFFF00, 0x00FF00, 0x00FFFF,
+        0x0060FF, 0x8000FF, 0xFF00FF, 0xFFFFFF, 0xA0A0A0,
+    };
+    const MultibootInfo* m = boot_fb;
+    if (!m || !(m->flags & (1 << 12)) || m->fb_type != 1 || m->fb_bpp != 32 || m->fb_addr >= phys_limit) return;
+    if (m->fb_height < 40) return;
+    const uint8_t* c = m->fb_color;
+    for (int i = 1; i <= n && i <= 10; i++) {
+        uint32_t x0 = 8 + (uint32_t)(i - 1) * 24, y0 = m->fb_height - 24;
+        if (x0 + 16 > m->fb_width) return;
+        uint32_t rgb = colour[i - 1];
+        uint32_t px = ((rgb >> 16 & 0xFF) << c[0]) | ((rgb >> 8 & 0xFF) << c[2]) | ((rgb & 0xFF) << c[4]);
+        for (uint32_t y = y0; y < y0 + 16; y++) {
+            uint32_t* row = (uint32_t*)(uintptr_t)(m->fb_addr + (uint64_t)y * m->fb_pitch);
+            for (uint32_t x = x0; x < x0 + 16; x++) row[x] = px;
+        }
+    }
+}
+
 extern "C" void kmain() {
     serial_init();
     printf("\nFelix BASIC - bare metal\n");
@@ -625,6 +652,8 @@ extern "C" void kmain() {
     if (mb_magic != 0x2BADB002) { printf("Not booted by a Multiboot loader\n"); return; }
     static MultibootInfo info;
     info = *mbi;
+    boot_fb = &info;
+    boot_mark(2);                                       // kernel started
     static char cmdbuf[512];
     const char* cmdline = nullptr;
     if (info.flags & (1 << 2)) {
@@ -634,8 +663,10 @@ extern "C" void kmain() {
     // The heap before the constructors: the interpreter allocates its
     // variable and program tables in them.
     heap_init(&info);
+    boot_mark(3);                                       // memory
     if (!video_init(&info)) { printf("No usable framebuffer found\n"); return; }
     video_ready = true;
+    boot_mark(4);                                       // video
     // The interpreter's constructors allocate its variable table (MAX_VARS
     // variables; arrays come from the heap at DIM) and don't
     // survive running out: check first, with room for the rest.
@@ -652,6 +683,7 @@ extern "C" void kmain() {
         halt_screen("NOT ENOUGH MEMORY", l2);
     }
     for (auto f = __init_array_start; f != __init_array_end; f++) (*f)();
+    boot_mark(5);                                       // interpreter set up
 
 #ifndef __x86_64__
     if (!fpu_present)                                   // BASIC numbers are doubles
@@ -664,15 +696,20 @@ extern "C" void kmain() {
         if (!strncmp(p, "audio=speaker", 13)) speaker = true;
     AudioDriver drv = speaker ? AUDIO_NONE : audio_init(cmdline);
     player_init(drv != AUDIO_NONE);
+    boot_mark(6);                                       // sound
     printf("Sound: %s\n", drv != AUDIO_NONE ? audio_name() : "PC speaker");
     usb_init(cmdline);
+    boot_mark(7);                                       // USB
     ps2_mouse_init();
+    boot_mark(8);                                       // PS/2 mouse
     interrupts_init();
+    boot_mark(9);                                       // interrupts on
     if ((info.flags & (1 << 3)) && info.mods_count) {   // a disk image (UEFI loader)
         const uint32_t* mod = (const uint32_t*)(uintptr_t)info.mods_addr;
         storage_set_image((const void*)(uintptr_t)mod[0], mod[1] - mod[0]);
     }
     storage_init(info.flags, info.boot_device, cmdline);
+    boot_mark(10);                                      // disks
     printf("Heap after start-up: %lu KB free\n", (unsigned long)(heap_free_bytes() >> 10));
 
     static char arg0[] = "basic";

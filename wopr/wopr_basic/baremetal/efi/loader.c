@@ -8,6 +8,13 @@
 // it's passed along as a module and becomes the RAM disk; booted from the
 // Felix BASIC floppy itself (or that image written to a USB stick), the
 // whole disk is, programs and all.
+//
+// Diagnostics: it reports each step on screen while the firmware console is
+// still there; "debug" in the load options (GRUB: chainloader ... debug)
+// also waits for a key before handing over. From then on, progress is a
+// row of coloured blocks along the bottom of the screen, block 1 drawn here
+// and the rest by the kernel (see boot_mark in kernel.cpp), so a machine
+// that hangs before the BASIC prompt still shows how far it got.
 #include <efi.h>
 #include <efilib.h>
 
@@ -39,6 +46,28 @@ static void fail(CHAR16* msg) {
     Print(L"\r\nfelixbasic.efi: %s\r\nPress any key to return.\r\n", msg);
     UINTN idx;
     uefi_call_wrapper(ST_->BootServices->WaitForEvent, 3, 1, &ST_->ConIn->WaitForKey, &idx);
+}
+
+static void wait_key(void) {
+    UINTN idx;
+    uefi_call_wrapper(ST_->ConIn->Reset, 2, ST_->ConIn, FALSE);
+    uefi_call_wrapper(ST_->BootServices->WaitForEvent, 3, 1, &ST_->ConIn->WaitForKey, &idx);
+}
+
+// Progress block n (1-based) along the bottom of the screen, straight into
+// the framebuffer: usable after ExitBootServices. Same layout and colours
+// as boot_mark in kernel.cpp.
+static void fb_block(EFI_GRAPHICS_OUTPUT_PROTOCOL* gop, int n, UINT32 rgb) {
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* info = gop->Mode->Info;
+    UINT32 w = info->HorizontalResolution, h = info->VerticalResolution, pitch = info->PixelsPerScanLine;
+    UINT32 x0 = 8 + (UINT32)(n - 1) * 24, y0 = h - 24;
+    if (h < 40 || x0 + 16 > w) return;
+    UINT32 r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+    UINT32 px = info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor
+              ? (r << 16) | (g << 8) | b : (b << 16) | (g << 8) | r;
+    UINT32* fb = (UINT32*)(UINTN)gop->Mode->FrameBufferBase;
+    for (UINT32 y = y0; y < y0 + 16; y++)
+        for (UINT32 x = x0; x < x0 + 16; x++) fb[(UINTN)y * pitch + x] = px;
 }
 
 // Allocate pages below 4 GiB (the kernel's DMA structures need 32-bit addresses).
@@ -130,6 +159,15 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     for (UINTN i = 0; i < cut; i++) img_path[i] = self[i] == L'/' ? L'\\' : self[i];
     StrCpy(img_path + cut, L"felixbasic.img");
 
+    // "debug" anywhere in the load options: pause before handing over.
+    int debug = 0;
+    {
+        CHAR16* o = li->LoadOptions;
+        UINTN on = li->LoadOptionsSize / 2;
+        for (UINTN i = 0; o && i + 5 <= on; i++)
+            if (o[i] == L'd' && o[i+1] == L'e' && o[i+2] == L'b' && o[i+3] == L'u' && o[i+4] == L'g') debug = 1;
+    }
+
     UINTN disk_size = 0;
     UINT8* disk = read_file(image, img_path, &disk_size);     // optional
     int from_floppy = 0;
@@ -141,12 +179,25 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = setup_gop();
     if (!gop) { fail(L"no 32-bit graphics mode available"); return EFI_UNSUPPORTED; }
 
+    // (after setup_gop: a mode change clears the screen)
+    Print(L"Felix BASIC UEFI loader\r\n");
+    Print(L"  loaded from:  %s\r\n", self ? self : L"(unknown)");
+    if (!disk)           Print(L"  disk image:   none (no %s, boot disk not a floppy)\r\n", img_path);
+    else if (from_floppy) Print(L"  disk image:   the boot disk itself, %d bytes\r\n", disk_size);
+    else                 Print(L"  disk image:   %s, %d bytes at 0x%lx\r\n", img_path, disk_size, (UINT64)(UINTN)disk);
+    Print(L"  graphics:     %dx%d, %s, framebuffer 0x%lx, %d px/line\r\n",
+          gop->Mode->Info->HorizontalResolution, gop->Mode->Info->VerticalResolution,
+          gop->Mode->Info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor ? L"BGRX" : L"RGBX",
+          (UINT64)gop->Mode->FrameBufferBase, gop->Mode->Info->PixelsPerScanLine);
+
     // Kernel: copy, zero .bss, relocate.
     UINT8* kbase = alloc_low(KERNEL_MEM_SIZE);
     struct MultibootInfo* mbi = alloc_low(4096);
     struct MultibootMmap* mmap = alloc_low(MAX_MMAP * sizeof(struct MultibootMmap));
     if (!kbase || !mbi || !mmap) { fail(L"out of memory below 4 GiB"); return EFI_OUT_OF_RESOURCES; }
     UINTN image_size = kernel_image_end - kernel_image;
+    Print(L"  kernel:       %d bytes (%d in memory) at 0x%lx, entry +0x%lx\r\n",
+          image_size, (UINTN)KERNEL_MEM_SIZE, (UINT64)(UINTN)kbase, (UINT64)KERNEL_ENTRY);
     CopyMem(kbase, (void*)kernel_image, image_size);
     SetMem(kbase + image_size, KERNEL_MEM_SIZE - image_size, 0);
     for (Elf64_Rela* r = (Elf64_Rela*)(kbase + KERNEL_RELA_START); r < (Elf64_Rela*)(kbase + KERNEL_RELA_END); r++) {
@@ -189,26 +240,35 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     mbi->fb_color[2] = 8;             mbi->fb_color[3] = 8;   // green
     mbi->fb_color[4] = bgr ? 0 : 16;  mbi->fb_color[5] = 8;   // blue
 
-    // Leave boot services (retry once if the memory map changed under us).
-    UINTN map_size = 0, key, desc_size;
+    Print(L"  command line: %a\r\n", cmdline);
+    Print(L"Progress blocks along the bottom from here: 1 loader done, 2 kernel started,\r\n"
+          L"3 memory, 4 video, 5 interpreter, 6 sound, 7 USB, 8 mouse, 9 interrupts, 10 disks.\r\n");
+    if (debug) { Print(L"debug: press any key to start the kernel.\r\n"); wait_key(); }
+    Print(L"Leaving boot services...\r\n");
+
+    // Leave boot services. The map buffer is allocated once, with room to
+    // spare, before the first attempt: after a failed ExitBootServices only
+    // GetMemoryMap and ExitBootServices may be called (some firmware hangs
+    // on an AllocatePool there), and nothing may be printed.
+    UINTN map_size = 0, map_cap, key, desc_size;
     UINT32 desc_ver;
-    EFI_MEMORY_DESCRIPTOR* map = NULL;
-    for (int attempt = 0; attempt < 4; attempt++) {
-        map_size = 0;
-        uefi_call_wrapper(st->BootServices->GetMemoryMap, 5, &map_size, NULL, &key, &desc_size, &desc_ver);
-        map_size += 8 * desc_size;
-        if (map) FreePool(map);
-        map = AllocatePool(map_size);
+    uefi_call_wrapper(st->BootServices->GetMemoryMap, 5, &map_size, NULL, &key, &desc_size, &desc_ver);
+    map_cap = map_size + 64 * (desc_size ? desc_size : 48);
+    EFI_MEMORY_DESCRIPTOR* map = AllocatePool(map_cap);
+    if (!map) { fail(L"out of memory for the memory map"); return EFI_OUT_OF_RESOURCES; }
+    for (int attempt = 0; attempt < 8; attempt++) {
+        map_size = map_cap;
         if (EFI_ERROR(uefi_call_wrapper(st->BootServices->GetMemoryMap, 5, &map_size, map, &key, &desc_size, &desc_ver)))
             continue;
         if (!EFI_ERROR(uefi_call_wrapper(st->BootServices->ExitBootServices, 2, image, key)))
             goto exited;
     }
-    fail(L"ExitBootServices failed");
-    return EFI_LOAD_ERROR;
+    fb_block(gop, 1, 0x404040);     // a grey first block: stuck in the firmware
+    for (;;) __asm__ volatile("hlt");
 
 exited:
     __asm__ volatile("cli");
+    fb_block(gop, 1, 0xFF0000);     // 1: out of the firmware
     // Hand the kernel the free RAM as a Multiboot memory map. Only
     // EfiConventionalMemory: boot-services memory still holds the page
     // tables the kernel keeps using, and felixbasic.img sits in loader memory.
