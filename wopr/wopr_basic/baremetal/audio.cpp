@@ -159,7 +159,94 @@ static int route_to_dac(int cad, int nid, int depth) {
     return -1;
 }
 
-static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt) {
+// ---- HDMI / DisplayPort output (the graphics card's or chipset's codec)
+// A digital pin carries sound only when a monitor is attached (presence
+// detect), its converter is switched to digital, and the monitor is told
+// what's coming in an audio InfoFrame. As Linux's generic HDMI codec code.
+static bool hdmi_present(int cad, int pin, uint32_t pcaps) {
+    if (!(pcaps & (1 << 2))) return true;                     // can't tell: assume so
+    if (pcaps & (1 << 1)) { verb(cad, pin, 0x709, 0); io_delay(2000); }   // pin sense trigger
+    return verb(cad, pin, 0xF09, 0) & (1u << 31);
+}
+// The monitor's ELD (from its EDID): connection type and name, for the boot
+// messages. Returns 1 for DisplayPort, 0 for HDMI, -1 if it can't be read.
+static int hdmi_eld(int cad, int pin, char* name, int cap) {
+    name[0] = 0;
+    int size = (int)(verb(cad, pin, 0xF2E, 0x08) & 0xFF);     // ELD buffer size
+    if (size < 20) return -1;
+    uint8_t eld[96];
+    if (size > (int)sizeof eld) size = sizeof eld;
+    for (int i = 0; i < size; i++) {
+        uint32_t r = verb(cad, pin, 0xF2F, i);
+        if (!(r & (1u << 31))) return -1;                     // not valid (yet)
+        eld[i] = r & 0xFF;
+    }
+    int mnl = eld[4] & 0x1F;                                  // monitor name length
+    int n = 0;
+    for (int i = 0; i < mnl && 20 + i < size && n < cap - 1; i++)
+        if (eld[20 + i] >= 32 && eld[20 + i] < 127) name[n++] = (char)eld[20 + i];
+    name[n] = 0;
+    return (eld[5] >> 2) & 3;                                 // conn_type: 0 HDMI, 1 DP
+}
+// Audio InfoFrame (2-channel PCM, "refer to stream header") through the
+// pin's data island packet buffer 0.
+static void hdmi_infoframe(int cad, int pin, bool dp) {
+    uint8_t f[9];
+    int n;
+    if (dp) {
+        const uint8_t d[8] = {0x84, 0x1B, 0x11 << 2, 0x01, 0, 0, 0, 0};   // type, len, ver, CC = 2ch
+        memcpy(f, d, 8); n = 8;
+    } else {
+        const uint8_t h[9] = {0x84, 0x01, 0x0A, 0, 0x01, 0, 0, 0, 0};     // type, ver, len, sum, CC = 2ch
+        memcpy(f, h, 9); n = 9;
+        uint8_t sum = 0;
+        for (int i = 0; i < n; i++) sum += f[i];
+        f[3] = (uint8_t)(0x100 - sum);                        // all bytes sum to 0
+    }
+    verb(cad, pin, 0x730, 0);                                 // DIP index: packet 0, byte 0
+    verb(cad, pin, 0x732, 0x00);                              // stop sending it
+    verb(cad, pin, 0x730, 0);
+    for (int i = 0; i < n; i++) verb(cad, pin, 0x731, f[i]);
+    for (int i = n; i < 32; i++) verb(cad, pin, 0x731, 0);    // clear the rest of the buffer
+    verb(cad, pin, 0x730, 0);
+    verb(cad, pin, 0x732, 0xC0);                              // send it, best effort
+}
+// The first digital pin with a monitor on it: route it from a converter and
+// set the converter to digital. Returns true if one was set up.
+static bool hdmi_setup(int cad, int start, int count, uint8_t stream_tag, uint16_t fmt) {
+    for (int n = start; n < start + count && n < 128; n++) {
+        Widget& w = widgets[n];
+        if (w.type != 4) continue;
+        uint32_t pcaps = param(cad, n, 0x0C);
+        if (!(pcaps & (1 << 4)) || !(pcaps & ((1 << 7) | (1u << 24)))) continue;   // digital output pins only
+        uint32_t cfg = verb(cad, n, 0xF1C, 0);
+        if ((cfg >> 30) == 1) continue;                       // not wired up
+        if (!hdmi_present(cad, n, pcaps)) continue;           // no monitor on it
+        char name[32];
+        int type = hdmi_eld(cad, n, name, sizeof name);
+        bool dp = type == 1 || (type < 0 && !(pcaps & (1 << 7)));
+        verb(cad, n, 0x705, 0);                               // pin to D0
+        int cvt = route_to_dac(cad, n, 0);
+        if (cvt < 0) continue;
+        verb4(cad, cvt, 0x2, fmt);                            // converter format
+        verb(cad, cvt, 0x72D, 1);                             // 2 channels
+        verb(cad, cvt, 0x706, stream_tag << 4);               // stream tag, channel 0
+        verb(cad, cvt, 0x70D, 0x01);                          // digital converter on
+        verb(cad, cvt, 0x705, 0);
+        unmute_out(cad, cvt);
+        verb(cad, n, 0x734, 0x00);                            // channel 0 -> slot 0
+        verb(cad, n, 0x734, 0x11);                            // channel 1 -> slot 1
+        if (w.caps & (1 << 2)) unmute_out(cad, n);
+        verb(cad, n, 0x707, 0x40);                            // pin out enable
+        hdmi_infoframe(cad, n, dp);
+        printf("HDA: codec %d pin %d -> converter %d (%s%s%s%s)\n", cad, n, cvt, dp ? "DisplayPort" : "HDMI",
+               name[0] ? ", \"" : "", name, name[0] ? "\"" : "");
+        return true;
+    }
+    return false;
+}
+
+static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt, bool digital) {
     uint32_t sub = param(cad, 0, 0x04);
     int fg_start = (sub >> 16) & 0xFF, fg_count = sub & 0xFF;
     bool any = false;
@@ -187,12 +274,18 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt) {
             }
         }
 
+        if (digital) {                                        // HDMI / DisplayPort
+            if (hdmi_setup(cad, start, count, stream_tag, fmt)) return true;
+            continue;
+        }
+
         // Route every connected analog output pin.
         for (int n = start; n < start + count && n < 128; n++) {
             Widget& w = widgets[n];
             if (w.type != 4) continue;                               // pin complex
             uint32_t pcaps = param(cad, n, 0x0C);
             if (!(pcaps & (1 << 4))) continue;                       // not output capable
+            if (pcaps & ((1 << 7) | (1u << 24))) continue;           // HDMI / DisplayPort: see hdmi_setup
             uint32_t cfg = verb(cad, n, 0xF1C, 0);
             int conn = cfg >> 30, dev = (cfg >> 20) & 0xF;
             if (conn == 1) continue;                                 // nothing attached
@@ -213,7 +306,7 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt) {
     return any;
 }
 
-static bool hda_try(const PciDevice& d) {
+static bool hda_try(const PciDevice& d, bool digital) {
     uint32_t id = pci_read(d, 0x00);
     uint16_t vendor = id & 0xFFFF;
     uint32_t bar = pci_read(d, 0x10);
@@ -267,10 +360,11 @@ static bool hda_try(const PciDevice& d) {
 
     bool routed = false;
     for (int cad = 0; cad < 15; cad++)
-        if (codecs & (1 << cad)) routed |= hda_setup_codec(cad, tag, fmt);
+        if (codecs & (1 << cad) && !(digital && routed)) routed |= hda_setup_codec(cad, tag, fmt, digital);
     if (!routed) {
         w8(0x4C, 0); w8(0x5C, 0);                     // stop CORB/RIRB: try the next controller
-        printf("HDA: %02x:%02x.%x has no analog output (HDMI only?)\n", d.bus, d.dev, d.fn);
+        printf("HDA: %02x:%02x.%x: no %s\n", d.bus, d.dev, d.fn,
+               digital ? "HDMI/DisplayPort output with a monitor on it" : "analog output");
         return false;
     }
     printf("HDA: using %02x:%02x.%x\n", d.bus, d.dev, d.fn);
@@ -296,12 +390,41 @@ static bool hda_try(const PciDevice& d) {
     return true;
 }
 
-// Graphics cards' HDMI audio shows up as an HD Audio controller too, often
-// before the motherboard's: take the first one with an analog output.
-static bool hda_init() {
+// A machine can have several HD Audio controllers: the motherboard's
+// (speakers, headphones) and graphics cards' (HDMI / DisplayPort to the
+// monitor). By default the first analog output wins and HDMI is the
+// fallback; audio=hdmi turns that round, and hda=BB:DD.F (as lspci shows
+// it) picks the controller.
+static bool hda_init(bool prefer_digital, int only_bus, int only_dev, int only_fn) {
     PciDevice d;
-    for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++)
-        if (hda_try(d)) return true;
+    for (int pass = 0; pass < 2; pass++) {
+        bool digital = (pass == 0) == prefer_digital;
+        for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++) {
+            if (only_bus >= 0 && (d.bus != only_bus || d.dev != only_dev || d.fn != only_fn)) continue;
+            if (hda_try(d, digital)) return true;
+        }
+    }
+    if (only_bus >= 0 && !pci_find_class(0x04, 0x03, -1, &d, 0))
+        printf("HDA: no HD Audio controllers\n");
+    return false;
+}
+
+// hda=BB:DD.F (hex, as lspci prints it). Returns false if absent or malformed.
+static bool hda_address(const char* cmdline, int* bus, int* dev, int* fn) {
+    for (const char* p = cmdline; p && *p; p++) {
+        if (strncmp(p, "hda=", 4) != 0 || (p != cmdline && p[-1] != ' ')) continue;
+        int v[3] = {0, 0, 0}, k = 0;
+        for (const char* q = p + 4; *q && *q != ' ' && k < 3; q++) {
+            char c = *q;
+            if (c == ':' || c == '.') { k++; continue; }
+            int x = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1;
+            if (x < 0) return false;
+            v[k] = v[k] * 16 + x;
+        }
+        if (k != 2) return false;
+        *bus = v[0]; *dev = v[1]; *fn = v[2];
+        return true;
+    }
     return false;
 }
 
@@ -461,13 +584,16 @@ static bool arg_is(const char* cmdline, const char* want) {
 
 AudioDriver audio_init(const char* cmdline) {
     bool want_off = arg_is(cmdline, "off");
-    bool want_hda = arg_is(cmdline, "hda");
+    bool want_hdmi = arg_is(cmdline, "hdmi");
+    bool want_hda = arg_is(cmdline, "hda") || want_hdmi;
     bool want_ac  = arg_is(cmdline, "ac97");
     bool want_sb  = arg_is(cmdline, "sb");
     bool any = !want_hda && !want_ac && !want_sb;
     memset(ring, 0, sizeof(ring));
     if (!want_off) {
-        if ((any || want_hda) && hda_init()) driver = AUDIO_HDA;
+        int hb = -1, hd = 0, hf = 0;
+        if (hda_address(cmdline, &hb, &hd, &hf)) want_hda = true, any = false;
+        if ((any || want_hda) && hda_init(want_hdmi, hb, hd, hf)) driver = AUDIO_HDA;
         else if ((any || want_ac) && ac97_init()) driver = AUDIO_AC97;
         else if ((any || want_sb) && sb_init(cmdline)) driver = AUDIO_SB;
     }
