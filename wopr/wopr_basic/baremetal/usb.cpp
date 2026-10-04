@@ -1,4 +1,5 @@
-// xHCI USB keyboard and mouse driver (polled; every xHCI controller found).
+// xHCI USB keyboard and mouse driver (polled; the first xHCI controller, or
+// those named with usbhc=).
 //
 // Takes the controller from the BIOS, resets it, enumerates keyboards and
 // mice on the root ports and behind USB 2 hubs (hubs in hubs too, and ones
@@ -349,8 +350,19 @@ static int command(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3, Trb* ev) 
 }
 
 // A control transfer on endpoint 0. Returns true on success.
+static bool control_on(Keyboard& k, uint8_t type, uint8_t req, uint16_t value, uint16_t index,
+                       uint16_t len, volatile void* buf);
+// On the device's own controller, whichever is current (and back after).
 static bool control(Keyboard& k, uint8_t type, uint8_t req, uint16_t value, uint16_t index,
                     uint16_t len, volatile void* buf) {
+    int was = cur_hc;
+    select_hc(k.hci);
+    bool ok = control_on(k, type, req, value, index, len, buf);
+    select_hc(was);
+    return ok;
+}
+static bool control_on(Keyboard& k, uint8_t type, uint8_t req, uint16_t value, uint16_t index,
+                       uint16_t len, volatile void* buf) {
     bool in = type & 0x80;
     uint32_t trt = len ? (in ? 3 : 2) : 0;
     ring_push(k.ep0, type | req << 8 | (uint32_t)value << 16, index | (uint32_t)len << 16, 8,
@@ -652,6 +664,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
 static void forget(int i) {
     Keyboard& k = kbds[i];
     if (!k.active) return;
+    int was = cur_hc;
     select_hc(k.hci);
     for (int j = 0; j < MAX_KBD; j++)
         if (kbds[j].active && kbds[j].parent == i) forget(j);
@@ -664,6 +677,7 @@ static void forget(int i) {
         printf("USB: %s on %s unplugged\n", o.kind == HUB ? "hub" : o.mouse ? "mouse" : "keyboard", o.where);
     }
     command(0, 0, 0, 10 << 10 | (uint32_t)slot << 24, nullptr);     // disable slot
+    select_hc(was);
 }
 
 // Port `port` of hub h: something plugged in or out (or the first look).
@@ -813,11 +827,39 @@ static const char* hc_vendor(const PciDevice& d) {
     }
 }
 
+// By default only the first xHCI controller is taken over; the others stay
+// with the firmware, which may be emulating a PS/2 keyboard for what's
+// plugged into them (taking them all over upset some machines).
+// usbhc=BB:DD.F[,BB:DD.F...] picks which controllers instead (as lspci
+// prints them).
+static bool hc_wanted(const char* cmdline, const PciDevice& d) {
+    const char* p = cmdline;
+    for (; p && *p; p++) if (!strncmp(p, "usbhc=", 6) && (p == cmdline || p[-1] == ' ')) break;
+    if (!p || !*p) return nhc == 0;                    // no usbhc=: the first one only
+    p += 6;
+    while (*p && *p != ' ') {
+        int v[3] = {0, 0, 0}, k = 0;
+        for (; *p && *p != ' ' && *p != ','; p++) {
+            char c = *p;
+            if (c == ':' || c == '.') { if (k < 2) k++; continue; }
+            int x = c >= '0' && c <= '9' ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : 0;
+            v[k] = v[k] * 16 + x;
+        }
+        if (v[0] == d.bus && v[1] == d.dev && v[2] == d.fn) return true;
+        if (*p == ',') p++;
+    }
+    return false;
+}
+
 bool usb_init(const char* cmdline) {
     for (const char* p = cmdline; p && *p; p++)
         if (strncmp(p, "usb=off", 7) == 0) { printf("USB: disabled\n"); return false; }
     PciDevice d;
     for (int i = 0; nhc < MAX_HC && pci_find_class(0x0C, 0x03, 0x30, &d, i); i++) {
+        if (!hc_wanted(cmdline, d)) {
+            printf("USB: %02x:%02x.%x (%s): left to the firmware\n", d.bus, d.dev, d.fn, hc_vendor(d));
+            continue;
+        }
         select_hc(nhc);
         memset((void*)hc, 0, sizeof *hc);
         if (!init_controller(d)) { printf("USB: %02x:%02x.%x (%s): not started\n", d.bus, d.dev, d.fn, hc_vendor(d)); continue; }

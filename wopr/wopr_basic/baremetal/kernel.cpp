@@ -872,9 +872,14 @@ extern "C" void kmain() {
     for (const char* p = cmdline; p && *p; p++)
         if (!strncmp(p, "pause", 5) && (p == cmdline || p[-1] == ' ')) {
             StandaloneBasic::display_print((char*)platform_boot_log());
-            StandaloneBasic::display_print((char*)"\nPress a key to start BASIC.");
+            StandaloneBasic::display_print((char*)"\nPress a key to start BASIC (or wait a minute).");
             gfx_sdl_render();
-            StandaloneBasic::display_getchar();
+            // A key, or 60 s: the keyboard may be what isn't working.
+            uint32_t t0 = platform_ms();
+            while (platform_ms() - t0 < 60000) {
+                if (StandaloneBasic::display_inkey()) break;
+                __asm__ volatile("hlt");
+            }
             break;
         }
 

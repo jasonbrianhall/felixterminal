@@ -96,8 +96,11 @@ Sound Blaster, or the PC speaker; `audio=hdmi` tries the monitor first.
 **Ctrl+F1** at any time opens a menu of every output found at boot (each
 controller's jacks and HDMI/DisplayPort, with the monitor's name) to
 switch between them; the new one plays a short beep. `pause` holds the start-up messages on
-screen until a key is pressed; `DMESG` at the BASIC prompt shows them again
-any time.
+screen until a key is pressed (or a minute passes); `DMESG` at the BASIC
+prompt shows them again any time. USB keyboards and mice work on the first USB
+(xHCI) controller found, including behind hubs; the others are left to the
+firmware. `usbhc=BB:DD.F[,BB:DD.F...]` names the controllers to use instead
+(as `lspci` shows them); `usb=off` leaves them all to the firmware.
 
 ## How it's put together
 
