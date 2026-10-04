@@ -15,3 +15,11 @@ uint32_t audio_delay_ms();                          // queued ahead of the speak
 uint32_t audio_underruns();                         // times the card ran out of sound since boot
 constexpr int audio_rate() { return 48000; }
 const char* audio_name();
+
+// The outputs found at boot (speakers/headphones, HDMI/DisplayPort per
+// controller, AC'97, Sound Blaster, PC speaker) and switching between them.
+// Hold the note player (player_hold) while switching.
+int audio_output_count();
+int audio_output_current();
+const char* audio_output_name(int i);
+bool audio_select(int i);

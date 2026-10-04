@@ -12,4 +12,5 @@ bool player_on_card();
 bool player_push(uint32_t centi_hz, uint32_t tone_ms, uint32_t gap_ms);
 bool player_busy();                       // something queued or playing
 void player_stop();                       // silence now, drop the queue
+void player_hold();                       // stop using the card until player_init (switching outputs)
 void player_tick();                       // irq.cpp: every timer interrupt

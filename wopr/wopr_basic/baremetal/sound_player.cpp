@@ -108,6 +108,18 @@ void player_init(bool use_card) {
 }
 bool player_on_card() { return card; }
 
+// Stop calling into the audio driver (and silence the speaker) until the
+// next player_init: for switching audio outputs.
+void player_hold() {
+    uint32_t f = irq_save();
+    ready = false;
+    playing = false;
+    q_head = q_tail;
+    tone_left_us = gap_left_us = 0;
+    speaker(0);
+    irq_restore(f);
+}
+
 bool player_push(uint32_t centi_hz, uint32_t tone_ms, uint32_t gap_ms) {
     uint32_t f = irq_save();
     int next = (q_tail + 1) % QSIZE;

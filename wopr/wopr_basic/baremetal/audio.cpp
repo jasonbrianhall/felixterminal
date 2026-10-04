@@ -73,6 +73,10 @@ static uint32_t ac97_play_pos() {
     return civ * CHUNK_FRAMES + (CHUNK_FRAMES - left);
 }
 
+static void ac97_stop() {
+    if (ac_nabm) outb(ac_nabm + 0x1B, 0x00);         // PCM-out engine stopped
+}
+
 // ================================================================ HD Audio
 // Controller: CORB/RIRB for codec verbs, one output stream whose BDL covers
 // the ring. Codec: walk the audio function group, find every connected
@@ -159,6 +163,8 @@ static int route_to_dac(int cad, int nid, int depth) {
     return -1;
 }
 
+static char hda_label[48];        // what the last successful setup plays through
+
 // ---- HDMI / DisplayPort output (the graphics card's or chipset's codec)
 // A digital pin carries sound only when a monitor is attached (presence
 // detect), its converter is switched to digital, and the monitor is told
@@ -241,6 +247,8 @@ static bool hdmi_setup(int cad, int start, int count, uint8_t stream_tag, uint16
         hdmi_infoframe(cad, n, dp);
         printf("HDA: codec %d pin %d -> converter %d (%s%s%s%s)\n", cad, n, cvt, dp ? "DisplayPort" : "HDMI",
                name[0] ? ", \"" : "", name, name[0] ? "\"" : "");
+        snprintf(hda_label, sizeof hda_label, "%s%s%s%s", dp ? "DisplayPort" : "HDMI",
+                 name[0] ? " \"" : "", name, name[0] ? "\"" : "");
         return true;
     }
     return false;
@@ -300,6 +308,7 @@ static bool hda_setup_codec(int cad, uint8_t stream_tag, uint16_t fmt, bool digi
             verb(cad, dac, 0x705, 0);
             printf("HDA: codec %d pin %d -> DAC %d (%s)\n", cad, n, dac,
                    dev == 0 ? "line out" : dev == 1 ? "speaker" : "headphone");
+            if (!any) snprintf(hda_label, sizeof hda_label, "speakers / headphones");
             any = true;
         }
     }
@@ -390,23 +399,11 @@ static bool hda_try(const PciDevice& d, bool digital) {
     return true;
 }
 
-// A machine can have several HD Audio controllers: the motherboard's
-// (speakers, headphones) and graphics cards' (HDMI / DisplayPort to the
-// monitor). By default the first analog output wins and HDMI is the
-// fallback; audio=hdmi turns that round, and hda=BB:DD.F (as lspci shows
-// it) picks the controller.
-static bool hda_init(bool prefer_digital, int only_bus, int only_dev, int only_fn) {
-    PciDevice d;
-    for (int pass = 0; pass < 2; pass++) {
-        bool digital = (pass == 0) == prefer_digital;
-        for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++) {
-            if (only_bus >= 0 && (d.bus != only_bus || d.dev != only_dev || d.fn != only_fn)) continue;
-            if (hda_try(d, digital)) return true;
-        }
-    }
-    if (only_bus >= 0 && !pci_find_class(0x04, 0x03, -1, &d, 0))
-        printf("HDA: no HD Audio controllers\n");
-    return false;
+static void hda_stop() {
+    if (!hda) return;
+    w8(sd + 0, 0);                                    // stream stopped
+    for (int i = 0; i < 1000 && (r8(sd + 0) & 2); i++) io_delay(1);
+    w8(0x4C, 0); w8(0x5C, 0);                         // CORB / RIRB stopped
 }
 
 // hda=BB:DD.F (hex, as lspci prints it). Returns false if absent or malformed.
@@ -475,6 +472,11 @@ static bool sb_reset() {
 static const uint8_t kDmaAddr[4] = {0x00, 0x02, 0x04, 0x06};
 static const uint8_t kDmaCount[4] = {0x01, 0x03, 0x05, 0x07};
 static const uint8_t kDmaPage[4] = {0x87, 0x83, 0x81, 0x82};
+
+static void sb_stop() {
+    sb_reset();                                       // ends auto-init output, speaker off
+    outb(0x0A, 0x04 | sb_dma);                        // mask its DMA channel
+}
 
 static bool sb_init(const char* cmdline) {
     // sb=220,1  (port, 8-bit DMA channel)
@@ -582,29 +584,104 @@ static bool arg_is(const char* cmdline, const char* want) {
     return false;
 }
 
+// ---------------------------------------------------------------- outputs
+// Every way of making sound this machine has, found once at boot: each HD
+// Audio controller's analog jacks and its HDMI/DisplayPort output (when a
+// monitor is on it), AC'97, a Sound Blaster, and the PC speaker. One plays
+// at a time; audio_select() switches (the Ctrl+F1 menu, kernel.cpp).
+enum OutKind : uint8_t { OUT_SPEAKER, OUT_HDA_ANALOG, OUT_HDA_DIGITAL, OUT_AC97, OUT_SB };
+struct AudioOut { OutKind kind; PciDevice d; char name[64]; };
+#define MAX_OUTS 12
+static AudioOut outs[MAX_OUTS];
+static int nouts, cur_out = -1;
+static int latency_ms;
+static const char* boot_cmdline;                      // for sb= when the Sound Blaster restarts
+
+static const char* hda_vendor(const PciDevice& d) {
+    switch (pci_read(d, 0x00) & 0xFFFF) {
+    case 0x10DE: return "NVIDIA";
+    case 0x1002: case 0x1022: return "AMD";
+    case 0x8086: return "Intel";
+    default: return "HD Audio";
+    }
+}
+
+static void add_out(OutKind k, const PciDevice* d, const char* name) {
+    if (nouts >= MAX_OUTS) return;
+    AudioOut& o = outs[nouts++];
+    o.kind = k;
+    if (d) o.d = *d;
+    snprintf(o.name, sizeof o.name, "%s", name);
+}
+
+static void stop_current() {
+    switch (driver) {
+    case AUDIO_HDA:  hda_stop(); break;
+    case AUDIO_AC97: ac97_stop(); break;
+    case AUDIO_SB:   sb_stop(); break;
+    default: break;
+    }
+    driver = AUDIO_NONE;
+}
+
+// Start output i; the ring starts out silent and the write position a
+// latency ahead of the card.
+static bool start_out(int i) {
+    stop_current();
+    memset(ring, 0, sizeof(ring));
+    const AudioOut& o = outs[i];
+    bool ok = false;
+    switch (o.kind) {
+    case OUT_HDA_ANALOG:  ok = hda_try(o.d, false); if (ok) driver = AUDIO_HDA; break;
+    case OUT_HDA_DIGITAL: ok = hda_try(o.d, true);  if (ok) driver = AUDIO_HDA; break;
+    case OUT_AC97:        ok = ac97_init();         if (ok) driver = AUDIO_AC97; break;
+    case OUT_SB:          ok = sb_init(boot_cmdline); if (ok) driver = AUDIO_SB; break;
+    case OUT_SPEAKER:     ok = true; break;
+    }
+    if (!ok) return false;
+    cur_out = i;
+    if (driver == AUDIO_SB) {
+        sb_ahead = sb_rate * latency_ms / 1000;
+        sb_write = (sb_play_pos() + sb_ahead) % SB_RING;
+    } else if (driver != AUDIO_NONE) {
+        target_ahead = (uint32_t)(kRate * latency_ms / 1000);
+        write_pos = (audio_play_pos() + target_ahead) % RING_FRAMES;
+    }
+    printf("Audio: %s\n", o.name);
+    return true;
+}
+
+int audio_output_count() { return nouts; }
+int audio_output_current() { return cur_out; }
+const char* audio_output_name(int i) { return i >= 0 && i < nouts ? outs[i].name : ""; }
+// Switch to output i (the note player must be held meanwhile: it calls in
+// from the timer interrupt). On failure the previous one is restarted.
+bool audio_select(int i) {
+    if (i < 0 || i >= nouts) return false;
+    int was = cur_out;
+    if (start_out(i)) return true;
+    printf("Audio: couldn't start %s\n", outs[i].name);
+    if (was >= 0) start_out(was);
+    return false;
+}
+
 AudioDriver audio_init(const char* cmdline) {
-    bool want_off = arg_is(cmdline, "off");
+    boot_cmdline = cmdline;
+    bool want_off = arg_is(cmdline, "off") || arg_is(cmdline, "speaker");
     bool want_hdmi = arg_is(cmdline, "hdmi");
-    bool want_hda = arg_is(cmdline, "hda") || want_hdmi;
+    bool want_hda = arg_is(cmdline, "hda") || want_hdmi || arg_is(cmdline, "analog");
     bool want_ac  = arg_is(cmdline, "ac97");
     bool want_sb  = arg_is(cmdline, "sb");
+    int hb = -1, hd = 0, hf = 0;
+    if (hda_address(cmdline, &hb, &hd, &hf)) want_hda = true;
     bool any = !want_hda && !want_ac && !want_sb;
-    memset(ring, 0, sizeof(ring));
-    if (!want_off) {
-        int hb = -1, hd = 0, hf = 0;
-        if (hda_address(cmdline, &hb, &hd, &hf)) want_hda = true, any = false;
-        if ((any || want_hda) && hda_init(want_hdmi, hb, hd, hf)) driver = AUDIO_HDA;
-        else if ((any || want_ac) && ac97_init()) driver = AUDIO_AC97;
-        else if ((any || want_sb) && sb_init(cmdline)) driver = AUDIO_SB;
-    }
-    if (driver == AUDIO_NONE) { printf("Audio: none\n"); return driver; }
 
     // Sound is topped up at 240 Hz (kernel.cpp), so a short cushion is enough:
     // 20 ms. A 386 can spend longer than that on one frame, so it gets 50 ms.
 #ifdef __x86_64__
-    int ms = 20;
+    latency_ms = 20;
 #else
-    int ms = 50;
+    latency_ms = 50;
 #endif
     // Boot option latency=N (milliseconds, 5..200) overrides it: lower if
     // sound feels late, higher if it crackles (the debug heartbeat counts underruns).
@@ -612,17 +689,44 @@ AudioDriver audio_init(const char* cmdline) {
         if (!strncmp(p, "latency=", 8)) {
             int v = 0;
             for (const char* q = p + 8; *q >= '0' && *q <= '9'; q++) v = v * 10 + (*q - '0');
-            if (v >= 5 && v <= 200) ms = v;
+            if (v >= 5 && v <= 200) latency_ms = v;
         }
-    if (driver == AUDIO_SB) {
-        sb_ahead = sb_rate * ms / 1000;
-        sb_write = (sb_play_pos() + sb_ahead) % SB_RING;
-        printf("Audio: %s at %u Hz, %d ms latency\n", audio_name(), (unsigned)sb_rate, ms);
-        return driver;
+
+    // Find every output: start each one to see that it works, then stop it.
+    PciDevice d;
+    for (int i = 0; i < 8 && pci_find_class(0x04, 0x03, -1, &d, i); i++) {
+        char name[64];
+        for (int digital = 0; digital < 2; digital++) {
+            if (!hda_try(d, digital)) continue;
+            hda_stop();
+            snprintf(name, sizeof name, "%s %s (%02x:%02x.%x)", hda_vendor(d), hda_label, d.bus, d.dev, d.fn);
+            add_out(digital ? OUT_HDA_DIGITAL : OUT_HDA_ANALOG, &d, name);
+        }
     }
-    target_ahead = (uint32_t)(kRate * ms / 1000);
-    write_pos = (audio_play_pos() + target_ahead) % RING_FRAMES;
-    printf("Audio: %s at %d Hz, %d ms latency\n", audio_name(), kRate, ms);
+    if (ac97_init()) { ac97_stop(); add_out(OUT_AC97, nullptr, "AC'97"); }
+    if (sb_init(cmdline)) { sb_stop(); add_out(OUT_SB, nullptr, "Sound Blaster"); }
+    add_out(OUT_SPEAKER, nullptr, "PC speaker");
+
+    // The one to start with: what the boot options ask for, else the
+    // built-in speakers/headphones, else a monitor, else AC'97, else a
+    // Sound Blaster, else the PC speaker.
+    static const OutKind analog_first[] = {OUT_HDA_ANALOG, OUT_HDA_DIGITAL, OUT_AC97, OUT_SB};
+    static const OutKind hdmi_first[]   = {OUT_HDA_DIGITAL, OUT_HDA_ANALOG, OUT_AC97, OUT_SB};
+    const OutKind* order = want_hdmi ? hdmi_first : analog_first;
+    if (!want_off)
+        for (int k = 0; k < 4 && cur_out < 0; k++) {
+            OutKind kind = order[k];
+            bool hda_kind = kind == OUT_HDA_ANALOG || kind == OUT_HDA_DIGITAL;
+            if (!any && !(hda_kind && want_hda) && !(kind == OUT_AC97 && want_ac) && !(kind == OUT_SB && want_sb)) continue;
+            for (int i = 0; i < nouts && cur_out < 0; i++) {
+                const AudioOut& o = outs[i];
+                if (o.kind != kind) continue;
+                if (hda_kind && hb >= 0 && (o.d.bus != hb || o.d.dev != hd || o.d.fn != hf)) continue;
+                start_out(i);
+            }
+        }
+    if (cur_out < 0) start_out(nouts - 1);            // the PC speaker
+    printf("Audio: %d output%s; Ctrl+F1 to choose\n", nouts, nouts == 1 ? "" : "s");
     return driver;
 }
 

@@ -357,6 +357,12 @@ void kbd_push(uint8_t b) {
 
 static bool shift_l, shift_r, ctrl, alt, caps, numlock = true;
 
+// Ctrl+F1: the audio output menu (audio_menu, below). While it's open,
+// keys go to it instead of BASIC.
+static volatile bool menu_wanted;
+static bool menu_open;
+static int menu_key;                    // last key pressed in the menu: code | 0x100 if E0
+
 static void key_event(bool ext, uint8_t code, bool down) {
     switch (code) {
     case 0x2A: if (!ext) shift_l = down; return;
@@ -365,6 +371,8 @@ static void key_event(bool ext, uint8_t code, bool down) {
     case 0x38: alt = down; return;
     }
     if (!down) return;
+    if (menu_open) { menu_key = code | (ext ? 0x100 : 0); return; }
+    if (!ext && code == 0x3B && ctrl) { menu_wanted = true; return; }   // Ctrl+F1
     bool shift = shift_l || shift_r;
     if (ext) {
         switch (code) {
@@ -493,7 +501,7 @@ static void poll_ps2_mouse() {
     }
 }
 
-void platform_poll_input() {
+static void drain_keys() {
     usb_poll();
     poll_ps2_mouse();
     static bool ext;
@@ -506,6 +514,118 @@ void platform_poll_input() {
         if (e && ((b & 0x7F) == 0x2A || (b & 0x7F) == 0x36)) continue;   // fake shifts around E0 keys
         key_event(e, b & 0x7F, !(b & 0x80));
     }
+}
+static void audio_menu();
+void platform_poll_input() {
+    drain_keys();
+    if (menu_wanted && !menu_open) { menu_wanted = false; audio_menu(); }
+}
+
+// ---------------------------------------------------------------- audio menu
+// Ctrl+F1, any time: a box over whatever is on screen listing the audio
+// outputs found at boot. Up/Down (or a digit) and Enter switch, with a
+// short beep through the new one; Esc (or Ctrl+F1 again) leaves it. Drawn
+// straight into the framebuffer; what was under the box is put back.
+static int menu_scale;
+static void fb_px(uint32_t x, uint32_t y, uint32_t rgb) {
+    if (x >= fb_w || y >= fb_h) return;
+    uint32_t v = native(rgb);
+    uint8_t* p = fb + y * fb_pitch + x * fb_bytes;
+    switch (fb_bytes) {
+    case 1: *p = (uint8_t)v; break;
+    case 2: *(uint16_t*)p = (uint16_t)v; break;
+    case 3: p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); break;
+    default: *(uint32_t*)p = v; break;
+    }
+}
+static void fb_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb) {
+    for (uint32_t j = 0; j < h; j++)
+        for (uint32_t i = 0; i < w; i++) fb_px(x + i, y + j, rgb);
+}
+static void fb_text(uint32_t x, uint32_t y, const char* t, uint32_t fg, uint32_t bg, int maxc) {
+    int sc = menu_scale;
+    for (int c = 0; t[c] && c < maxc; c++) {
+        char ch = t[c] < 32 || t[c] > 126 ? '?' : t[c];
+        const unsigned char* g = font8x16[ch - 32];
+        for (int r = 0; r < 16; r++)
+            for (int b = 0; b < 8; b++)
+                fb_rect(x + (c * 8 + b) * sc, y + r * sc, sc, sc, (g[r] & (0x80 >> b)) ? fg : bg);
+    }
+}
+
+static void audio_menu() {
+    if (!fb || !video_ready) return;
+    menu_open = true;
+    menu_key = 0;
+    menu_scale = fb_w >= 1024 && fb_h >= 600 ? 2 : 1;
+    int n = audio_output_count(), sel = audio_output_current();
+    if (n <= 0) { menu_open = false; return; }
+    if (sel < 0) sel = 0;
+    const int cw = 8 * menu_scale, ch = 16 * menu_scale;
+    int cols = 28;
+    for (int i = 0; i < n; i++) {
+        int l = (int)strlen(audio_output_name(i)) + 6;
+        if (l > cols) cols = l;
+    }
+    int maxcols = (int)fb_w / cw - 2;
+    if (cols > maxcols) cols = maxcols;
+    uint32_t bw = (uint32_t)(cols + 2) * cw, bh = (uint32_t)(n + 5) * ch;
+    if (bh > fb_h) bh = fb_h;
+    uint32_t bx = (fb_w - bw) / 2, by = (fb_h - bh) / 2;
+
+    // Keep what's under the box.
+    uint8_t* saved = (uint8_t*)malloc((size_t)bw * bh * fb_bytes);
+    if (saved)
+        for (uint32_t j = 0; j < bh; j++)
+            memcpy(saved + (size_t)j * bw * fb_bytes, fb + (by + j) * fb_pitch + bx * fb_bytes, (size_t)bw * fb_bytes);
+
+    const uint32_t BG = 0x0000AA, FG = 0xFFFFFF, HI_BG = 0x00AAAA, HI_FG = 0x000000, DIM = 0xAAAAAA;
+    char line[128], status[96] = "";
+    bool redraw = true, done = false;
+    while (!done) {
+        if (redraw) {
+            redraw = false;
+            int cur = audio_output_current();
+            fb_rect(bx, by, bw, bh, BG);
+            fb_rect(bx + 2, by + 2, bw - 4, 2, FG); fb_rect(bx + 2, by + bh - 4, bw - 4, 2, FG);
+            fb_rect(bx + 2, by + 2, 2, bh - 4, FG); fb_rect(bx + bw - 4, by + 2, 2, bh - 4, FG);
+            fb_text(bx + cw, by + ch / 2, "Audio output", FG, BG, cols);
+            for (int i = 0; i < n; i++) {
+                snprintf(line, sizeof line, " %d %c %s", i + 1 < 10 ? i + 1 : 0, i == cur ? '*' : ' ', audio_output_name(i));
+                int pad = (int)strlen(line);
+                while (pad < cols && pad < (int)sizeof line - 1) line[pad++] = ' ';
+                line[pad] = 0;
+                fb_text(bx + cw, by + (uint32_t)(i + 2) * ch, line, i == sel ? HI_FG : FG, i == sel ? HI_BG : BG, cols);
+            }
+            fb_text(bx + cw, by + (uint32_t)(n + 3) * ch,
+                    status[0] ? status : "Up/Down, Enter: switch   Esc: close", status[0] ? FG : DIM, BG, cols);
+        }
+        drain_keys();
+        int k = menu_key;
+        menu_key = 0;
+        if (!k) { __asm__ volatile("hlt"); continue; }
+        if (k == 0x148 || k == 0x48) { sel = (sel + n - 1) % n; status[0] = 0; redraw = true; }      // up
+        else if (k == 0x150 || k == 0x50) { sel = (sel + 1) % n; status[0] = 0; redraw = true; }     // down
+        else if (k == 0x01 || (k == 0x3B && ctrl)) done = true;                                      // Esc, Ctrl+F1
+        else if ((k >= 0x02 && k <= 0x0A) || k == 0x1C || k == 0x11C) {                               // 1-9, Enter
+            if (k <= 0x0A) { if (k - 0x02 >= n) continue; sel = k - 0x02; }
+            player_hold();
+            bool ok = audio_select(sel);
+            player_init(audio_name()[0] != 'n');                  // "none": the PC speaker
+            player_push(88000, 150, 0);                          // a short A5 through the new output
+            snprintf(status, sizeof status, ok ? "Now: %s" : "Couldn't start %s", audio_output_name(sel));
+            redraw = true;
+        }
+    }
+    if (saved) {
+        for (uint32_t j = 0; j < bh; j++)
+            memcpy(fb + (by + j) * fb_pitch + bx * fb_bytes, saved + (size_t)j * bw * fb_bytes, (size_t)bw * fb_bytes);
+        free(saved);
+    } else {
+        video_invalidate();                                      // no copy: have BASIC repaint
+        gfx_sdl_render();
+    }
+    menu_open = false;
 }
 
 // ---------------------------------------------------------------- time
@@ -711,10 +831,7 @@ extern "C" void kmain() {
                     "This PC has no 387 (or 486DX) floating-point unit.");
 #endif
 
-    bool speaker = false;
-    for (const char* p = cmdline; p && *p; p++)
-        if (!strncmp(p, "audio=speaker", 13)) speaker = true;
-    AudioDriver drv = speaker ? AUDIO_NONE : audio_init(cmdline);
+    AudioDriver drv = audio_init(cmdline);            // audio=speaker: starts on the PC speaker
     player_init(drv != AUDIO_NONE);
     boot_mark(6);                                       // sound
     printf("Sound: %s\n", drv != AUDIO_NONE ? audio_name() : "PC speaker");
