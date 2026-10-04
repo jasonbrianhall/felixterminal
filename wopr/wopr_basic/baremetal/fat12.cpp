@@ -274,6 +274,7 @@ uint8_t lfn_sum(const uint8_t* n) {
 bool dir_lba(uint32_t d, uint32_t k, uint32_t& lba) {
     if (d == 0) { if (k >= v.root_secs) return false; lba = v.root_lba + k; return true; }
     uint32_t c = d;
+    if (k / v.spc > v.nclus) return false;          // longer than the disk: a loop in the FAT
     for (uint32_t i = k / v.spc; i; i--) { c = fat_get(c); if (!valid(c)) return false; }
     lba = clus_lba(c) + k % v.spc;
     return true;

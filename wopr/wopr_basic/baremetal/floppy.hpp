@@ -13,3 +13,4 @@ bool floppy_write_protected();                              // set by the last f
 bool floppy_disk_write_protected();                         // ask the drive (SENSE DRIVE STATUS)
 void floppy_idle();                                         // done for now: motor off soon
 void floppy_poll();                                         // from the main loop: the motor-off timer
+void floppy_set_trace(bool on);                             // print every request (floppy=trace)

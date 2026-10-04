@@ -94,6 +94,7 @@ void storage_init(uint32_t mb_flags, uint32_t boot_device, const char* cmdline) 
     bool off = false;
     for (const char* p = cmdline; p && *p; p++)
         if (!strncmp(p, "floppy=off", 10)) off = true;
+        else if (!strncmp(p, "floppy=trace", 12)) floppy_set_trace(true);
     // Multiboot boot_device: BIOS drive number in the top byte; 0x00 is A:.
     if (!off && (mb_flags & (1 << 1)) && (boot_device >> 24) == 0x00 && floppy_init()) {
         on_floppy = true;

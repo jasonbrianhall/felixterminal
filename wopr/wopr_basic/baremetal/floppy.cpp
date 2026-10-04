@@ -3,8 +3,10 @@
 #include "hw.hpp"
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 extern volatile uint32_t ticks;          // irq.cpp: the PIT at 60 Hz
+void gfx_sdl_render(void);               // basic_gfx_sdl.cpp: show the screen now
 
 namespace {
 
@@ -25,24 +27,87 @@ bool present;
 uint32_t spt = 18, heads = 2, total = 2880;
 uint8_t rate;                // CCR data rate: 0 = 500 kbit/s, 2 = 250, 3 = 1 Mbit/s
 int cur_cyl = -1;
+// Track cache: whole sides of tracks, a few of them, least recently used
+// out. Reading a whole side costs about what one sector does (the wait is
+// for the disk to come round), and FAT work reads the same neighbouring
+// sectors over and over -- DIR looks every file up again, and the root
+// directory straddles two sides.
+struct Side { int c = -1, h = -1; uint32_t used = 0; uint8_t data[36 * 512]; };
+Side sides[4];
+uint32_t use_clock;
+Side* cached(uint32_t c, uint32_t h) {
+    for (Side& sd : sides)
+        if (sd.c == (int)c && sd.h == (int)h) { sd.used = ++use_clock; return &sd; }
+    return nullptr;
+}
+void uncache() { for (Side& sd : sides) sd.c = sd.h = -1; }
 bool motor, wprot;
 uint32_t motor_off_at;       // tick to stop the motor (0: not scheduled)
+bool quiet;                  // probing the data rate: failures are expected
+bool started;                // floppy_init done: the screen can be refreshed
+char why[96];                // what the last failed transfer ran into
+
+bool trace;                  // floppy=trace: report every request
+bool stall_seen;             // the timer stopped: every wait gives up at once
 
 // Milliseconds, in 1/60 s steps.
 uint32_t now() { return ticks * 50 / 3; }
+
+// Every wait below is timed by the timer interrupt. If the timer stops
+// (interrupts left off), a wait would never end and the machine would just
+// hang. The PIT itself keeps counting regardless, wrapping 240 times a
+// second (irq.cpp): two seconds' worth of wraps with no tick, and we say so
+// and give up.
+void report(const char* fmt, ...);
+uintptr_t irq_off();
+void irq_restore(uintptr_t f);
+bool stalled() {
+    static uint32_t last_ticks, wraps;
+    static uint16_t last_cnt;
+    if (stall_seen) return true;
+    if (ticks != last_ticks) { last_ticks = ticks; wraps = 0; return false; }
+    uintptr_t f = irq_off();
+    outb(0x43, 0x00);                                    // latch channel 0
+    uint16_t cnt = inb(0x40);
+    cnt |= (uint16_t)(inb(0x40) << 8);
+    irq_restore(f);
+    if (cnt > last_cnt) wraps++;                         // counted down to the bottom and reloaded
+    last_cnt = cnt;
+    if (wraps < 480) return false;
+    uintptr_t fl;
+    __asm__ volatile("pushf; pop %0" : "=r"(fl));
+    outb(0x20, 0x0A);
+    uint8_t irr = inb(0x20);
+    stall_seen = true;
+    report("Floppy: the timer has stopped (interrupts %s, PIC mask %02X/%02X, IRR %02X)",
+           (fl & 0x200) ? "on" : "off", inb(0x21), inb(0xA1), irr);
+    return true;
+}
+bool waiting(uint32_t t, uint32_t ms) { return now() - t < ms && !stalled(); }
+
 void delay_ms(uint32_t ms) {
     if (ms < 20) { for (uint32_t i = 0; i < ms * 1000; i++) outb(0x80, 0); return; }   // ~1 us each
     uint32_t t = now();
-    while (now() - t < ms) __asm__ volatile("pause");
+    while (waiting(t, ms)) __asm__ volatile("pause");
+}
+
+void report(const char* fmt, ...) {
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    printf("%s\n", line);
+    if (started) gfx_sdl_render();
 }
 
 bool send(uint8_t b) {
-    for (uint32_t t = now(); now() - t < 500;)
+    for (uint32_t t = now(); waiting(t, 500);)
         if ((inb(MSR) & (RQM | DIO)) == RQM) { outb(FIFO, b); return true; }
     return false;
 }
 bool recv(uint8_t& b) {
-    for (uint32_t t = now(); now() - t < 500;)
+    for (uint32_t t = now(); waiting(t, 500);)
         if ((inb(MSR) & (RQM | DIO)) == (RQM | DIO)) { b = inb(FIFO); return true; }
     return false;
 }
@@ -54,7 +119,7 @@ bool sense(uint8_t& st0, uint8_t& pcn) {
 }
 // After SEEK or RECALIBRATE: poll until the drive reports seek end.
 bool wait_seek(int cyl) {
-    for (uint32_t t = now(); now() - t < 3000; delay_ms(1)) {
+    for (uint32_t t = now(); waiting(t, 3000); delay_ms(1)) {
         uint8_t st0, pcn;
         if (!sense(st0, pcn)) continue;
         if (!(st0 & 0x20)) continue;                     // not our seek-end yet
@@ -73,6 +138,7 @@ void motor_on() {
 }
 
 bool reset() {
+    uncache();
     outb(DOR, 0);
     for (int i = 0; i < 20; i++) outb(0x80, 0);          // > 4 us in reset (not by reading MSR:
                                                          // QEMU leaves reset on that, without the interrupt)
@@ -84,7 +150,7 @@ bool reset() {
     // wait too.
     delay_ms(10);
     int got = 0;                                         // one interrupt per drive (4)
-    for (uint32_t t = now(); got < 4 && now() - t < 500;) {
+    for (uint32_t t = now(); got < 4 && waiting(t, 500);) {
         uint8_t st0, pcn;
         if (sense(st0, pcn)) got++; else delay_ms(1);
     }
@@ -110,27 +176,71 @@ bool seek(int c) {
     return false;
 }
 
+// The DMA controller's byte flip-flop is shared by every channel, and the
+// Sound Blaster code resets it and reads its own count from the timer
+// interrupt (audio.cpp, sb_play_pos). Landing between our two byte
+// accesses, it would put the second byte in the wrong half of an address
+// or count. So no interrupts while we touch those registers.
+uintptr_t irq_off() {
+    uintptr_t f;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+void irq_restore(uintptr_t f) { if (f & 0x200) __asm__ volatile("sti" ::: "memory"); }
+
 void dma_setup(bool to_disk, uint32_t len) {
+    uintptr_t f = irq_off();
     uint32_t a = (uint32_t)(uintptr_t)dma_buf;
     outb(0x0A, 0x06);                                    // mask channel 2
     outb(0x0C, 0xFF); outb(0x04, a & 0xFF); outb(0x04, (a >> 8) & 0xFF);
     outb(0x81, (a >> 16) & 0xFF);
     outb(0x0C, 0xFF); outb(0x05, (len - 1) & 0xFF); outb(0x05, (len - 1) >> 8);
     outb(0x0B, to_disk ? 0x4A : 0x46);                   // single mode, memory->disk or disk->memory
+    (void)inb(0x08);                                     // clear any old terminal-count bits
     outb(0x0A, 0x02);                                    // unmask
+    irq_restore(f);
+}
+// Channel 2's count register: len - 1 until the first byte moves, 0xFFFF
+// once the last one has (terminal count).
+uint16_t dma_count() {
+    uintptr_t f = irq_off();
+    outb(0x0C, 0xFF);
+    uint8_t lo = inb(0x05), hi = inb(0x05);
+    irq_restore(f);
+    return (uint16_t)(lo | hi << 8);
 }
 bool transfer(bool to_disk, uint32_t c, uint32_t h, uint32_t s, uint32_t n) {
     dma_setup(to_disk, n * 512);
     const uint8_t cmd[9] = {to_disk ? CMD_WRITE : CMD_READ, (uint8_t)(h << 2), (uint8_t)c, (uint8_t)h,
                             (uint8_t)s, 2, (uint8_t)spt, 0x1B, 0xFF};
-    for (uint8_t b : cmd) if (!send(b)) return false;
+    for (uint8_t b : cmd)
+        if (!send(b)) { snprintf(why, sizeof why, "controller not taking commands (MSR %02X)", inb(MSR)); return false; }
     // The DMA terminal count ends the command; wait for its result phase.
-    uint32_t t = now();
-    while ((inb(MSR) & (RQM | DIO | CB)) != (RQM | DIO | CB))
-        if (now() - t > 3000) return false;
+    // MSR alone can't be trusted for that: PCem shows RQM|DIO|CB after
+    // every byte it moves by DMA (a real 82077 keeps RQM clear), so it
+    // looked finished after the first byte and the buffer was copied out
+    // half-filled. So: wait for the DMA controller's terminal count
+    // (status register bit 2 for channel 2), or, if no byte has moved at
+    // all, take RQM|DIO|CB as an error ending the command early. The count
+    // register reaching 0xFFFF is terminal count too, should the status bit
+    // be missed.
+    uint32_t t = now(), len = n * 512;
+    for (;;) {
+        uint16_t left = dma_count();
+        if ((inb(0x08) & 0x04) || left == 0xFFFF) { delay_ms(1); break; }   // then the results
+        if ((inb(MSR) & (RQM | DIO | CB)) == (RQM | DIO | CB) && left == (uint16_t)(len - 1))
+            break;
+        if (!waiting(t, 3000)) {
+            snprintf(why, sizeof why, "transfer never finished (MSR %02X, %u of %u bytes moved)",
+                     inb(MSR), (unsigned)((uint16_t)(len - 1) - left), (unsigned)len);
+            return false;
+        }
+    }
     uint8_t r[7];
-    for (uint8_t& b : r) if (!recv(b)) return false;
+    for (uint8_t& b : r)
+        if (!recv(b)) { snprintf(why, sizeof why, "no result from the controller (MSR %02X)", inb(MSR)); return false; }
     if ((r[0] & 0xC0) == 0) return true;
+    snprintf(why, sizeof why, "error ST0 %02X ST1 %02X ST2 %02X", r[0], r[1], r[2]);
     if (r[1] & 0x02) wprot = true;                       // ST1: not writable
     return false;
 }
@@ -143,19 +253,48 @@ bool xfer(bool to_disk, uint32_t lba, uint32_t n, uint8_t* buf) {
         uint32_t c = lba / (spt * heads), h = (lba / spt) % heads, s = lba % spt + 1;
         uint32_t cnt = spt - (s - 1);
         if (cnt > n) cnt = n;
+        if (!to_disk && !quiet) {
+            Side* sd = cached(c, h);
+            if (!sd) {
+                // The whole side, in one go, one attempt: if anything on it
+                // won't read, fall back to just the sectors asked for.
+                if (trace) report("Floppy: read C%u H%u (whole side, for S%u x%u)", c, h, s, cnt);
+                if (seek((int)c) && transfer(false, c, h, 1, spt)) {
+                    sd = &sides[0];
+                    for (Side& o : sides) if (o.used < sd->used) sd = &o;
+                    sd->c = (int)c; sd->h = (int)h; sd->used = ++use_clock;
+                    memcpy(sd->data, dma_buf, spt * 512);
+                }
+            }
+            if (sd) {
+                memcpy(buf, sd->data + (s - 1) * 512, cnt * 512);
+                lba += cnt; buf += cnt * 512; n -= cnt;
+                continue;
+            }
+        }
+        if (trace) report("Floppy: %s C%u H%u S%u x%u", to_disk ? "write" : "read", c, h, s, cnt);
         if (to_disk) memcpy(dma_buf, buf, cnt * 512);
         bool ok = false;
-        for (int attempt = 0; attempt < 5 && !ok && !wprot; attempt++) {
+        int tries = quiet ? 2 : 5;                       // probing: don't linger on a wrong rate
+        for (int attempt = 0; attempt < tries && !ok && !wprot; attempt++) {
             if (attempt == 3) reset();
             if (attempt) recalibrate();
-            ok = seek((int)c) && transfer(to_disk, c, h, s, cnt);
+            why[0] = 0;
+            if (!seek((int)c)) snprintf(why, sizeof why, "seek to track %u failed", c);
+            else ok = transfer(to_disk, c, h, s, cnt);
+            if (!ok && !quiet)
+                report("Floppy: %s C%u H%u S%u x%u, try %d: %s", to_disk ? "write" : "read",
+                       c, h, s, cnt, attempt + 1, why[0] ? why : "?");
         }
         if (!ok) {
+            uncache();                                   // what's on the disk is anyone's guess now
+            if (quiet) return false;
             printf("Floppy: %s error at sector %u%s\n", to_disk ? "write" : "read", lba,
                    wprot ? " (write-protected)" : "");
             return false;
         }
         if (!to_disk) memcpy(buf, dma_buf, cnt * 512);
+        else if (Side* sd = cached(c, h)) memcpy(sd->data + (s - 1) * 512, buf, cnt * 512);   // keep it current
         lba += cnt; buf += cnt * 512; n -= cnt;
     }
     return true;
@@ -188,10 +327,25 @@ bool floppy_init() {
     }
     present = true;
     // Geometry from the boot sector (sector 1 of track 0 is the same on all formats).
+    // The disk needn't match the drive (a 1.44 MB disk in a 2.88 MB drive,
+    // or a CMOS type that's simply wrong, as on a fresh PCem machine): try
+    // the drive's own data rate first, then the others, until the boot
+    // sector reads.
     uint8_t b[512];
+    static const uint8_t rates[] = {0, 2, 3, 1};         // 1.44/1.2 MB, 720 KB, 2.88 MB, 300 kbit/s
+    uint8_t first = rate;
+    quiet = true;
     bool ok = xfer(false, 0, 1, b);
-    if (!ok && rate != 2) { rate = 2; outb(CCR, rate); ok = xfer(false, 0, 1, b); }   // 720 KB disk
+    for (uint8_t r : rates) {
+        if (ok) break;
+        if (r == first) continue;
+        rate = r;
+        outb(CCR, rate);
+        ok = xfer(false, 0, 1, b);
+    }
+    quiet = false;
     if (!ok) { printf("Floppy: can't read the disk\n"); present = false; floppy_idle(); return false; }
+    if (rate != first) printf("Floppy: disk read at a different data rate than the drive type suggests\n");
     uint32_t bspt = b[24] | b[25] << 8, bh = b[26] | b[27] << 8;
     uint32_t tot = b[19] | b[20] << 8;
     if (!tot) tot = b[32] | b[33] << 8 | b[34] << 16 | (uint32_t)b[35] << 24;
@@ -201,6 +355,7 @@ bool floppy_init() {
     floppy_check_media();                                // clear the change line
     printf("Floppy: drive A: %u sectors (%u/track, %u heads)\n", total, spt, heads);
     floppy_idle();
+    started = true;
     return true;
 }
 
@@ -214,10 +369,14 @@ bool floppy_disk_write_protected() {
     return st3 & 0x40;
 }
 
+void floppy_set_trace(bool on) { trace = on; }
+
 int floppy_check_media() {
     if (!present) return -1;
+    if (trace) report("Floppy: check media (change line %s)", (inb(DIR) & 0x80) ? "set" : "clear");
     motor_on();
     if (!(inb(DIR) & 0x80)) return 0;
+    uncache();                                           // a different disk, perhaps
     // The change line clears on a step once a disk is in the drive.
     cur_cyl = -1;
     seek(1);
