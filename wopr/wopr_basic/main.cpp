@@ -202,7 +202,8 @@ static void run_lines(int start_pc, int fresh) {
             display_print(tbuf);
         }
         if (jumped < 0) {
-            g_err = 255; g_erl = g_lines[old_pc].linenum;
+            g_err = g_err_raised ? g_err_raised : 255; g_err_raised = 0;
+            g_erl = g_lines[old_pc].linenum;
             if (g_error_handler[0]) {
                 g_error_resume_pc = old_pc;
                 cmd_goto(&ip, g_error_handler);
@@ -235,7 +236,8 @@ static void run_lines(int start_pc, int fresh) {
             display_print(tbuf);
         }
         if (jumped < 0) {
-            g_err = 255; g_erl = g_lines[old_pc].linenum;
+            g_err = g_err_raised ? g_err_raised : 255; g_err_raised = 0;
+            g_erl = g_lines[old_pc].linenum;
             if (g_error_handler[0]) {
                 g_error_resume_pc = old_pc;
                 cmd_goto(&ip, g_error_handler);

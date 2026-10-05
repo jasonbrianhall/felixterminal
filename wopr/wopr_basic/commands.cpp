@@ -1505,6 +1505,7 @@ static int cmd_error(Interp *ip, char *args) {
     mpf_t n; mpf_init2(n, g_prec);
     eval_expr(sk(args), n);
     g_err = (int)mpf_get_si(n);
+    g_err_raised = g_err;
     mpf_clear(n);
     /* If there's a handler, signal it; otherwise print and stop */
     if (g_error_handler[0]) {
@@ -2520,13 +2521,10 @@ static int cmd_input(Interp *ip, char *args) {
 static int cmd_open(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
-    char filename[DEFAULT_BUFFER]; int fi = 0;
-    if (*p == '"') {
-        p++;
-        while (*p && *p != '"' && fi < (int)sizeof(filename) - 1) filename[fi++] = *p++;
-        if (*p == '"') p++;
-    }
-    filename[fi] = '\0';
+    /* The filename is any string expression: "x.bas", f$, d$ + "\" + f$ */
+    char filename[DEFAULT_BUFFER];
+    filename[0] = '\0';
+    p = eval_str_expr(p, filename, sizeof filename);
     tilde_expand(filename, sizeof(filename));
     p = sk(p);
     char mode_ch = 'O';
@@ -2544,7 +2542,14 @@ static int cmd_open(Interp *ip, char *args) {
     FileHandle *fh = fh_get(n);
     if (fh->fp) { fclose(fh->fp); fh->fp = NULL; }
     fh->fp = fopen(filename, (mode_ch == 'I') ? "r" : (mode_ch == 'A') ? "a" : "w");
-    if (!fh->fp) { perror(filename); return 0; }
+    if (!fh->fp) {
+        /* 53 File not found (reading), 75 Path/File access error (writing);
+           trappable with ON ERROR like QBasic */
+        g_err = (mode_ch == 'I') ? 53 : 75;
+        if (g_error_handler[0]) { g_err_raised = g_err; return -1; }
+        perror(filename);
+        return 0;
+    }
     fh->mode = mode_ch;
     return 0;
 }
@@ -3016,6 +3021,29 @@ static int cmd_for(Interp *ip, char *args) {
     p = sk(eval_expr(p, limit));
     if (strncasecmp(p, "STEP", 4) == 0) { p = sk(p + 4); eval_expr(p, step); }
     Var *v = var_get(vname); mpf_set(v->num, start); var_fix_int(v, v->num);
+
+    /* Start already past the limit: the body runs zero times, as in QBasic
+       (FOR i = 2 TO 1, FOR i = 3 TO 4 STEP -1). Skip to after the matching
+       NEXT; "NEXT j, i" closes one loop per name. */
+    {
+        int c = mpf_cmp(v->num, limit);
+        int none = (mpf_sgn(step) >= 0) ? (c > 0) : (c < 0);
+        if (none) {
+            mpf_clears(start, limit, step, NULL);
+            int depth = 1, pc = ip->pc + 1;
+            while (pc < g_nlines && depth > 0) {
+                char *t = sk(g_lines[pc].text);
+                if (kw_match(t, "FOR")) depth++;
+                else if (kw_match(t, "NEXT")) {
+                    depth--;
+                    for (char *q = t; *q; q++) if (*q == ',') depth--;
+                }
+                pc++;
+            }
+            ip->pc = pc;
+            return 1;
+        }
+    }
 
     if (g_ctrl_top >= CTRL_STACK_MAX) { basic_stacktrace("Stack overflow"); return -1; }
     CtrlFrame *f = &g_ctrl[g_ctrl_top++];

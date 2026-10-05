@@ -130,6 +130,7 @@ extern int              g_current_pc;  /* pc of the line currently executing */
 extern char             g_error_handler[MAX_VARNAME];
 extern int              g_error_resume_pc;
 extern int              g_err;   /* last error code (ERR) */
+extern int              g_err_raised; /* specific code set by the failing statement */
 extern int              g_erl;   /* line number of last error (ERL) */
 extern int              g_tron;  /* TRON trace flag */
 

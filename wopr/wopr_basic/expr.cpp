@@ -34,6 +34,7 @@ int                   g_current_pc =  0;
 char g_error_handler[MAX_VARNAME] = "";  /* label/line of handler, "" = none */
 int  g_error_resume_pc = -1;             /* pc to RESUME to */
 int  g_err  = 0;                         /* last error code */
+int  g_err_raised = 0;   /* code a statement raised (ERROR n, OPEN failure); 0 = generic */
 int  g_erl  = 0;                         /* line number where error occurred */
 int  g_tron = 0;                         /* trace flag */
 
@@ -776,18 +777,9 @@ static void parse_and_operand_p(Parser *ps, mpf_t result) {
     mpf_t tmp; mpf_init2(tmp, g_prec);
     mpf_t rhs; mpf_init2(rhs, g_prec);
 
-    /* additive */
-    parse_term_p(ps, result);
+    /* string comparison -- checked before parsing a number, so the right
+       side of AND can be one ("ok AND a$ <> """) */
     skip_ws_p(ps);
-    while (*ps->p == '+' || *ps->p == '-') {
-        char op = *ps->p++;
-        parse_term_p(ps, tmp);
-        if (op == '+') mpf_add(result, result, tmp);
-        else           mpf_sub(result, result, tmp);
-        skip_ws_p(ps);
-    }
-
-    /* string comparison */
     if (is_str_token(ps->p)) {
         char lhs_s[DEFAULT_BUFFER], rhs_s[DEFAULT_BUFFER];
         ps->p = sk(eval_str_expr(ps->p, lhs_s, sizeof lhs_s));
@@ -810,6 +802,17 @@ static void parse_and_operand_p(Parser *ps, mpf_t result) {
             skip_ws_p(ps);
         }
     } else {
+        /* additive */
+        parse_term_p(ps, result);
+        skip_ws_p(ps);
+        while (*ps->p == '+' || *ps->p == '-') {
+            char op = *ps->p++;
+            parse_term_p(ps, tmp);
+            if (op == '+') mpf_add(result, result, tmp);
+            else           mpf_sub(result, result, tmp);
+            skip_ws_p(ps);
+        }
+
         /* numeric comparison */
         skip_ws_p(ps);
         char op[3] = { ps->p[0], ps->p[0] ? ps->p[1] : '\0', '\0' };
@@ -1196,7 +1199,19 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         int n = (int)mpf_get_si(fn); mpf_clear(fn);
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         FileHandle *fh = (n >= 1 && n <= MAX_FILE_HANDLES) ? &g_files[n] : NULL;
-        mpf_set_si(result, (!fh || !fh->fp || feof(fh->fp)) ? -1 : 0);
+        /* True once nothing is left to read, as in QBasic -- not only after
+           a read has already failed (feof), which gave LINE INPUT loops a
+           phantom empty last line. */
+        int at_end = 1;
+        if (fh && fh->fp) {
+            if (fh->mode == 'I') {
+                int ch = fgetc(fh->fp);
+                if (ch != EOF) { ungetc(ch, fh->fp); at_end = 0; }
+            } else {
+                at_end = feof(fh->fp) ? 1 : 0;
+            }
+        }
+        mpf_set_si(result, at_end ? -1 : 0);
         return;
     }
 
