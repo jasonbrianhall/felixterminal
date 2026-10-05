@@ -208,6 +208,7 @@ void load(char *filename) {
     if (!f) { perror(filename); return; }
 
     label_clear();
+    source_capture(f);
 
     /* ---- detect format by scanning for the first code line ---- */
     int numbered = 0;
@@ -222,6 +223,7 @@ void load(char *filename) {
         break;
     }
     rewind(f);
+    g_program_freeform = !numbered;
 
     /* ---- NUMBERED path ---- */
     if (numbered) {
@@ -721,11 +723,52 @@ void clear_program(void) {
     g_option_base = 0;
     g_cont_pc     = -1;
     label_clear();
+    source_invalidate();
+    g_program_freeform = 0;
     const_clear();
     const_init_builtins();
     sprites_reset();
     for (int i = 1; i <= MAX_FILE_HANDLES; i++)
         if (g_files[i].fp) { fclose(g_files[i].fp); g_files[i].fp = NULL; g_files[i].mode = 0; }
+}
+
+/* ================================================================
+ * Original source text of the last LOADed file.
+ *
+ * The loader discards comments, blank lines, labels, TYPE blocks and
+ * DECLAREs, and gives free-form programs pseudo line numbers, so g_lines
+ * cannot be written back faithfully.  SAVE writes this copy verbatim
+ * while the program is unchanged since LOAD; any edit (typed numbered
+ * line, DELETE, RENUM, NEW) invalidates it.
+ * ================================================================ */
+int g_program_freeform = 0;   /* 1 = last LOAD was a free-form (unnumbered) file */
+
+static char  *g_source     = NULL;
+static size_t g_source_len = 0;
+
+void source_invalidate(void) {
+    free(g_source);
+    g_source = NULL;
+    g_source_len = 0;
+}
+
+void source_capture(FILE *f) {
+    source_invalidate();
+    size_t cap = 65536, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return;
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, f)) > 0) {
+        len += n;
+        if (len == cap) {
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) { free(buf); rewind(f); return; }
+            buf = nb; cap *= 2;
+        }
+    }
+    rewind(f);
+    g_source = buf;
+    g_source_len = len;
 }
 
 /* ================================================================
@@ -741,9 +784,25 @@ void save_program(char *filename) {
     else
         snprintf(path, sizeof path, "%s.bas", filename);
 
+    /* Unedited since LOAD: write the original text back untouched so
+       comments, formatting, labels and directives survive. */
+    if (g_source) {
+        FILE *f = fopen(path, "wb");
+        if (!f) { perror(path); return; }
+        fwrite(g_source, 1, g_source_len, f);
+        fclose(f);
+        printf("Saved %s\n", path);
+        return;
+    }
+
+    if (g_program_freeform) {
+        display_print("Free-form program: can't save (original source unavailable)\n");
+        return;
+    }
+
     FILE *f = fopen(path, "w");
     if (!f) { perror(path); return; }
-    
+
     /* Write preserving line numbers if they exist */
     for (int i = 0; i < g_nlines; i++) {
         if (g_lines[i].linenum > 0)

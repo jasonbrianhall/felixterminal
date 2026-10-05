@@ -221,6 +221,9 @@ int  find_line_by_label(char *name);
 void normalize_kw(char *src, char *dst, int dstsz);
 void load(char *filename);
 void save_program(char *filename);
+void source_capture(FILE *f);
+void source_invalidate(void);
+extern int g_program_freeform;
 void load_program(char *filename);
 void clear_program(void);
 

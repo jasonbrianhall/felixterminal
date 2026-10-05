@@ -577,6 +577,7 @@ return 0;
 
         } else if (strncasecmp(p,"DELETE",6)==0 && !isalnum((unsigned char)p[6])) {
             p = sk(p+6);
+            if (g_program_freeform) { display_print("Free-form program: can't edit by line number. Edit the .bas file instead.\n"); continue; }
             if (!isdigit((unsigned char)*p)) { display_print("Usage: DELETE start[-end]\n"); continue; }
             int from = atoi(p); while (isdigit((unsigned char)*p)) p++;
             int to = from; p = sk(p);
@@ -586,6 +587,7 @@ return 0;
                 if (g_lines[i].linenum < from || g_lines[i].linenum > to) g_lines[w++] = g_lines[i];
                 else free(g_lines[i].text);
             }
+            if (w != g_nlines) source_invalidate();
             printf("Deleted %d entries.\n", g_nlines - w);
             g_nlines = w;
 
@@ -598,6 +600,8 @@ return 0;
             p=sk(p); if(*p==',') p=sk(p+1);
             if (isdigit((unsigned char)*p)) { step=atoi(p); }
             if (step < 1) step = 10;
+            if (g_program_freeform) { display_print("Free-form program: can't edit by line number. Edit the .bas file instead.\n"); continue; }
+            source_invalidate();
             int old_nums[MAX_LINES], new_nums[MAX_LINES], nmap = 0, prev2 = -1;
             for (int i = 0; i < g_nlines; i++) {
                 if (g_lines[i].linenum != prev2) {
@@ -705,6 +709,8 @@ return 0;
                 }
             }
             /* Numbered line: add/replace in program store */
+            if (g_program_freeform) { display_print("Free-form program: can't edit by line number. Edit the .bas file instead.\n"); continue; }
+            source_invalidate();
             int num = (int)strtol(p, (char **)&p, 10);
             while (isspace((unsigned char)*p)) p++;
             int w = 0;
