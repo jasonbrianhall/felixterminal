@@ -127,3 +127,16 @@ Around it:
 Host-side tests live in `tools/fat12_test.sh`, `tools/libc_test.sh` and `tools/rbtree_test.sh`.
 
 Boot progress is logged on the serial port (COM1); `make run` shows it.
+
+# Limitations
+
+The software currently has several limitations
+
+- Their are some QBasic bugs.  It's not a perfect interpreter.  Bugs are fixed as they are found.
+- It only supports the first USB card it sees.  If you have multiple USB cards, put your keyboard and mouse on the first one (usually your motherboard).  It does support multiple keyboards and mice; just not on separate USB PCI slots.  Also no hot plugging; if you unplug it and need to use it, you'll have to reboot.
+- No HDMI Audio support.  Will never happen.  Their are just too many driver variations for such a small project.
+- Limited to FAT12.  FAT12 is old.  It's good enough for a filesystem for loading and saving basic files but that's about it.
+- Secure boot will never work.  Not paying Microsoft to sign my efi files.  It does boot with security boot disabled and in legacy boot mode.
+- Can't boot from the floppy in EFI mode.  This is just because EFI doesn't have floppy support.  Either boot from a CDROM or boot from Linux using an existing GRUB install.
+
+
