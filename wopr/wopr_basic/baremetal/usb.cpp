@@ -76,6 +76,18 @@ static bool ring_init(Ring& r) {
     return true;
 }
 
+/* A ring in memory that's already allocated (reused across plug-ins). */
+static void ring_attach(Ring& r, volatile Trb* mem) {
+    r.trb = mem;
+    memset((void*)mem, 0, RING_TRBS * sizeof(Trb));
+    r.enq = 0;
+    r.cycle = 1;
+    volatile Trb& link = r.trb[RING_TRBS - 1];
+    link.d0 = (uint32_t)phys(r.trb);
+    link.d1 = (uint32_t)(phys(r.trb) >> 32);
+    link.d3 = TRB_LINK << 10 | (1 << 1);
+}
+
 static uint64_t ring_push(Ring& r, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) {
     volatile Trb& t = r.trb[r.enq];
     uint64_t addr = phys(&t);
@@ -160,6 +172,13 @@ struct Keyboard {
 };
 #define MAX_KBD 32
 static Keyboard kbds[MAX_KBD];
+/* Each table entry's controller-visible memory, allocated the first time
+ * the entry is used and reused by whatever is plugged in next: the pool is
+ * never freed, so allocating per plug-in ran it dry after a few hundred. */
+static struct {
+    volatile uint8_t *out_ctx, *in_ctx, *reports;
+    volatile Trb *ep0, *intr;
+} devmem[MAX_KBD];
 
 static inline volatile uint32_t* ctx(volatile uint8_t* base, int idx) {
     return (volatile uint32_t*)(base + idx * H->csz);
@@ -167,7 +186,8 @@ static inline volatile uint32_t* ctx(volatile uint8_t* base, int idx) {
 
 // ---------------------------------------------------------------- key reports
 // HID usage -> PS/2 set-1 scancode (0x100 flag = E0-prefixed): letters,
-// digits, punctuation, Enter/Esc/Backspace/Tab/Space, F1-F12, arrows, keypad Enter.
+// digits, punctuation, Enter/Esc/Backspace/Tab/Space, F1-F12, arrows, the
+// editing keys and the keypad.
 static const struct { uint8_t usage; uint16_t code; } keymap[] = {
     {0x04, 0x1E}, {0x05, 0x30}, {0x06, 0x2E}, {0x07, 0x20}, {0x08, 0x12}, {0x09, 0x21},
     {0x0A, 0x22}, {0x0B, 0x23}, {0x0C, 0x17}, {0x0D, 0x24}, {0x0E, 0x25}, {0x0F, 0x26},
@@ -181,6 +201,13 @@ static const struct { uint8_t usage; uint16_t code; } keymap[] = {
     {0x3C, 0x3D}, {0x3D, 0x3E}, {0x3E, 0x3F}, {0x3F, 0x40}, {0x40, 0x41}, {0x41, 0x42},
     {0x42, 0x43}, {0x43, 0x44}, {0x44, 0x57}, {0x45, 0x58}, {0x4F, 0x14D}, {0x50, 0x14B},
     {0x51, 0x150}, {0x52, 0x148}, {0x58, 0x11C},
+    // Caps Lock; Insert, Home, Page Up, Delete, End, Page Down
+    {0x39, 0x3A}, {0x49, 0x152}, {0x4A, 0x147}, {0x4B, 0x149}, {0x4C, 0x153}, {0x4D, 0x14F}, {0x4E, 0x151},
+    // keypad: Num Lock, / * - +, 1-9, 0, .
+    {0x53, 0x45}, {0x54, 0x135}, {0x55, 0x37}, {0x56, 0x4A}, {0x57, 0x4E},
+    {0x59, 0x4F}, {0x5A, 0x50}, {0x5B, 0x51}, {0x5C, 0x4B}, {0x5D, 0x4C}, {0x5E, 0x4D},
+    {0x5F, 0x47}, {0x60, 0x48}, {0x61, 0x49}, {0x62, 0x52}, {0x63, 0x53},
+    {0x64, 0x56},                                       // the key left of Z on ISO boards
 };
 
 static void emit(uint16_t code, bool down) {
@@ -373,6 +400,12 @@ static void forget(int i);
 
 // A device that's just been reset and enabled, wherever it is: give it a
 // slot and an address, and set it up as a keyboard, mouse or hub.
+static bool setup_slot(Keyboard& k, int ki);
+static void release_slot(int slot) {
+    H->dcbaa[slot] = 0;
+    command(0, 0, 0, 10 << 10 | (uint32_t)slot << 24, nullptr);   // Disable Slot
+}
+
 static void setup_device(int root_port, int parent, int hub_port, int speed) {
     for (auto& k : kbds)                               // already there?
         if (k.active && k.hc == H && k.port == root_port && k.parent == parent && (parent < 0 || k.hub_port == hub_port)) return;
@@ -403,11 +436,34 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     if (command(0, 0, 0, TRB_ENABLE_SLOT << 10, &ev) != 1) { printf("USB: %s: no slot\n", k.where); return; }
     k.slot = ev.d3 >> 24;
     if (k.slot < 1 || k.slot > H->max_slots) return;
+    // Anything that doesn't end up driven gives its slot back: kept, a USB
+    // stick plugged in a few dozen times used them all up.
+    if (!setup_slot(k, ki)) release_slot(k.slot);
+}
 
-    k.out_ctx = (volatile uint8_t*)dma_alloc(32 * H->csz, 64);
-    k.in_ctx  = (volatile uint8_t*)dma_alloc(33 * H->csz, 64);
-    k.reports = (volatile uint8_t*)dma_alloc(RING_TRBS * 8, 64);
-    if (!k.out_ctx || !k.in_ctx || !k.reports || !ring_init(k.ep0) || !ring_init(k.intr)) return;
+
+// The rest of setting up a device that has slot k.slot: its memory, an
+// address, and a keyboard, mouse or hub on top. False: not driven.
+static bool setup_slot(Keyboard& k, int ki) {
+    auto& m = devmem[ki];
+    if (!m.out_ctx) {                                   // sized for 64-byte contexts, whichever controller
+        m.out_ctx = (volatile uint8_t*)dma_alloc(32 * 64, 64);
+        m.in_ctx  = (volatile uint8_t*)dma_alloc(33 * 64, 64);
+        m.reports = (volatile uint8_t*)dma_alloc(RING_TRBS * 8, 64);
+        m.ep0     = (volatile Trb*)dma_alloc(RING_TRBS * sizeof(Trb), 64);
+        m.intr    = (volatile Trb*)dma_alloc(RING_TRBS * sizeof(Trb), 64);
+        if (!m.out_ctx || !m.in_ctx || !m.reports || !m.ep0 || !m.intr) {
+            printf("USB: %s: out of memory\n", k.where);
+            m.out_ctx = nullptr;
+            return false;
+        }
+    }
+    k.out_ctx = m.out_ctx; k.in_ctx = m.in_ctx; k.reports = m.reports;
+    memset((void*)k.out_ctx, 0, 32 * 64);
+    memset((void*)k.in_ctx, 0, 33 * 64);
+    memset((void*)k.reports, 0, RING_TRBS * 8);
+    ring_attach(k.ep0, m.ep0);
+    ring_attach(k.intr, m.intr);
     H->dcbaa[k.slot] = phys(k.out_ctx);
 
     // Address Device: slot context + endpoint 0.
@@ -421,11 +477,11 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     ep0[4] = 8;
     uint64_t ic = phys(k.in_ctx);
     int cc = command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_ADDRESS_DEVICE << 10 | (uint32_t)k.slot << 24, nullptr);
-    if (cc != 1) { printf("USB: %s: address failed (%d)\n", k.where, cc); return; }
+    if (cc != 1) { printf("USB: %s: address failed (%d)\n", k.where, cc); return false; }
     delay_ms(2);
 
     static volatile uint8_t desc[256] __attribute__((aligned(64)));
-    if (!control(k, 0x80, 6, 0x0100, 0, 8, desc)) { printf("USB: %s: no descriptor\n", k.where); return; }
+    if (!control(k, 0x80, 6, 0x0100, 0, 8, desc)) { printf("USB: %s: no descriptor\n", k.where); return false; }
     int mps = desc[7];
     bool hub = desc[4] == 9;                            // device class: hub
     if (mps && mps != mps0 && k.speed < 4) {            // fix EP0 max packet size
@@ -434,10 +490,10 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
         ep0[1] = (ep0[1] & 0xFFFF) | (uint32_t)mps << 16;
         command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_EVALUATE_CTX << 10 | (uint32_t)k.slot << 24, nullptr);
     }
-    if (!control(k, 0x80, 6, 0x0200, 0, 9, desc)) return;
+    if (!control(k, 0x80, 6, 0x0200, 0, 9, desc)) return false;
     int total = desc[2] | desc[3] << 8;
     if (total > (int)sizeof(desc)) total = sizeof(desc);
-    if (!control(k, 0x80, 6, 0x0200, 0, total, desc)) return;
+    if (!control(k, 0x80, 6, 0x0200, 0, total, desc)) return false;
     int config = desc[5];
 
     // A boot keyboard or mouse interface, or a hub's, and its interrupt IN endpoint.
@@ -456,23 +512,23 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
             ep_interval = desc[i + 6];
         }
     }
-    if (iface < 0 || !ep_addr) { printf("USB: %s: not a keyboard, mouse or hub\n", k.where); return; }
+    if (iface < 0 || !ep_addr) { printf("USB: %s: not a keyboard, mouse or hub\n", k.where); return false; }
     if (hub && k.speed >= 4) {                          // a USB 3 hub's SuperSpeed half
         printf("USB: %s: USB 3 hub (its USB 2 side carries keyboards and mice)\n", k.where);
-        return;
+        return false;
     }
-    if (hub && k.depth >= 5) { printf("USB: %s: hubs nested too deep\n", k.where); return; }
+    if (hub && k.depth >= 5) { printf("USB: %s: hubs nested too deep\n", k.where); return false; }
 
-    if (!control(k, 0x00, 9, config, 0, 0, nullptr)) return;          // SET_CONFIGURATION
+    if (!control(k, 0x00, 9, config, 0, 0, nullptr)) return false;          // SET_CONFIGURATION
 
     if (hub) {
         // Hub descriptor: port count, characteristics (TT think time), power-on delay.
-        if (!control(k, 0xA0, 6, 0x2900, 0, 9, desc)) { printf("USB: %s: no hub descriptor\n", k.where); return; }
+        if (!control(k, 0xA0, 6, 0x2900, 0, 9, desc)) { printf("USB: %s: no hub descriptor\n", k.where); return false; }
         k.kind = HUB;
         k.nports = desc[2] > 31 ? 31 : desc[2];
         k.ttt = (desc[3] >> 5) & 3;
         k.power_good_ms = desc[5] * 2u;
-        if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return;
+        if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return false;
         k.active = true;
         for (int i = 0; i < 8; i++) queue_report(k);
         H->db[k.slot] = k.dci;
@@ -480,12 +536,12 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
         for (int p = 1; p <= k.nports; p++) control(k, 0x23, 3, 8, p, 0, nullptr);   // SET_FEATURE PORT_POWER
         delay_ms((int)k.power_good_ms + 100);           // power good, then connect debounce
         for (int p = 1; p <= k.nports; p++) hub_port_change(ki, p);
-        return;
+        return true;
     }
 
     control(k, 0x21, 0x0B, 0, iface, 0, nullptr);                      // SET_PROTOCOL boot
     control(k, 0x21, 0x0A, 0, iface, 0, nullptr);                      // SET_IDLE (may stall)
-    if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return;
+    if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return false;
 
     k.kind = is_mouse ? MOUSE : KBD;
     k.mouse = is_mouse;
@@ -493,6 +549,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     for (int i = 0; i < 8; i++) queue_report(k);
     H->db[k.slot] = k.dci;
     printf("USB: %s on %s (slot %d, %s speed)\n", k.mouse ? "mouse" : "keyboard", k.where, k.slot, speed_name(k.speed));
+    return true;
 }
 
 // Drop device i and everything plugged into it (if it's a hub).

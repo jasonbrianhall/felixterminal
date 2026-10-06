@@ -1827,6 +1827,11 @@ int display_get_width(void) {
     return s_text_cols;
 }
 
+int display_get_col(void) {
+    return (s_cur_col < s_text_cols ? s_cur_col : s_text_cols - 1) + 1;
+}
+void display_note_output(const char *s) { (void)s; }   /* the text grid tracks its own cursor */
+
 // Non-blocking key poll (INKEY$)
 BASIC_NS_END
 

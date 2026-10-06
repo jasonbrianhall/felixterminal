@@ -98,6 +98,18 @@ int line_cmp(const void *a, const void *b) {
     return ((Line *)a)->linenum - ((Line *)b)->linenum;
 }
 
+extern int g_program_freeform;
+/* The line a program's own line number refers to (GOTO 100, RESTORE 100):
+ * in a free-form program that's the line labelled 100. */
+int find_target_line(int num) {
+    if (g_program_freeform) {
+        char nb[16];
+        snprintf(nb, sizeof nb, "%d", num);
+        return find_line_by_label(nb);
+    }
+    return find_line_idx(num);
+}
+
 int find_line_idx(int num) {
     for (int i = 0; i < g_nlines; i++)
         if (g_lines[i].linenum == num) return i;
@@ -270,12 +282,17 @@ void load(char *filename) {
                             tf->name[fi++] = (char)toupper((unsigned char)*fp++);
                         tf->name[fi] = '\0';
                         while (isspace((unsigned char)*fp)) fp++;
-                        tf->is_str = tf->is_int = 0;
+                        tf->is_str = tf->is_int = tf->fixed_len = 0;
                         if (strncasecmp(fp, "AS", 2) == 0) {
                             fp += 2; while (isspace((unsigned char)*fp)) fp++;
                             tf->is_str = (strncasecmp(fp, "STRING", 6) == 0) ? 1 : 0;
                             tf->is_int = strncasecmp(fp, "INTEGER", 7) == 0 ||
                                          strncasecmp(fp, "LONG", 4) == 0;
+                            if (tf->is_str) {                /* STRING * n */
+                                char *q = fp + 6;
+                                while (isspace((unsigned char)*q)) q++;
+                                if (*q == '*') tf->fixed_len = atoi(q + 1);
+                            }
                         }
                         if (tf->name[0]) td->nfields++;
                     }
@@ -296,7 +313,7 @@ void load(char *filename) {
                 while ((isalnum((unsigned char)*np) || *np == '_') && si < MAX_VARNAME - 1)
                     subname[si++] = (char)toupper((unsigned char)*np++);
                 /* Include type sigil if present (e.g. GetNum#, CalcDelay!) */
-                if ((*np == '#' || *np == '!' || *np == '%' || *np == '&') && si < MAX_VARNAME - 1)
+                if ((*np == '#' || *np == '!' || *np == '%' || *np == '&' || *np == '$') && si < MAX_VARNAME - 1)
                     subname[si++] = *np++;
                 subname[si] = '\0';
                 if (subname[0]) {
@@ -458,17 +475,41 @@ void load(char *filename) {
                     tf->name[fi] = '\0';
                     /* check AS STRING vs numeric */
                     while (isspace((unsigned char)*p)) p++;
-                    tf->is_str = tf->is_int = 0;
+                    tf->is_str = tf->is_int = tf->fixed_len = 0;
                     if (strncasecmp(p, "AS", 2) == 0) {
                         p += 2; while (isspace((unsigned char)*p)) p++;
                         tf->is_str = (strncasecmp(p, "STRING", 6) == 0) ? 1 : 0;
                         tf->is_int = strncasecmp(p, "INTEGER", 7) == 0 ||
                                      strncasecmp(p, "LONG", 4) == 0;
+                        tf->fixed_len = 0;
+                        if (tf->is_str) {                    /* STRING * n */
+                            char *q = p + 6;
+                            while (isspace((unsigned char)*q)) q++;
+                            if (*q == '*') tf->fixed_len = atoi(q + 1);
+                        }
                     }
                     if (tf->name[0]) td->nfields++;
                 }
             }
             continue;
+        }
+
+        /* A QBasic line number in a free-form program ("100 PRINT X") is a
+         * label: GOTO 100 finds it, not pseudo-line 100. */
+        if (isdigit((unsigned char)*p)) {
+            char *d = p;
+            while (isdigit((unsigned char)*d)) d++;
+            if (!*d || isspace((unsigned char)*d) || *d == ':' || *d == '\'') {
+                if (pending_count < 8 && d - p < MAX_VARNAME) {
+                    memcpy(pending_buf + pending_count * MAX_VARNAME, p, (size_t)(d - p));
+                    pending_buf[pending_count * MAX_VARNAME + (d - p)] = '\0';
+                    pending_count++;
+                }
+                p = d;
+                if (*p == ':') p++;
+                while (isspace((unsigned char)*p)) p++;
+                if (!*p || *p == '\'') continue;     /* a number on its own line */
+            }
         }
 
         /* bare label definition? */
@@ -541,7 +582,7 @@ void load(char *filename) {
             while ((isalnum((unsigned char)*np) || *np == '_') && si < MAX_VARNAME - 1)
                 subname[si++] = (char)toupper((unsigned char)*np++);
             /* Include type sigil if present (e.g. GetNum#, CalcDelay!) */
-            if ((*np == '#' || *np == '!' || *np == '%' || *np == '&') && si < MAX_VARNAME - 1)
+            if ((*np == '#' || *np == '!' || *np == '%' || *np == '&' || *np == '$') && si < MAX_VARNAME - 1)
                 subname[si++] = *np++;
             subname[si] = '\0';
             if (subname[0]) {

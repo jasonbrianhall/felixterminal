@@ -77,13 +77,50 @@ BASIC_NS_BEGIN
 #endif
 #define DEFAULT_PREC     128
 #define DEFAULT_BUFFER  4096
+/* The longest string (QBasic's limit is 32767 characters). String
+ * temporaries this size live on the heap (StrBuf), not the stack. */
+#define STR_MAX        32768
+/* strncpy without the zero padding to n (it cost a 32 KB memset per copy
+ * into a STR_MAX buffer): at most n chars, then a '\0' if there's room. */
+static inline char *bstrncpy(char *d, const char *s, size_t n) {
+    size_t k = 0;
+    while (k < n && s[k]) { d[k] = s[k]; k++; }
+    if (k < n) d[k] = '\0';
+    return d;
+}
+#ifdef __cplusplus
+/* Freed buffers are kept for reuse: string expressions take and give back
+ * several per statement, and a fresh 32 KB malloc each time is slow. */
+struct StrBufCache {
+    char *slot[32];
+    int   n;
+};
+extern StrBufCache g_strbuf_cache;
+struct StrBuf {
+    char *p;
+    bool  owned;
+    StrBuf() : p(g_strbuf_cache.n ? g_strbuf_cache.slot[--g_strbuf_cache.n] : (char *)malloc(STR_MAX)),
+               owned(p != nullptr) {
+        static char none[1];                     /* out of memory: an empty string */
+        if (!p) p = none;
+        p[0] = '\0';
+    }
+    ~StrBuf() {
+        if (!owned) return;
+        if (g_strbuf_cache.n < 32) g_strbuf_cache.slot[g_strbuf_cache.n++] = p;
+        else free(p);
+    }
+    StrBuf(const StrBuf &) = delete;
+    StrBuf &operator=(const StrBuf &) = delete;
+};
+#endif
 #define MAX_ARRAY_DIMS     2
 /* The largest single array DIM accepts (elements). Arrays are allocated
  * at DIM, sized to what was asked for. Builds with little RAM (the
  * bare-metal kernel) pass smaller values for MAX_VARS, CTRL_STACK_MAX and
  * MAX_VARNAME (the control stack and the label/type tables) with -D. */
 #ifndef MAX_ARRAY_SIZE
-#define MAX_ARRAY_SIZE  65536
+#define MAX_ARRAY_SIZE  16777216
 #endif
 #define MAX_DATA_ITEMS  4096
 #define MAX_DEF_FN        32
@@ -158,7 +195,8 @@ typedef struct {
     mpf_t   num;
     char   *str;
     /* array (up to 2D), allocated by DIM: arr_len elements of one kind */
-    int     dim[MAX_ARRAY_DIMS];
+    int     dim[MAX_ARRAY_DIMS];         /* element count per dimension */
+    int     lb[MAX_ARRAY_DIMS];          /* lower bound per dimension (DIM A(5 TO 10): 5) */
     int     ndim;
     int     arr_len;
     mpf_t  *arr_num;
@@ -203,6 +241,12 @@ int     inkey_to_str(int ch, char *buf);
 extern char g_deftype[26];              /* each letter's DEFxxx type: '%' '&' '!' '#' '$' */
 void    def_letters_apply(const char *letters, char type);
 int     var_name_is_int(const char *name);
+/* Names declared AS STRING (DIM S AS STRING, SUB X (A AS STRING)): they're
+ * string variables without the $, stored as NAME$. */
+void    strdecl_apply(char *name);            /* NAME -> NAME$ if declared so */
+int     strdecl_fixed_len(const char *name);  /* AS STRING * n: n, else 0 */
+/* Store s in a string slot, cut to fixed_len when that's > 0. */
+void    str_store_fixed(char **slot, const char *s, int fixed_len);
 void    var_fix_int(Var *v, mpf_t x);   /* round x as QBasic does if v is an integer */
 
 /* ================================================================
@@ -219,6 +263,7 @@ extern int  g_nlines;
 int  line_cmp(const void *a, const void *b);
 int  find_line_idx(int num);
 int  find_line_by_label(char *name);
+int  find_target_line(int num);
 void normalize_kw(char *src, char *dst, int dstsz);
 void load(char *filename);
 void save_program(char *filename);
@@ -274,6 +319,7 @@ typedef struct {
     char name[MAX_VARNAME];
     int  is_str;   /* 1 = string field, 0 = numeric */
     int  is_int;   /* AS INTEGER / AS LONG */
+    int  fixed_len;/* AS STRING * n: n; 0 for a variable-length string */
 } TypeField;
 
 typedef struct {
@@ -311,6 +357,9 @@ typedef struct {
  * Utility helpers (defined in expr.c, used everywhere)
  * ================================================================ */
 char        *str_dup(char *s);
+/* A number as QBasic shows it, without PRINT's padding: "5", "-5", ".5",
+ * "-.25", "1E+20" (7 significant digits; never "-0"). */
+void         fmt_num(double d, char *buf, int bufsz);
 char  *sk(char *p);
 char  *read_varname(char *p, char *name);
 int          kw_match(char *p, char *kw);
@@ -323,6 +372,7 @@ void const_clear(void);
 void const_set(char *name, char *value, int is_str);
 char *eval_expr(char *s, mpf_t result);
 char *eval_str_expr(char *s, char *buf, int bufsz);
+char *str_compare_tail(char *p, const char *lhs, mpf_t out);
 char *eval_str_or_inkey(char *p, char *buf, int bufsz);
 
 /* ================================================================

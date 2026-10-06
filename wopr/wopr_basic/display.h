@@ -74,6 +74,13 @@ void display_spc(int n);
 /* Get current terminal width (used by WIDTH query) */
 int display_get_width(void);
 
+/* The cursor's column, 1-based (POS, TAB and PRINT's comma zones). */
+int display_get_col(void);
+
+/* Terminal backends: note text written by other routes (basic_printf), so
+ * display_get_col stays right. Escape sequences are understood. */
+void display_note_output(const char *s);
+
 BASIC_NS_END
 
 #endif /* DISPLAY_H */

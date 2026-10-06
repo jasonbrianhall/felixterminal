@@ -173,6 +173,100 @@ void var_fix_int(Var *v, mpf_t x) {
     mpf_set_d(x, f);
 }
 
+/* ---------------------------------------------------------------- AS STRING */
+/* Names declared AS STRING anywhere in the program (DIM, REDIM, COMMON,
+ * STATIC, SHARED, SUB/FUNCTION parameters), with their fixed length. */
+static struct StrDecl { char name[MAX_VARNAME]; int fixed_len; } *g_sdecl;
+static int g_nsdecl, g_capsdecl;
+
+static void strdecl_add(const char *name, int len, int fixed_len) {
+    if (len <= 0 || len >= MAX_VARNAME - 1) return;
+    for (int i = 0; i < g_nsdecl; i++)
+        if ((int)strlen(g_sdecl[i].name) == len && strncasecmp(g_sdecl[i].name, name, len) == 0) {
+            if (fixed_len > 0) g_sdecl[i].fixed_len = fixed_len;
+            return;
+        }
+    if (g_nsdecl == g_capsdecl) {
+        int cap = g_capsdecl ? g_capsdecl * 2 : 16;
+        StrDecl *n = (StrDecl *)realloc(g_sdecl, (size_t)cap * sizeof *n);
+        if (!n) return;
+        g_sdecl = n; g_capsdecl = cap;
+    }
+    StrDecl *d = &g_sdecl[g_nsdecl++];
+    for (int i = 0; i < len; i++) d->name[i] = (char)toupper((unsigned char)name[i]);
+    d->name[len] = '\0';
+    d->fixed_len = fixed_len;
+}
+
+static StrDecl *strdecl_find(const char *name, size_t len) {
+    for (int i = 0; i < g_nsdecl; i++)
+        if (strlen(g_sdecl[i].name) == len && strncasecmp(g_sdecl[i].name, name, len) == 0) return &g_sdecl[i];
+    return NULL;
+}
+
+void strdecl_apply(char *name) {
+    if (!g_nsdecl) return;
+    size_t n = strlen(name);
+    if (!n || n >= MAX_VARNAME - 1) return;
+    char last = name[n - 1];
+    if (!isalnum((unsigned char)last) && last != '_') return;   /* has a type suffix */
+    if (strdecl_find(name, n)) { name[n] = '$'; name[n + 1] = '\0'; }
+}
+
+int strdecl_fixed_len(const char *name) {
+    size_t n = strlen(name);
+    if (n && name[n - 1] == '$') n--;
+    StrDecl *d = g_nsdecl ? strdecl_find(name, n) : NULL;
+    return d ? d->fixed_len : 0;
+}
+
+void str_store_fixed(char **slot, const char *s, int fixed_len) {
+    if (fixed_len <= 0) { char *n = str_dup((char *)s); free(*slot); *slot = n; return; }
+    /* Cut to the length. QBasic also pads a shorter value with spaces, but
+     * this interpreter's programs (test/test2.bas) compare such fields to
+     * the unpadded text, so a shorter value is kept as it is. */
+    size_t k = strlen(s);
+    if (k > (size_t)fixed_len) k = (size_t)fixed_len;
+    char *n = (char *)malloc(k + 1);
+    if (!n) return;
+    memcpy(n, s, k);
+    n[k] = '\0';
+    free(*slot); *slot = n;
+}
+
+/* "name AS STRING [* n]" (or "name(...) AS STRING") anywhere in a line. */
+static void strdecl_scan_line(const char *t) {
+    int in_str = 0;
+    for (const char *p = t; *p; p++) {
+        if (*p == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (*p == '\'') return;                               /* comment */
+        if (!(toupper((unsigned char)p[0]) == 'A' && toupper((unsigned char)p[1]) == 'S')) continue;
+        if (p > t && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) continue;
+        if (isalnum((unsigned char)p[2]) || p[2] == '_') continue;
+        const char *q = p + 2;
+        while (*q == ' ' || *q == '\t') q++;
+        if (strncasecmp(q, "STRING", 6) != 0 || isalnum((unsigned char)q[6]) || q[6] == '_') continue;
+        q += 6;
+        while (*q == ' ' || *q == '\t') q++;
+        int fixed = 0;
+        if (*q == '*') fixed = atoi(q + 1);
+        /* back from AS to the name: spaces, an optional (...) and the name */
+        const char *b = p - 1;
+        while (b >= t && (*b == ' ' || *b == '\t')) b--;
+        if (b >= t && *b == ')') {
+            int depth = 0;
+            while (b >= t) { if (*b == ')') depth++; else if (*b == '(') { if (--depth == 0) { b--; break; } } b--; }
+            while (b >= t && (*b == ' ' || *b == '\t')) b--;
+        }
+        const char *e = b;
+        while (b >= t && (isalnum((unsigned char)*b) || *b == '_')) b--;
+        if (e <= b) continue;                                    /* no plain name (A$ AS ...) */
+        if (b >= t && *b == '.') continue;                       /* a TYPE field */
+        strdecl_add(b + 1, (int)(e - b), fixed);
+    }
+}
+
 /* ---------------------------------------------------------------- scopes */
 int g_scope  = 0;
 int g_locals = 0;
@@ -184,6 +278,8 @@ static void shared_add(const char *name, int len) {
     if (len <= 0 || len >= MAX_VARNAME) return;
     char raw[MAX_VARNAME], cb[MAX_VARNAME];
     memcpy(raw, name, (size_t)len); raw[len] = '\0';
+    for (char *c = raw; *c; c++) *c = (char)toupper((unsigned char)*c);
+    strdecl_apply(raw);                          /* DIM SHARED A AS STRING: A$ */
     name = var_canon(raw, cb); len = (int)strlen(name);
     for (int i = 0; i < g_nshared; i++)
         if ((int)strlen(g_shared[i]) == len && strncasecmp(g_shared[i], name, len) == 0) return;
@@ -257,6 +353,9 @@ void scope_program_start(void) {
     }
     for (int i = 0; i < g_nshared; i++) free(g_shared[i]);
     g_nshared = 0;
+    g_nsdecl = 0;
+    for (int i = 0; i < g_nlines; i++)
+        if (g_lines[i].text) strdecl_scan_line(g_lines[i].text);
     g_scope = 0;
     int any = 0;
     for (int i = 0; i < g_nlines; i++) {
@@ -426,8 +525,8 @@ void var_free_arrays(Var *v) {
 mpf_t *arr_num_elem(Var *v, int i, int j) {
     static mpf_t scratch;
     static int scratch_ready = 0;
-    int oi  = i - g_option_base;
-    int oj  = j - g_option_base;
+    int oi  = i - (v->ndim ? v->lb[0] : g_option_base);
+    int oj  = j - (v->ndim ? v->lb[1] : g_option_base);
     int idx = (v->ndim == 2) ? (oi * v->dim[1] + oj) : oi;
     int total = v->arr_len;
     if (!v->arr_num || total < 1) {
@@ -444,8 +543,8 @@ mpf_t *arr_num_elem(Var *v, int i, int j) {
 
 char **arr_str_elem(Var *v, int i, int j) {
     static char *scratch = NULL;
-    int oi  = i - g_option_base;
-    int oj  = j - g_option_base;
+    int oi  = i - (v->ndim ? v->lb[0] : g_option_base);
+    int oj  = j - (v->ndim ? v->lb[1] : g_option_base);
     int idx = (v->ndim == 2) ? (oi * v->dim[1] + oj) : oi;
     int total = v->arr_len;
     if (!v->arr_str || total < 1) {

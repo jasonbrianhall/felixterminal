@@ -67,7 +67,7 @@ ARCHFLAGS := -fno-pic -fno-pie -mcmodel=kernel -mno-red-zone -msse2
 BOOTDEFS :=
 endif
 # Arrays take memory when they're DIMmed; these size the fixed tables.
-LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=65536 -DCTRL_STACK_MAX=1024 -DMAX_VARNAME=128 -DMAX_DIR_ENTRIES=512
+LIMITS   := -DMAX_VARS=1024 -DMAX_ARRAY_SIZE=4194304 -DCTRL_STACK_MAX=1024 -DMAX_VARNAME=128 -DMAX_DIR_ENTRIES=512
 else ifeq ($(ARCH),i386)
 MFLAG    := -m32
 SUFFIX   := -i386

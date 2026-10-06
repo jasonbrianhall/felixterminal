@@ -45,9 +45,9 @@ static void tilde_expand(char *buf, int bufsz) {
     if (buf[1] != '/' && buf[1] != '\0') return;
     const char *home = getenv("HOME");
     if (!home) return;
-    char tmp[DEFAULT_BUFFER];
-    snprintf(tmp, sizeof(tmp), "%s%s", home, buf + 1);
-    strncpy(buf, tmp, bufsz - 1);
+    StrBuf tmp_mem_; char *tmp = tmp_mem_.p;
+    snprintf(tmp, STR_MAX, "%s%s", home, buf + 1);
+    bstrncpy(buf, tmp, bufsz - 1);
     buf[bufsz - 1] = '\0';
 }
 
@@ -171,7 +171,7 @@ static int using_number(const char *f, double val, char *out, int outsz) {
     if (lead_plus) sign = neg ? "-" : "+";
     else if (neg && !trail_minus && !trail_plus) sign = "-";
     snprintf(body, sizeof body, "%s%s%s", sign, dollar ? "$" : "", digits);
-    int width = before + (dot ? 1 + after : 0) + (lead_plus ? 1 : 0) + (dollar && stars ? 1 : 0) + (expo ? 4 : 0);
+    int width = before + (dot ? 1 + after : 0) + (lead_plus ? 1 : 0) + (dollar ? 1 : 0) + (expo ? 4 : 0);
     int blen = (int)strlen(body);
     int o = 0;
     if (blen > width && o < outsz - 1) out[o++] = '%';       /* doesn't fit */
@@ -204,8 +204,8 @@ static char *print_using_list(char *fmt, char *p) {
         used_field = 1;
         const char *f = fmt + pos;
         if (using_is_str_start(f)) {
-            char sbuf[1024];
-            p = sk(eval_str_expr(p, sbuf, sizeof sbuf));
+            StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+            p = sk(eval_str_expr(p, sbuf, STR_MAX));
             int n = (*f == '!') ? 1 : (*f == '&') ? -1 : 0;
             int w = 1;
             if (*f == '\\') { const char *q = f + 1; while (*q != '\\') q++; n = (int)(q - f) + 1; w = n; }
@@ -280,9 +280,9 @@ static void felix_send(char *cmd) {
 }
 
 static void felix_sendf(char *fmt, ...) {
-    char buf[DEFAULT_BUFFER];
+    StrBuf buf_mem_; char *buf = buf_mem_.p;
     va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    vsnprintf(buf, STR_MAX, fmt, ap);
     va_end(ap);
     felix_send(buf);
 }
@@ -296,9 +296,9 @@ static void felix_draw(char *cmd) {
 }
 
 static void felix_drawf(char *fmt, ...) {
-    char buf[DEFAULT_BUFFER];
+    StrBuf buf_mem_; char *buf = buf_mem_.p;
     va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    vsnprintf(buf, STR_MAX, fmt, ap);
     va_end(ap);
     felix_draw(buf);
 }
@@ -409,10 +409,10 @@ static int cmd_run(Interp *ip, char *args) {
 
     if (*p == '"' || *p == '\'') {
         /* RUN "filename"  load file then run it */
-        char name[DEFAULT_BUFFER];
+        StrBuf name_mem_; char *name = name_mem_.p;
         char q = *p++;
         int ni = 0;
-        while (*p && *p != q && ni < (int)sizeof(name) - 1)
+        while (*p && *p != q && ni < (int)STR_MAX - 1)
             name[ni++] = *p++;
         name[ni] = '\0';
         if (!*name) { display_print("RUN: missing filename\n"); return 0; }
@@ -438,7 +438,7 @@ static int cmd_run(Interp *ip, char *args) {
         eval_expr(p, n);
         int linenum = (int)mpf_get_si(n);
         mpf_clear(n);
-        int idx = find_line_idx(linenum);
+        int idx = find_target_line(linenum);
         if (idx < 0) {
             basic_stderr("RUN: line %d not found\n", linenum);
             ip->running = 0;
@@ -642,8 +642,8 @@ static int cmd_sound(Interp *ip, char *args) {
 /* PLAY "mml-string"  GW-BASIC Music Macro Language */
 static int cmd_play(Interp *ip, char *args) {
     (void)ip;
-    char mml[1024];
-    eval_str_expr(sk(args), mml, sizeof mml);
+    StrBuf mml_mem_; char *mml = mml_mem_.p;
+    eval_str_expr(sk(args), mml, STR_MAX);
     sound_play(mml);
     return 0;
 }
@@ -1190,9 +1190,9 @@ static int cmd_select(Interp *ip, char *args) {
     if (kw_match(p, "CASE")) p = sk(p + 4);
 
     /* Evaluate the selector  could be string or numeric */
-    char sel_s[1024] = ""; double sel_n = 0; int sel_is_str = 0;
+    StrBuf sel_s_mem_; char *sel_s = sel_s_mem_.p; double sel_n = 0; int sel_is_str = 0;
     if (is_str_token(p)) {
-        eval_str_expr(p, sel_s, sizeof sel_s);
+        eval_str_expr(p, sel_s, STR_MAX);
         sel_is_str = 1;
     } else {
         mpf_t v; mpf_init2(v, g_prec);
@@ -1222,13 +1222,13 @@ static int cmd_select(Interp *ip, char *args) {
         while (*t && !matched) {
             t = sk(t);
             if (sel_is_str) {
-                char cval[1024];
-                t = eval_str_expr(t, cval, sizeof cval);
+                StrBuf cval_mem_; char *cval = cval_mem_.p;
+                t = eval_str_expr(t, cval, STR_MAX);
                 t = sk(t);
                 if (kw_match(t, "TO")) {
                     t = sk(t + 2);
-                    char cval2[1024];
-                    t = eval_str_expr(t, cval2, sizeof cval2);
+                    StrBuf cval2_mem_; char *cval2 = cval2_mem_.p;
+                    t = eval_str_expr(t, cval2, STR_MAX);
                     matched = (strcmp(sel_s, cval) >= 0 && strcmp(sel_s, cval2) <= 0);
                 } else {
                     matched = (strcmp(sel_s, cval) == 0);
@@ -1434,17 +1434,15 @@ static int cmd_write(Interp *ip, char *args) {
             if (!first) fprintf(fh->fp, ",");
             first = 0;
             if (is_str_token(p)) {
-                char sbuf[1024]; p = sk(eval_str_expr(p, sbuf, sizeof sbuf));
+                StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p; p = sk(eval_str_expr(p, sbuf, STR_MAX));
                 fprintf(fh->fp, "\"%s\"", sbuf);
             } else {
                 mpf_t val; mpf_init2(val, g_prec);
                 p = sk(eval_expr(p, val));
                 /* Write integer if whole, else decimal */
-                double d = mpf_get_d(val);
-                if (d == floor(d) && fabs(d) < 1e15)
-                    fprintf(fh->fp, "%.0f", d);
-                else
-                    fprintf(fh->fp, "%.7G", d);
+                char nb[64];
+                fmt_num(mpf_get_d(val), nb, sizeof nb);
+                fputs(nb, fh->fp);
                 mpf_clear(val);
             }
             p = sk(p);
@@ -1460,19 +1458,15 @@ static int cmd_write(Interp *ip, char *args) {
         if (!first) display_putchar(',');
         first = 0;
         if (is_str_token(p)) {
-            char sbuf[1024]; p = sk(eval_str_expr(p, sbuf, sizeof sbuf));
+            StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p; p = sk(eval_str_expr(p, sbuf, STR_MAX));
             display_putchar('"');
             display_print(sbuf);
             display_putchar('"');
         } else {
             mpf_t val; mpf_init2(val, g_prec);
             p = sk(eval_expr(p, val));
-            double d = mpf_get_d(val);
             char nbuf[64];
-            if (d == floor(d) && fabs(d) < 1e15)
-                snprintf(nbuf, sizeof nbuf, "%.0f", d);
-            else
-                snprintf(nbuf, sizeof nbuf, "%.7G", d);
+            fmt_num(mpf_get_d(val), nbuf, sizeof nbuf);
             display_print(nbuf);
             mpf_clear(val);
         }
@@ -1691,6 +1685,7 @@ static void array_move(Var *to, Var *from) {
     var_free_arrays(to);
     to->kind = from->kind;
     memcpy(to->dim, from->dim, sizeof to->dim);
+    memcpy(to->lb, from->lb, sizeof to->lb);
     to->ndim = from->ndim;
     to->arr_len = from->arr_len; to->arr_num = from->arr_num; to->arr_str = from->arr_str;
     from->arr_len = 0; from->arr_num = NULL; from->arr_str = NULL;
@@ -1945,6 +1940,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
                    && pi < MAX_VARNAME - 1)
                 pname[pi++] = *ps++;
             pname[pi] = '\0';
+            strdecl_apply(pname);              /* A AS STRING: A$ */
             /* skip optional () for array params */
             ps = sk(ps);
             if (*ps == '(') { ps++; while (*ps && *ps != ')') ps++; if (*ps == ')') ps++; }
@@ -1952,7 +1948,7 @@ static int call_sub(Interp *ip, char *args, int bare) {
             ps = sk(ps);
             if (strncasecmp(ps, "AS", 2) == 0 && isspace((unsigned char)ps[2])) {
                 ps = sk(ps + 2);
-                while (isalnum((unsigned char)*ps) || *ps == '_' || *ps == ' ') ps++;
+                while (*ps && *ps != ',' && *ps != ')') ps++;      /* the type, even STRING * n */
             }
 
             /* --- evaluate one call-site argument --- */
@@ -1973,8 +1969,8 @@ static int call_sub(Interp *ip, char *args, int bare) {
                 while (*look && *look != ')') look++;
                 cs = sk(look + 1);
             } else if (a->is_str) {
-                char sbuf[DEFAULT_BUFFER];
-                cs = sk(eval_str_expr(cs, sbuf, sizeof sbuf));
+                StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+                cs = sk(eval_str_expr(cs, sbuf, STR_MAX));
                 a->str = str_dup(sbuf);
             } else {
                 mpf_init2(a->num, g_prec);
@@ -2137,37 +2133,49 @@ static int cmd_dim(Interp *ip, char *args) {
         if (*p == '(') {
             p = sk(p + 1);
 
-            #define PARSE_DIM(out_size) do { \
+            /* (n) is OPTION BASE to n; (a TO b) is a to b. */
+            #define PARSE_DIM(out_size, out_lb) do { \
                 mpf_t _a; mpf_init2(_a, g_prec); \
                 p = sk(eval_expr(sk(p), _a)); \
                 if (kw_match(p, "TO")) { \
+                    (out_lb) = (int)mpf_get_si(_a); \
                     mpf_clear(_a); \
                     p = sk(p + 2); \
                     mpf_t _b; mpf_init2(_b, g_prec); \
                     p = sk(eval_expr(sk(p), _b)); \
-                    (out_size) = (int)mpf_get_si(_b) + 1 - g_option_base; \
+                    (out_size) = (int)mpf_get_si(_b) + 1 - (out_lb); \
                     mpf_clear(_b); \
                 } else { \
+                    (out_lb) = g_option_base; \
                     (out_size) = (int)mpf_get_si(_a) + 1 - g_option_base; \
                     mpf_clear(_a); \
                 } \
             } while(0)
 
-            int dim1, dim2 = 1, ndim = 1;
-            PARSE_DIM(dim1);
-            if (*p == ',') { p = sk(p + 1); PARSE_DIM(dim2); ndim = 2; }
+            int dim1, dim2 = 1, ndim = 1, lb1, lb2 = g_option_base;
+            PARSE_DIM(dim1, lb1);
+            if (*p == ',') { p = sk(p + 1); PARSE_DIM(dim2, lb2); ndim = 2; }
             #undef PARSE_DIM
 
             if (*p == ')') p++;
             if (dim1 < 1) dim1 = 1;
             if (dim2 < 1) dim2 = 1;
+            /* 64-bit: DIM A(100000, 100000) mustn't wrap around. Too big
+             * shrinks the first dimension, so the shape still matches what
+             * was allocated. */
+            long long want = (long long)dim1 * dim2;
+            if (want > MAX_ARRAY_SIZE) {
+                basic_stderr("Array too large: %lld elements (limit %d)\n", want, (int)MAX_ARRAY_SIZE);
+                dim1 = (int)(MAX_ARRAY_SIZE / dim2);
+                if (dim1 < 1) { dim1 = 1; dim2 = MAX_ARRAY_SIZE; }
+            }
             int total = dim1 * dim2;
-            if (total > MAX_ARRAY_SIZE) { basic_stderr("Array too large: %d\n", total); total = MAX_ARRAY_SIZE; }
             int is_str = var_is_str_name(name);
             /* A plain variable of the same name becomes the array. */
             if (v->kind == VAR_STR && v->str) { free(v->str); v->str = NULL; }
             v->kind = is_str ? VAR_ARRAY_STR : VAR_ARRAY_NUM;
             v->dim[0] = dim1; v->dim[1] = dim2; v->ndim = ndim;
+            v->lb[0] = lb1; v->lb[1] = lb2;
             if (!var_alloc_array(v, total, is_str))
                 basic_stderr("Out of memory for array %s(%d)\n", name, total);
         }
@@ -2208,6 +2216,7 @@ static int cmd_dim(Interp *ip, char *args) {
                     fv->kind = fs ? VAR_ARRAY_STR : VAR_ARRAY_NUM;
                     fv->ndim = base_v->ndim;
                     fv->dim[0] = base_v->dim[0]; fv->dim[1] = base_v->dim[1];
+                    fv->lb[0] = base_v->lb[0]; fv->lb[1] = base_v->lb[1];
                     if (!var_alloc_array(fv, base_v->arr_len, fs))
                         basic_stderr("Out of memory for array %s\n", flatname);
                 }
@@ -2215,6 +2224,15 @@ static int cmd_dim(Interp *ip, char *args) {
         }
         if (*p == ',') p = sk(p + 1);
     }
+    return 0;
+}
+
+/* A TYPE field's AS STRING * n length (0: variable length). */
+static int field_fixed_len(const char *field) {
+    for (int ti = 0; ti < g_ntypedefs; ti++)
+        for (int fi = 0; fi < g_typedefs[ti].nfields; fi++)
+            if (strcasecmp(g_typedefs[ti].fields[fi].name, field) == 0)
+                return g_typedefs[ti].fields[fi].fixed_len;
     return 0;
 }
 
@@ -2239,10 +2257,10 @@ static int cmd_let(Interp *ip, char *args) {
                 int fstr;
                 Var *fa = fr.nidx ? field_array(fr.base, fr.field, &fstr) : NULL;
                 if (fa && fstr) {
-                    char sbuf[1024];
-                    eval_str_expr(after, sbuf, sizeof sbuf);
+                    StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+                    eval_str_expr(after, sbuf, STR_MAX);
                     char **e = arr_str_elem(fa, fr.i, fr.j);
-                    free(*e); *e = str_dup(sbuf);
+                    str_store_fixed(e, sbuf, field_fixed_len(fr.field));
                     return 0;
                 }
                 if (fa) {
@@ -2257,13 +2275,14 @@ static int cmd_let(Interp *ip, char *args) {
                              strrchr(flatname, '.') != NULL;
                 /* Determine by trying string eval if it looks like a string */
                 if (is_str_token(after)) {
-                    char sbuf[1024];
-                    eval_str_expr(after, sbuf, sizeof sbuf);
+                    StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+                    eval_str_expr(after, sbuf, STR_MAX);
                     /* store as string  append $ sigil if not present */
                     char sname[MAX_VARNAME];
                     snprintf(sname, sizeof sname, "%s$", flatname);
                     Var *v = var_get(sname);
-                    free(v->str); v->str = str_dup(sbuf);
+                    const char *dot = strrchr(flatname, '.');
+                    str_store_fixed(&v->str, sbuf, dot ? field_fixed_len(dot + 1) : 0);
                 } else {
                     mpf_t val; mpf_init2(val, g_prec);
                     eval_expr(after, val);
@@ -2290,14 +2309,15 @@ static int cmd_let(Interp *ip, char *args) {
     }
     if (*p == '=') p = sk(p + 1);
     if (var_is_str_name(name)) {
-        char sbuf[1024];
-        eval_str_expr(sk(p), sbuf, sizeof sbuf);
+        StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+        eval_str_expr(sk(p), sbuf, STR_MAX);
         Var *v = var_get(name);
+        int fixed = strdecl_fixed_len(name);     /* DIM S AS STRING * 10 */
         if (is_arr && v->kind == VAR_ARRAY_STR) {
             char **slot = arr_str_elem(v, arr_i, arr_j);
-            free(*slot); *slot = str_dup(sbuf);
+            str_store_fixed(slot, sbuf, fixed);
         } else {
-            free(v->str); v->str = str_dup(sbuf);
+            str_store_fixed(&v->str, sbuf, fixed);
         }
     } else {
         mpf_t val; mpf_init2(val, g_prec);
@@ -2310,9 +2330,72 @@ static int cmd_let(Interp *ip, char *args) {
 }
 
 /* ================================================================
+ * MID$(target$, start [, length]) = replacement$
+ * Overwrites characters in place; the string's length never changes.
+ * ================================================================ */
+static int cmd_mid_stmt(Interp *ip, char *args) {
+    (void)ip;
+    char *p = sk(args);
+    if (*p != '(') { basic_stderr("MID$: syntax error\n"); return 0; }
+    p = sk(p + 1);
+    char name[MAX_VARNAME];
+    p = sk(read_varname(p, name));
+    int is_arr = 0, ai = 0, aj = 1;
+    if (*p == '(') {
+        is_arr = 1; p = sk(p + 1);
+        mpf_t i1; mpf_init2(i1, g_prec);
+        p = sk(eval_expr(p, i1)); ai = (int)mpf_get_si(i1);
+        if (*p == ',') { p = sk(p + 1); p = sk(eval_expr(p, i1)); aj = (int)mpf_get_si(i1); }
+        mpf_clear(i1);
+        if (*p == ')') p = sk(p + 1);
+    }
+    if (*p == ',') p = sk(p + 1);
+    mpf_t t; mpf_init2(t, g_prec);
+    p = sk(eval_expr(p, t));
+    long start = mpf_get_si(t), len = -1;
+    if (*p == ',') { p = sk(p + 1); p = sk(eval_expr(p, t)); len = mpf_get_si(t); }
+    mpf_clear(t);
+    if (*p == ')') p = sk(p + 1);
+    if (*p == '=') p = sk(p + 1);
+    StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+    eval_str_expr(p, sbuf, STR_MAX);
+    if (!var_is_str_name(name)) { basic_stderr("MID$: %s is not a string\n", name); return 0; }
+    Var *v = var_get(name);
+    char **slot = (is_arr && v->kind == VAR_ARRAY_STR) ? arr_str_elem(v, ai, aj) : &v->str;
+    if (!*slot) *slot = str_dup("");
+    long have = (long)strlen(*slot);
+    if (start < 1 || start > have) {
+        if (start < 1) basic_stderr("MID$: illegal start %ld\n", start);
+        return 0;
+    }
+    long n = (long)strlen(sbuf);
+    if (len >= 0 && len < n) n = len;
+    if (start - 1 + n > have) n = have - (start - 1);
+    memcpy(*slot + start - 1, sbuf, (size_t)n);
+    return 0;
+}
+
+/* ================================================================
  * PRINT
  * ================================================================ */
 static int cmd_print_file(Interp *ip, char *args);  /* forward */
+
+/* PRINT's comma: on to the next 14-column zone, or the next line. */
+static void print_next_zone(void) {
+    int col = display_get_col(), w = display_get_width();
+    int next = ((col - 1) / 14 + 1) * 14 + 1;
+    if (w > 0 && next + 13 > w) display_newline();
+    else display_spc(next - col);
+}
+/* TAB(n): to column n; if the cursor is already past it, on the next line. */
+static void print_tab(int col) {
+    int w = display_get_width();
+    if (w > 0 && col > w) col = (col - 1) % w + 1;
+    if (col < 1) col = 1;
+    int cur = display_get_col();
+    if (cur > col) { display_newline(); cur = 1; }
+    display_spc(col - cur);
+}
 
 static int cmd_print(Interp *ip, char *args) {
     (void)ip;
@@ -2321,8 +2404,8 @@ static int cmd_print(Interp *ip, char *args) {
 
     if (kw_match(p, "USING")) {
         p = sk(p + 5);
-        char fmt[1024];
-        p = sk(eval_str_expr(p, fmt, sizeof fmt));   /* a literal or any string expression */
+        StrBuf fmt_mem_; char *fmt = fmt_mem_.p;
+        p = sk(eval_str_expr(p, fmt, STR_MAX));   /* a literal or any string expression */
         if (*p == ';' || *p == ',') p = sk(p + 1);
         print_using_list(fmt, p);
         return 0;
@@ -2340,37 +2423,36 @@ static int cmd_print(Interp *ip, char *args) {
             } else if (kw_match(p, "TAB")) {
                 p = sk(p + 3); if (*p == '(') p++;
                 mpf_t n; mpf_init2(n, g_prec); p = eval_expr(sk(p), n);
-                int col = (int)mpf_get_si(n) - 1; mpf_clear(n);
+                int col = (int)mpf_get_si(n); mpf_clear(n);
                 p = sk(p); if (*p == ')') p = sk(p + 1);
-                if (col > 0) display_spc(col);
+                print_tab(col);
             } else {
-                char sbuf[1024];
-                p = eval_str_expr(p, sbuf, sizeof sbuf);
-                display_print(sbuf);
+                StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+                p = eval_str_expr(p, sbuf, STR_MAX);
+                /* A$ = B$ and the like: the comparison, printed as a number */
+                mpf_t cmpv; mpf_init2(cmpv, g_prec);
+                char *after = str_compare_tail(p, sbuf, cmpv);
+                if (after) {
+                    p = after;
+                    char nb[64], out[72];
+                    fmt_num(mpf_get_d(cmpv), nb, sizeof nb);
+                    snprintf(out, sizeof out, nb[0] == '-' ? "%s " : " %s ", nb);
+                    display_print(out);
+                } else display_print(sbuf);
+                mpf_clear(cmpv);
             }
         } else {
             mpf_t val; mpf_init2(val, g_prec);
             p = eval_expr(p, val);
-            double d = mpf_get_d(val);
-            if (d == floor(d) && fabs(d) < 1e15) {
-                if (d >= 0) printf(" %.0f ", d);
-                else        printf("%.0f ", d);
-            } else {
-                char buf[64];
-                snprintf(buf, sizeof buf, "%.7G", d);
-                if (strchr(buf, '.') && !strchr(buf, 'E')) {
-                    char *end = buf + strlen(buf) - 1;
-                    while (*end == '0') *end-- = '\0';
-                    if (*end == '.') *end = '\0';
-                }
-                if (d >= 0) printf(" %s ", buf);
-                else        printf("%s ", buf);
-            }
+            char buf[64], out[72];
+            fmt_num(mpf_get_d(val), buf, sizeof buf);
+            snprintf(out, sizeof out, buf[0] == '-' ? "%s " : " %s ", buf);
+            display_print(out);
             mpf_clear(val);
         }
         p = sk(p);
         if (*p == ';') { trailing_sep = 1; p = sk(p + 1); }
-        else if (*p == ',') { display_putchar('\t'); trailing_sep = 1; p = sk(p + 1); }
+        else if (*p == ',') { print_next_zone(); trailing_sep = 1; p = sk(p + 1); }
         else break;
     }
     if (!trailing_sep) display_newline();
@@ -2397,8 +2479,8 @@ static int cmd_debug(Interp *ip, char *args) {
                 p = sk(p); if (*p == ')') p = sk(p + 1);
                 mpf_clear(n);
             } else {
-                char sbuf[1024];
-                p = eval_str_expr(p, sbuf, sizeof sbuf);
+                StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+                p = eval_str_expr(p, sbuf, STR_MAX);
                 SDL_Log("%s", sbuf);
             }
         } else {
@@ -2448,9 +2530,9 @@ static int cmd_line_input(Interp *ip, char *args) {
     p = sk(p); if (*p == ';' || *p == ',') p = sk(p + 1);
     char name[MAX_VARNAME];
     read_varname(p, name);
-    char linebuf[DEFAULT_BUFFER];
+    StrBuf linebuf_mem_; char *linebuf = linebuf_mem_.p;
     display_cursor(1);
-    display_getline(linebuf, sizeof linebuf);
+    display_getline(linebuf, STR_MAX);
 #ifndef USE_SDL_WINDOW
     display_newline();
 #endif
@@ -2481,9 +2563,9 @@ static int cmd_input(Interp *ip, char *args) {
     } else {
         display_print("? ");
     }
-    char linebuf[DEFAULT_BUFFER];
+    StrBuf linebuf_mem_; char *linebuf = linebuf_mem_.p;
     display_cursor(1);
-    display_getline(linebuf, sizeof linebuf);
+    display_getline(linebuf, STR_MAX);
 #ifndef USE_SDL_WINDOW
     display_newline();
 #endif
@@ -2492,15 +2574,15 @@ static int cmd_input(Interp *ip, char *args) {
         char name[MAX_VARNAME];
         p = sk(read_varname(sk(p), name));
         char *comma = strchr(tok, ',');
-        char val_str[DEFAULT_BUFFER];
+        StrBuf val_str_mem_; char *val_str = val_str_mem_.p;
         if (comma) {
             size_t len = (size_t)(comma - tok);
-            if (len >= sizeof val_str) len = sizeof val_str - 1;
+            if (len >= STR_MAX) len = STR_MAX - 1;
             memcpy(val_str, tok, len); val_str[len] = '\0';
             tok = comma + 1;
         } else {
-            strncpy(val_str, tok, sizeof val_str - 1);
-            val_str[sizeof val_str - 1] = '\0';
+            bstrncpy(val_str, tok, STR_MAX - 1);
+            val_str[STR_MAX - 1] = '\0';
             tok += strlen(tok);
         }
         char *v_start = val_str;
@@ -2522,10 +2604,10 @@ static int cmd_open(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
     /* The filename is any string expression: "x.bas", f$, d$ + "\" + f$ */
-    char filename[DEFAULT_BUFFER];
+    StrBuf filename_mem_; char *filename = filename_mem_.p;
     filename[0] = '\0';
-    p = eval_str_expr(p, filename, sizeof filename);
-    tilde_expand(filename, sizeof(filename));
+    p = eval_str_expr(p, filename, STR_MAX);
+    tilde_expand(filename, STR_MAX);
     p = sk(p);
     char mode_ch = 'O';
     if (kw_match(p, "FOR")) {
@@ -2586,8 +2668,8 @@ static int cmd_input_file(Interp *ip, char *args) {
     while (*p) {
         char name[MAX_VARNAME];
         p = sk(read_varname(sk(p), name));
-        char linebuf[DEFAULT_BUFFER];
-        if (!fgets(linebuf, sizeof linebuf, fh->fp)) linebuf[0] = '\0';
+        StrBuf linebuf_mem_; char *linebuf = linebuf_mem_.p;
+        if (!fgets(linebuf, STR_MAX, fh->fp)) linebuf[0] = '\0';
         linebuf[strcspn(linebuf, "\r\n")] = '\0';
         char *val = linebuf;
         while (isspace((unsigned char)*val)) val++;
@@ -2613,15 +2695,13 @@ static int cmd_print_file(Interp *ip, char *args) {
     while (*p) {
         trailing = 0;
         if (is_str_token(p)) {
-            char sbuf[1024]; p = eval_str_expr(p, sbuf, sizeof sbuf); fputs(sbuf, fh->fp);
+            StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p; p = eval_str_expr(p, sbuf, STR_MAX); fputs(sbuf, fh->fp);
         } else {
             mpf_t val; mpf_init2(val, g_prec);
             p = eval_expr(p, val);
-            double d = mpf_get_d(val); mpf_clear(val);
-            if (d == floor(d) && fabs(d) < 1e15)
-                fprintf(fh->fp, d >= 0 ? " %.0f " : "%.0f ", d);
-            else
-                fprintf(fh->fp, d >= 0 ? " %g " : "%g ", d);
+            char nb[64];
+            fmt_num(mpf_get_d(val), nb, sizeof nb); mpf_clear(val);
+            fprintf(fh->fp, nb[0] == '-' ? "%s " : " %s ", nb);
         }
         p = sk(p);
         if      (*p == ';') { trailing = 1; p = sk(p + 1); }
@@ -2643,8 +2723,8 @@ static int cmd_line_input_file(Interp *ip, char *args) {
     if (!fh->fp || fh->mode != 'I') { basic_stderr("File #%d not open for input\n", n); return 0; }
     char name[MAX_VARNAME];
     read_varname(sk(p), name);
-    char linebuf[DEFAULT_BUFFER];
-    if (!fgets(linebuf, sizeof linebuf, fh->fp)) linebuf[0] = '\0';
+    StrBuf linebuf_mem_; char *linebuf = linebuf_mem_.p;
+    if (!fgets(linebuf, STR_MAX, fh->fp)) linebuf[0] = '\0';
     linebuf[strcspn(linebuf, "\r\n")] = '\0';
     Var *v = var_get(name);
     free(v->str); v->str = str_dup(linebuf);
@@ -3047,7 +3127,7 @@ static int cmd_for(Interp *ip, char *args) {
 
     if (g_ctrl_top >= CTRL_STACK_MAX) { basic_stacktrace("Stack overflow"); return -1; }
     CtrlFrame *f = &g_ctrl[g_ctrl_top++];
-    strncpy(f->varname, vname, MAX_VARNAME - 1);
+    bstrncpy(f->varname, vname, MAX_VARNAME - 1);
     mpf_init2(f->limit, g_prec); mpf_set(f->limit, limit);
     mpf_init2(f->step,  g_prec); mpf_set(f->step,  step);
     f->line_idx = ip->pc;
@@ -3057,8 +3137,9 @@ static int cmd_for(Interp *ip, char *args) {
 
 static int cmd_next(Interp *ip, char *args) {
     char *p = sk(args);
+  next_var:;
     char vname[MAX_VARNAME] = "";
-    if (isalpha((unsigned char)*p)) read_varname(p, vname);
+    if (isalpha((unsigned char)*p)) p = sk(read_varname(p, vname));
     int fi = g_ctrl_top - 1;
     if (*vname) {
         for (fi = g_ctrl_top - 1; fi >= 0; fi--)
@@ -3072,7 +3153,11 @@ static int cmd_next(Interp *ip, char *args) {
     int done = (mpf_sgn(f->step) > 0)
              ? (mpf_cmp(cv->num, f->limit) > 0)
              : (mpf_cmp(cv->num, f->limit) < 0);
-    if (done) { mpf_clear(f->limit); mpf_clear(f->step); g_ctrl_top = fi; return 0; }
+    if (done) {
+        mpf_clear(f->limit); mpf_clear(f->step); g_ctrl_top = fi;
+        if (*p == ',') { p = sk(p + 1); goto next_var; }   /* NEXT J, I: on to the outer loop */
+        return 0;
+    }
 
 #ifdef USE_SDL_WINDOW
     /* Pace FOR loops at about a million iterations a second, so delay loops
@@ -3120,7 +3205,7 @@ int cmd_goto(Interp *ip, char *args) {
     char *p = sk(args);
     int idx;
     if (isdigit((unsigned char)*p)) {
-        idx = find_line_idx(atoi(p));
+        idx = find_target_line(atoi(p));
     } else {
         /* label-based jump: read the identifier and look it up */
         char lname[MAX_VARNAME]; int i = 0;
@@ -3166,13 +3251,13 @@ static int eval_one_cmp(char **pp) {
     if (*p == '(') {
         p++;
         if (is_str_token(p)) {
-            char lhs[1024], rhs[1024];
-            p = sk(eval_str_or_inkey(p, lhs, sizeof lhs));
+            StrBuf lhs_mem_; char *lhs = lhs_mem_.p; StrBuf rhs_mem_; char *rhs = rhs_mem_.p;
+            p = sk(eval_str_or_inkey(p, lhs, STR_MAX));
             char op2[3] = {p[0], p[0] ? p[1] : '\0', '\0'}; int oplen = 2;
             if (!strcmp(op2,"<>")||!strcmp(op2,"><")||!strcmp(op2,"<=")||
                 !strcmp(op2,"=<")||!strcmp(op2,">=")||!strcmp(op2,"=>")) ;
             else { op2[1] = '\0'; oplen = 1; }
-            p = sk(eval_str_or_inkey(sk(p + oplen), rhs, sizeof rhs));
+            p = sk(eval_str_or_inkey(sk(p + oplen), rhs, STR_MAX));
             int c = strcmp(lhs, rhs);
             if      (!strcmp(op2,"<>")||!strcmp(op2,"><")) cmp=(c!=0);
             else if (!strcmp(op2,"<=")||!strcmp(op2,"=<")) cmp=(c<=0);
@@ -3226,13 +3311,13 @@ static int eval_one_cmp(char **pp) {
     }
 
     if (is_str_token(p)) {
-        char lhs[1024], rhs[1024];
-        p = sk(eval_str_or_inkey(p, lhs, sizeof lhs));
+        StrBuf lhs_mem_; char *lhs = lhs_mem_.p; StrBuf rhs_mem_; char *rhs = rhs_mem_.p;
+        p = sk(eval_str_or_inkey(p, lhs, STR_MAX));
         char op2[3] = {p[0], p[0] ? p[1] : '\0', '\0'}; int oplen = 2;
         if (!strcmp(op2,"<>")||!strcmp(op2,"><")||!strcmp(op2,"<=")||
             !strcmp(op2,"=<")||!strcmp(op2,">=")||!strcmp(op2,"=>")) ;
         else { op2[1]='\0'; oplen=1; }
-        p = sk(eval_str_or_inkey(sk(p + oplen), rhs, sizeof rhs));
+        p = sk(eval_str_or_inkey(sk(p + oplen), rhs, STR_MAX));
         int c = strcmp(lhs, rhs);
         if      (!strcmp(op2,"<>")||!strcmp(op2,"><")) cmp=(c!=0);
         else if (!strcmp(op2,"<=")||!strcmp(op2,"=<")) cmp=(c<=0);
@@ -3425,7 +3510,7 @@ static int cmd_restore(Interp *ip, char *args) {
     int target_idx = -1;
     if (isdigit((unsigned char)*p)) {
         int linenum = atoi(p);
-        target_idx = find_line_idx(linenum);
+        target_idx = find_target_line(linenum);
     } else {
         char lname[MAX_VARNAME]; int i = 0;
         while ((isalnum((unsigned char)*p) || *p == '_') && i < MAX_VARNAME - 1)
@@ -3521,17 +3606,18 @@ static int cmd_on(Interp *ip, char *args) {
     if      (kw_match(p,"GOSUB")) { is_gosub=1; p=sk(p+5); }
     else if (kw_match(p,"GOTO"))  {             p=sk(p+4); }
     else return 0;
-    int targets[64]; int nt = 0;
+    /* Targets are line numbers or labels: ON X GOTO 100, Done */
+    char targets[64][MAX_VARNAME]; int nt = 0;
     while (*p && nt < 64) {
         p = sk(p);
-        if (!isdigit((unsigned char)*p)) break;
-        targets[nt++] = atoi(p);
-        while (isdigit((unsigned char)*p)) p++;
-        p = sk(p); if (*p == ',') p++;
+        if (!isalnum((unsigned char)*p) && *p != '_') break;
+        int i = 0;
+        while ((isalnum((unsigned char)*p) || *p == '_') && i < MAX_VARNAME - 1) targets[nt][i++] = *p++;
+        targets[nt++][i] = '\0';
+        p = sk(p); if (*p == ',') p++; else break;
     }
     if (idx < 1 || idx > nt) return 0;
-    char num[32]; snprintf(num, sizeof num, "%d", targets[idx - 1]);
-    return is_gosub ? cmd_gosub(ip, num) : cmd_goto(ip, num);
+    return is_gosub ? cmd_gosub(ip, targets[idx - 1]) : cmd_goto(ip, targets[idx - 1]);
 }
 
 /* ================================================================
@@ -3640,6 +3726,7 @@ const Command commands[] = {
     { "ON ERROR",   cmd_on_error   },
     { "ON",         cmd_on         },
     { "RESUME",     cmd_resume     },
+    { "MID$",       cmd_mid_stmt   },
     { "ERROR",      cmd_error      },
     { "WRITE",      cmd_write      },
     { "TRON",       cmd_tron       },
@@ -3757,6 +3844,7 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
 
     for (int i = 0; commands[i].keyword; i++) {
         char *kw = commands[i].keyword;
+        if (toupper((unsigned char)*p) != (unsigned char)kw[0]) continue;   /* cheap first-letter reject */
         size_t len = strlen(kw);
         if (strncasecmp(p, kw, len) == 0) {
             char next = p[len];

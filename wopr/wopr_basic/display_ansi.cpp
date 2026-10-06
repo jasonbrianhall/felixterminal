@@ -56,6 +56,38 @@ static int g_raw = 0;
 #endif
 static int g_width = 80;
 
+/* The column the next character lands in (0-based), followed through
+ * everything written: text, newlines, and the cursor moves among ANSI
+ * escape sequences. */
+static int s_col = 0;
+void display_note_output(const char *s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == 0x1B && s[1] == '[') {                 /* CSI ... final */
+            const char *q = s + 2;
+            int nums[2] = { 0, 0 }, n = 0;
+            while (*q && !isalpha((unsigned char)*q)) {
+                if (isdigit((unsigned char)*q)) { if (n < 2) nums[n] = nums[n] * 10 + (*q - '0'); }
+                else if (*q == ';') n++;
+                q++;
+            }
+            if (*q == 'H' || *q == 'f') s_col = n >= 1 && nums[1] > 0 ? nums[1] - 1 : 0;
+            else if (*q == 'G') s_col = nums[0] > 0 ? nums[0] - 1 : 0;
+            else if (*q == 'C') s_col += nums[0] > 0 ? nums[0] : 1;
+            else if (*q == 'D') { s_col -= nums[0] > 0 ? nums[0] : 1; if (s_col < 0) s_col = 0; }
+            if (!*q) return;
+            s = q;
+        } else if (c == 0x1B) {
+            if (s[1]) s++;
+        } else if (c == '\n' || c == '\r') s_col = 0;
+        else if (c == '\b') { if (s_col > 0) s_col--; }
+        else if (c == '\t') s_col = (s_col / 8 + 1) * 8;
+        else if (c >= 0x20 && (c & 0xC0) != 0x80) s_col++;   /* not a UTF-8 continuation byte */
+    }
+}
+int display_get_col(void) { return s_col + 1; }
+
 /* CGA index → ANSI colour number (for fg: 30+n, bg: 40+n) */
 static const int cga_to_ansi[16] = {
     0, 4, 2, 6, 1, 5, 3, 7,   /* 0-7  normal */
@@ -137,6 +169,7 @@ void display_shutdown(void)
 
 void display_cls(void)
 {
+    s_col = 0;
 #if defined(FELIX_BASIC)
     felix_basic_cls();
 #else
@@ -147,6 +180,7 @@ void display_cls(void)
 
 void display_locate(int row, int col)
 {
+    if (col >= 1) s_col = col - 1;
 #if defined(FELIX_BASIC)
     (void)row; (void)col;
     felix_basic_flush_partial();
@@ -198,6 +232,7 @@ void display_width(int cols)
 
 void display_print(char *s)
 {
+    display_note_output(s);
 #ifdef WOPR
     if (strcmp(s, "Ok\n") == 0) return;
     // Suppress output while waiting for input to avoid double echo
@@ -214,6 +249,7 @@ void display_print(char *s)
 
 void display_putchar(int c)
 {
+    { char t[2] = { (char)c, 0 }; display_note_output(t); }
 #ifdef WOPR
     g_basic_suppress_newline = 0;
     char tmp[2] = { (char)c, 0 };
@@ -229,6 +265,7 @@ void display_putchar(int c)
 
 void display_newline(void)
 {
+    s_col = 0;
 #ifdef WOPR
     if (g_basic_suppress_newline) {
         g_basic_suppress_newline = 0;
@@ -258,6 +295,7 @@ void display_cursor(int visible)
 
 void display_spc(int n)
 {
+    if (n > 0) s_col += n;
 #ifdef WOPR
     for (int i = 0; i < n; i++) wopr_basic_push_line(" ");
 #elif defined(FELIX_BASIC)
@@ -358,7 +396,14 @@ int display_inkey(void)
 }
 
 /* Blocking line read */
+static int display_getline_impl(char *buf, int bufsz);
 int display_getline(char *buf, int bufsz)
+{
+    int r = display_getline_impl(buf, bufsz);
+    s_col = 0;                                   /* the line ended with Enter */
+    return r;
+}
+static int display_getline_impl(char *buf, int bufsz)
 {
 #ifdef WOPR
     if (!basic_shim_fgets(buf, bufsz)) {

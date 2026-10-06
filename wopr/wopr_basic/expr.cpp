@@ -33,6 +33,7 @@ int                   g_current_pc =  0;
 /* ON ERROR GOTO handler state */
 char g_error_handler[MAX_VARNAME] = "";  /* label/line of handler, "" = none */
 int  g_error_resume_pc = -1;             /* pc to RESUME to */
+StrBufCache g_strbuf_cache;               /* basic.h: StrBuf */
 int  g_err  = 0;                         /* last error code */
 int  g_err_raised = 0;   /* code a statement raised (ERROR n, OPEN failure); 0 = generic */
 int  g_erl  = 0;                         /* line number where error occurred */
@@ -87,6 +88,44 @@ static ConstEntry *const_find(char *name) {
 /* ================================================================
  * Utility helpers
  * ================================================================ */
+void fmt_num(double d, char *buf, int bufsz) {
+    d += 0.0;                                     /* -0 prints as 0 */
+    if (d == floor(d) && fabs(d) < 1e15) { snprintf(buf, bufsz, "%.0f", d); return; }
+    char t[64];
+    snprintf(t, sizeof t, "%.7G", d);
+    if (strcmp(t, "-0") == 0 || strcmp(t, "0") == 0) { snprintf(buf, bufsz, "0"); return; }
+    /* QBasic leaves off the zero before the point: .5, -.25 */
+    const char *s = t;
+    char out[64]; int o = 0;
+    if (*s == '-') out[o++] = *s++;
+    if (s[0] == '0' && s[1] == '.') s++;
+    snprintf(out + o, sizeof out - o, "%s", s);
+    snprintf(buf, bufsz, "%s", out);
+}
+
+/* &H1F, &O17, &17, &B101 at p: the value in *v and the end, or NULL. */
+static char *radix_literal(char *p, long *v) {
+    if (*p != '&') return NULL;
+    int base = 8; char *q = p + 1;
+    char c = (char)toupper((unsigned char)*q);
+    if (c == 'H') { base = 16; q++; }
+    else if (c == 'O') { base = 8; q++; }
+    else if (c == 'B') { base = 2; q++; }
+    else if (!(*q >= '0' && *q <= '7')) return NULL;
+    char *end;
+    *v = strtol(q, &end, base);
+    return end == q ? NULL : end;
+}
+
+/* HEX$/OCT$ of a negative number: its two's complement as an INTEGER
+ * (16 bits) when it fits, else as a LONG (32 bits), as QBasic shows them. */
+static unsigned long radix_unsigned(double d) {
+    long v = (long)(d >= 0 ? floor(d + 0.5) : -floor(-d + 0.5));
+    if (v >= 0) return (unsigned long)v;
+    if (v >= -32768) return (unsigned long)(v & 0xFFFF);
+    return (unsigned long)(v & 0xFFFFFFFFL);
+}
+
 char *str_dup(char *s) {
     char *d = (char *) malloc(strlen(s) + 1);
     if (!d) {
@@ -113,10 +152,12 @@ char *read_varname(char *p, char *name) {
     if (*p == '$' || *p == '#' || *p == '!' || *p == '%' || *p == '&')
         name[i++] = *p++;
     name[i] = '\0';
+    strdecl_apply(name);                  /* DIM S AS STRING: S is S$ */
     return p;
 }
 
 int kw_match(char *p, char *kw) {
+    if (toupper((unsigned char)*p) != toupper((unsigned char)*kw)) return 0;   /* cheap first-letter reject */
     size_t len = strlen(kw);
     if (strncasecmp(p, kw, len) != 0) return 0;
     char next = p[len];
@@ -127,16 +168,17 @@ int kw_match(char *p, char *kw) {
  * String expression evaluator
  * ================================================================ */
 static char *eval_str_primary(char *p, char *buf, int bufsz);
+char *str_user_fn(char *p, char *buf, int bufsz);
 
 char *eval_str_expr(char *s, char *buf, int bufsz) {
     buf[0] = '\0';
     s = sk(s);
-    char tmp[1024];
-    s = eval_str_primary(s, tmp, sizeof tmp);
+    StrBuf tmp_mem_; char *tmp = tmp_mem_.p;
+    s = eval_str_primary(s, tmp, STR_MAX);
     strncat(buf, tmp, bufsz - strlen(buf) - 1);
     while (*sk(s) == '+') {
         s = sk(s) + 1;
-        s = eval_str_primary(sk(s), tmp, sizeof tmp);
+        s = eval_str_primary(sk(s), tmp, STR_MAX);
         strncat(buf, tmp, bufsz - strlen(buf) - 1);
     }
     return s;
@@ -149,8 +191,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     /* UCASE$(str$) */
     if (kw_match(p, "UCASE$")) {
         p = sk(p + 6); if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*sk(p) == ')') p = sk(p) + 1;
         int i = 0;
         for (; src[i] && i < bufsz - 1; i++) buf[i] = (char)toupper((unsigned char)src[i]);
@@ -160,8 +202,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     /* LCASE$(str$) */
     if (kw_match(p, "LCASE$")) {
         p = sk(p + 6); if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*sk(p) == ')') p = sk(p) + 1;
         int i = 0;
         for (; src[i] && i < bufsz - 1; i++) buf[i] = (char)tolower((unsigned char)src[i]);
@@ -171,21 +213,21 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     /* LTRIM$(str$) */
     if (kw_match(p, "LTRIM$")) {
         p = sk(p + 6); if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*sk(p) == ')') p = sk(p) + 1;
         char *s = src;
         while (*s == ' ') s++;
-        strncpy(buf, s, bufsz - 1); buf[bufsz - 1] = '\0';
+        bstrncpy(buf, s, bufsz - 1); buf[bufsz - 1] = '\0';
         return p;
     }
     /* RTRIM$(str$) */
     if (kw_match(p, "RTRIM$")) {
         p = sk(p + 6); if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*sk(p) == ')') p = sk(p) + 1;
-        strncpy(buf, src, bufsz - 1); buf[bufsz - 1] = '\0';
+        bstrncpy(buf, src, bufsz - 1); buf[bufsz - 1] = '\0';
         int len = (int)strlen(buf);
         while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
         return p;
@@ -195,7 +237,7 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         p = sk(p + 4); if (*p == '(') p++;
         mpf_t n; mpf_init2(n, g_prec);
         p = eval_expr(sk(p), n);
-        snprintf(buf, bufsz, "%lX", (unsigned long)mpf_get_si(n));
+        snprintf(buf, bufsz, "%lX", radix_unsigned(mpf_get_d(n)));
         mpf_clear(n);
         if (*sk(p) == ')') p = sk(p) + 1;
         return p;
@@ -205,7 +247,7 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         p = sk(p + 4); if (*p == '(') p++;
         mpf_t n; mpf_init2(n, g_prec);
         p = eval_expr(sk(p), n);
-        snprintf(buf, bufsz, "%lo", (unsigned long)mpf_get_si(n));
+        snprintf(buf, bufsz, "%lo", radix_unsigned(mpf_get_d(n)));
         mpf_clear(n);
         if (*sk(p) == ')') p = sk(p) + 1;
         return p;
@@ -229,8 +271,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     if (kw_match(p, "LEFT$")) {
         p = sk(p + 5);
         if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*p == ',') p = sk(p + 1);
         mpf_t n; mpf_init2(n, g_prec);
         p = sk(eval_expr(sk(p), n));
@@ -247,8 +289,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     if (kw_match(p, "RIGHT$")) {
         p = sk(p + 6);
         if (*p == '(') p++;
-        char src[1024];
-        p = sk(eval_str_expr(sk(p), src, sizeof src));
+        StrBuf src_mem_; char *src = src_mem_.p;
+        p = sk(eval_str_expr(sk(p), src, STR_MAX));
         if (*p == ',') p = sk(p + 1);
         mpf_t n; mpf_init2(n, g_prec);
         p = sk(eval_expr(sk(p), n));
@@ -285,11 +327,11 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     if (kw_match(p, "ENV$")) {
         p = sk(p + 4);
         if (*p == '(') p = sk(p + 1);
-        char varname[DEFAULT_BUFFER];
-        p = sk(eval_str_expr(p, varname, sizeof varname));
+        StrBuf varname_mem_; char *varname = varname_mem_.p;
+        p = sk(eval_str_expr(p, varname, STR_MAX));
         if (*p == ')') p++;
         char *val = getenv(varname);
-        strncpy(buf, val ? val : "", bufsz - 1);
+        bstrncpy(buf, val ? val : "", bufsz - 1);
         buf[bufsz - 1] = '\0';
         return p;
     }
@@ -339,8 +381,8 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
     if (kw_match(p, "MID$")) {
         p = sk(p + 4);
         if (*p == '(') p++;
-        char src_buf[1024];
-        p = sk(eval_str_expr(sk(p), src_buf, sizeof src_buf));
+        StrBuf src_buf_mem_; char *src_buf = src_buf_mem_.p;
+        p = sk(eval_str_expr(sk(p), src_buf, STR_MAX));
         char *src = src_buf;
         if (*p == ',') p = sk(p + 1);
         mpf_t st; mpf_init2(st, g_prec);
@@ -370,13 +412,9 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         mpf_t n; mpf_init2(n, g_prec);
         p = eval_expr(sk(p), n);
         /* BASIC STR$ always prefixes a space for non-negative numbers */
-        char tmp_num[DEFAULT_BUFFER];
-#ifndef DONTUSEGMP
-        gmp_snprintf(tmp_num, sizeof tmp_num, "%.6Fg", n);
-#else
-        snprintf(tmp_num, sizeof tmp_num, "%.6g", mpf_get_d(n));
-#endif
-        if (mpf_sgn(n) >= 0)
+        char tmp_num[64];
+        fmt_num(mpf_get_d(n), tmp_num, sizeof tmp_num);   /* as PRINT shows it */
+        if (tmp_num[0] != '-')
             snprintf(buf, bufsz, " %s", tmp_num);
         else
             snprintf(buf, bufsz, "%s", tmp_num);
@@ -469,7 +507,7 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
                 Var *fa = field_array(base2, field2, &fstr);
                 if (fa && fstr) {
                     char *e = *arr_str_elem(fa, fi_i, fi_j);
-                    strncpy(buf, e ? e : "", bufsz - 1); buf[bufsz - 1] = '\0';
+                    bstrncpy(buf, e ? e : "", bufsz - 1); buf[bufsz - 1] = '\0';
                     return p;
                 }
                 if (fa) { snprintf(buf, bufsz, "%g", mpf_get_d(*arr_num_elem(fa, fi_i, fi_j))); return p; }
@@ -483,7 +521,7 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
                     snprintf(flatname2, sizeof flatname2, "%s.%s", base2, field2);
                 snprintf(sname2, sizeof sname2, "%s$", flatname2);
                 Var *vs2 = var_find(sname2);
-                if (vs2) { strncpy(buf, vs2->str ? vs2->str : "", bufsz-1); buf[bufsz-1]='\0'; return p; }
+                if (vs2) { bstrncpy(buf, vs2->str ? vs2->str : "", bufsz-1); buf[bufsz-1]='\0'; return p; }
                 /* numeric field in string context */
                 Var *vn2 = var_find(flatname2);
                 if (vn2) { snprintf(buf, bufsz, "%g", mpf_get_d(vn2->num)); return p; }
@@ -495,13 +533,17 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
 
     /* String variable (scalar or array element) — check CONST table first */
     if (isalpha((unsigned char)*p) || *p == '_') {
+        {   /* a string FUNCTION (FUNCTION Name$) */
+            char *fe = str_user_fn(p, buf, bufsz);
+            if (fe) return fe;
+        }
         char vname[MAX_VARNAME];
         char *after = read_varname(p, vname);
 
         /* CONST string lookup */
         ConstEntry *ce = const_find(vname);
         if (ce && ce->is_str) {
-            strncpy(buf, ce->value, bufsz - 1); buf[bufsz - 1] = '\0';
+            bstrncpy(buf, ce->value, bufsz - 1); buf[bufsz - 1] = '\0';
             return after;
         }
 
@@ -518,12 +560,12 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
                 if (*p == ')') p++;
                 if (v->kind == VAR_ARRAY_STR) {
                     char **slot = arr_str_elem(v, ai, aj);
-                    strncpy(buf, *slot ? *slot : "", bufsz - 1);
+                    bstrncpy(buf, *slot ? *slot : "", bufsz - 1);
                 } else {
-                    strncpy(buf, v->str ? v->str : "", bufsz - 1);
+                    bstrncpy(buf, v->str ? v->str : "", bufsz - 1);
                 }
             } else {
-                strncpy(buf, v->str ? v->str : "", bufsz - 1);
+                bstrncpy(buf, v->str ? v->str : "", bufsz - 1);
             }
             buf[bufsz - 1] = '\0';
             return p;
@@ -615,7 +657,6 @@ char *eval_str_or_inkey(char *p, char *buf, int bufsz) {
 typedef struct { char *p; } Parser;
 
 static void parse_expr_p(Parser *ps, mpf_t result);
-static void parse_and_operand_p(Parser *ps, mpf_t result);
 static void parse_term_p(Parser *ps, mpf_t result);
 static void parse_unary_p(Parser *ps, mpf_t result);
 static void parse_power_p(Parser *ps, mpf_t result);
@@ -623,13 +664,57 @@ static void parse_primary_p(Parser *ps, mpf_t result);
 
 static void skip_ws_p(Parser *ps) { while (isspace((unsigned char)*ps->p)) ps->p++; }
 
-static void parse_expr_p(Parser *ps, mpf_t result) {
-    mpf_t tmp; mpf_init2(tmp, g_prec);
-    mpf_t rhs; mpf_init2(rhs, g_prec);
+/* Logical and relational levels, lowest precedence first (QBasic order):
+ *   IMP < EQV < XOR < OR < AND < NOT < relational (= <> < > <= >=) < + -
+ * A relational operand that starts with a string is a string comparison.
+ * Logical operators work on the operands rounded to whole numbers. */
+static void parse_imp_p(Parser *ps, mpf_t result);
+static void parse_not_p(Parser *ps, mpf_t result);
 
-    /* -----------------------------------------
-     * 1. Parse left additive expression
-     * ----------------------------------------- */
+static long logic_int(mpf_t x) {                 /* round half to even, as CINT/CLNG */
+    double d = mpf_get_d(x), f = floor(d), r = d - f;
+    if (r > 0.5 || (r == 0.5 && fmod(f, 2.0) != 0)) f += 1;
+    return (long)f;
+}
+
+/* The relational operator at ps->p: 1 =, 2 <>, 3 <, 4 >, 5 <=, 6 >=; 0 none. */
+static int read_relop(Parser *ps) {
+    skip_ws_p(ps);
+    char a = ps->p[0], b = a ? ps->p[1] : 0;
+    int op = 0, len = 2;
+    if ((a == '<' && b == '>') || (a == '>' && b == '<')) op = 2;
+    else if ((a == '<' && b == '=') || (a == '=' && b == '<')) op = 5;
+    else if ((a == '>' && b == '=') || (a == '=' && b == '>')) op = 6;
+    else { len = 1; op = a == '=' ? 1 : a == '<' ? 3 : a == '>' ? 4 : 0; }
+    if (op) { ps->p += len; skip_ws_p(ps); }
+    return op;
+}
+static int relop_true(int op, int c) {
+    switch (op) {
+    case 1: return c == 0;  case 2: return c != 0;
+    case 3: return c < 0;   case 4: return c > 0;
+    case 5: return c <= 0;  default: return c >= 0;
+    }
+}
+
+/* After a string expression `lhs` has been read and p is just past it: if a
+ * comparison follows (A$ = "x", A$ < B$ ...), evaluate it into out (-1/0)
+ * and return the position after it; NULL if there's no comparison. Used by
+ * PRINT, which reads a string before it knows it's in a comparison. */
+char *str_compare_tail(char *p, const char *lhs, mpf_t out) {
+    Parser ps; memset(&ps, 0, sizeof ps); ps.p = p;
+    int op = read_relop(&ps);
+    if (!op) return NULL;
+    char *rhs = (char *)malloc(STR_MAX);
+    if (!rhs) return NULL;
+    ps.p = sk(eval_str_expr(ps.p, rhs, STR_MAX));
+    mpf_set_si(out, relop_true(op, strcmp(lhs, rhs)) ? -1 : 0);
+    free(rhs);
+    return ps.p;
+}
+
+static void parse_additive_p(Parser *ps, mpf_t result) {
+    mpf_t tmp; mpf_init2(tmp, g_prec);
     parse_term_p(ps, result);
     skip_ws_p(ps);
     while (*ps->p == '+' || *ps->p == '-') {
@@ -639,224 +724,80 @@ static void parse_expr_p(Parser *ps, mpf_t result) {
         else           mpf_sub(result, result, tmp);
         skip_ws_p(ps);
     }
-
-    /* -----------------------------------------
-     * 2. STRING comparison (must run BEFORE numeric)
-     * ----------------------------------------- */
-    skip_ws_p(ps);
-    if (is_str_token(ps->p)) {
-        char lhs[1024], rhs_s[1024];
-
-        /* parse left string */
-        ps->p = sk(eval_str_expr(ps->p, lhs, sizeof lhs));
-        skip_ws_p(ps);
-
-        /* detect operator */
-        char op[3] = { ps->p[0], ps->p[0] ? ps->p[1] : '\0', '\0' };
-        int oplen = 0;
-
-        if (!strcmp(op,"<>") || !strcmp(op,"><") ||
-            !strcmp(op,"<=") || !strcmp(op,"=<") ||
-            !strcmp(op,">=") || !strcmp(op,"=>")) {
-            oplen = 2;
-        } else if (ps->p[0]=='<' || ps->p[0]=='>' || ps->p[0]=='=') {
-            op[1] = '\0';
-            oplen = 1;
-        }
-
-        if (oplen > 0) {
-            ps->p += oplen;
-            skip_ws_p(ps);
-
-            /* parse right string */
-            ps->p = sk(eval_str_expr(ps->p, rhs_s, sizeof rhs_s));
-
-            int c = strcmp(lhs, rhs_s);
-            int cmp;
-
-            if (!strcmp(op,"<>") || !strcmp(op,"><"))      cmp = (c != 0);
-            else if (!strcmp(op,"<=") || !strcmp(op,"=<")) cmp = (c <= 0);
-            else if (!strcmp(op,">=") || !strcmp(op,"=>")) cmp = (c >= 0);
-            else if (op[0]=='<')                           cmp = (c < 0);
-            else if (op[0]=='>')                           cmp = (c > 0);
-            else                                           cmp = (c == 0);
-
-            mpf_set_si(result, cmp ? -1 : 0);
-            skip_ws_p(ps);
-        }
-    }
-    else {
-        /* -----------------------------------------
-         * 3. NUMERIC comparison
-         * ----------------------------------------- */
-        skip_ws_p(ps);
-        char op[3] = { '\0', '\0', '\0' };
-        int oplen = 0;
-        
-        /* Safely read comparison operator (max 2 chars) */
-        if (ps->p[0]) {
-            op[0] = ps->p[0];
-            if (ps->p[1]) op[1] = ps->p[1];
-        }
-
-        if (op[0] && op[1] && 
-            (!strcmp(op,"<>") || !strcmp(op,"><") ||
-             !strcmp(op,"<=") || !strcmp(op,"=<") ||
-             !strcmp(op,">=") || !strcmp(op,"=>"))) {
-            oplen = 2;
-        } else if (op[0] && (op[0]=='<' || op[0]=='>' || op[0]=='=')) {
-            op[1] = '\0';
-            oplen = 1;
-        }
-
-        if (oplen > 0) {
-            ps->p += oplen;
-            skip_ws_p(ps);
-
-            /* parse RHS additive */
-            parse_term_p(ps, rhs);
-            skip_ws_p(ps);
-            while (*ps->p=='+' || *ps->p=='-') {
-                char aop = *ps->p++;
-                parse_term_p(ps, tmp);
-                if (aop=='+') mpf_add(rhs,rhs,tmp);
-                else          mpf_sub(rhs,rhs,tmp);
-                skip_ws_p(ps);
-            }
-
-            int c = mpf_cmp(result, rhs);
-            int cmp;
-
-            if (!strcmp(op,"<>") || !strcmp(op,"><"))      cmp = (c != 0);
-            else if (!strcmp(op,"<=") || !strcmp(op,"=<")) cmp = (c <= 0);
-            else if (!strcmp(op,">=") || !strcmp(op,"=>")) cmp = (c >= 0);
-            else if (op[0]=='<')                           cmp = (c < 0);
-            else if (op[0]=='>')                           cmp = (c > 0);
-            else                                           cmp = (c == 0);
-
-            mpf_set_si(result, cmp ? -1 : 0);
-            skip_ws_p(ps);
-        }
-    }
-
-    /* -----------------------------------------
-     * 4. Boolean chaining: AND/XOR bind tighter than OR (QBasic precedence)
-     *    AND/XOR RHS uses parse_and_operand_p (stops before OR).
-     *    OR RHS uses parse_expr_p (which handles the next AND-group).
-     * ----------------------------------------- */
-    /* Step 4a: AND / XOR chain (higher precedence) */
-    skip_ws_p(ps);
-    while (kw_match(ps->p,"AND") || kw_match(ps->p,"XOR")) {
-        int is_xor = kw_match(ps->p,"XOR");
-        ps->p += 3;
-        skip_ws_p(ps);
-        parse_and_operand_p(ps, rhs);   /* does NOT consume OR */
-        long lv = mpf_get_si(result);
-        long rv = mpf_get_si(rhs);
-        mpf_set_si(result, is_xor ? (lv ^ rv) : (lv & rv));
-        skip_ws_p(ps);
-    }
-    /* Step 4b: OR chain (lower precedence) */
-    while (kw_match(ps->p,"OR")) {
-        ps->p += 2;
-        skip_ws_p(ps);
-        parse_expr_p(ps, rhs);          /* full expr: handles next AND-group + OR */
-        long lv = mpf_get_si(result);
-        long rv = mpf_get_si(rhs);
-        mpf_set_si(result, lv | rv);
-        skip_ws_p(ps);
-    }
-
     mpf_clear(tmp);
-    mpf_clear(rhs);
 }
 
-/* parse_and_operand_p — like parse_expr_p but stops before OR/XOR.
- * Used as the RHS of AND so that OR is not greedily consumed. */
-static void parse_and_operand_p(Parser *ps, mpf_t result) {
-    mpf_t tmp; mpf_init2(tmp, g_prec);
-    mpf_t rhs; mpf_init2(rhs, g_prec);
-
-    /* string comparison -- checked before parsing a number, so the right
-       side of AND can be one ("ok AND a$ <> """) */
+static void parse_relational_p(Parser *ps, mpf_t result) {
     skip_ws_p(ps);
     if (is_str_token(ps->p)) {
-        char lhs_s[DEFAULT_BUFFER], rhs_s[DEFAULT_BUFFER];
-        ps->p = sk(eval_str_expr(ps->p, lhs_s, sizeof lhs_s));
-        skip_ws_p(ps);
-        char op[3] = { ps->p[0], ps->p[0] ? ps->p[1] : '\0', '\0' };
-        int oplen = 0;
-        if (!strcmp(op,"<>")||!strcmp(op,"><")||!strcmp(op,"<=")||
-            !strcmp(op,"=<")||!strcmp(op,">=")||!strcmp(op,"=>")) oplen=2;
-        else if (ps->p[0]=='<'||ps->p[0]=='>'||ps->p[0]=='=') { op[1]='\0'; oplen=1; }
-        if (oplen > 0) {
-            ps->p += oplen; skip_ws_p(ps);
-            ps->p = sk(eval_str_expr(ps->p, rhs_s, sizeof rhs_s));
-            int c = strcmp(lhs_s, rhs_s), cmp;
-            if (!strcmp(op,"<>")||!strcmp(op,"><")) cmp=(c!=0);
-            else if (!strcmp(op,"<=")||!strcmp(op,"=<")) cmp=(c<=0);
-            else if (!strcmp(op,">=")||!strcmp(op,"=>")) cmp=(c>=0);
-            else if (op[0]=='<') cmp=(c<0); else if (op[0]=='>') cmp=(c>0);
-            else cmp=(c==0);
-            mpf_set_si(result, cmp ? -1 : 0);
-            skip_ws_p(ps);
+        char *lhs = (char *)malloc(STR_MAX), *rhs = (char *)malloc(STR_MAX);
+        if (!lhs || !rhs) { free(lhs); free(rhs); mpf_set_ui(result, 0); return; }
+        ps->p = sk(eval_str_expr(ps->p, lhs, STR_MAX));
+        mpf_set_ui(result, 0);
+        int op;
+        while ((op = read_relop(ps))) {           /* A$ = B$ = C$ compares the -1/0 next */
+            ps->p = sk(eval_str_expr(ps->p, rhs, STR_MAX));
+            mpf_set_si(result, relop_true(op, strcmp(lhs, rhs)) ? -1 : 0);
+            if (!is_str_token(ps->p)) break;
+            strcpy(lhs, rhs);
         }
-    } else {
-        /* additive */
-        parse_term_p(ps, result);
+        free(lhs); free(rhs);
         skip_ws_p(ps);
-        while (*ps->p == '+' || *ps->p == '-') {
-            char op = *ps->p++;
-            parse_term_p(ps, tmp);
-            if (op == '+') mpf_add(result, result, tmp);
-            else           mpf_sub(result, result, tmp);
-            skip_ws_p(ps);
-        }
-
-        /* numeric comparison */
-        skip_ws_p(ps);
-        char op[3] = { ps->p[0], ps->p[0] ? ps->p[1] : '\0', '\0' };
-        int oplen = 0;
-        if (!strcmp(op,"<>")||!strcmp(op,"><")||!strcmp(op,"<=")||
-            !strcmp(op,"=<")||!strcmp(op,">=")||!strcmp(op,"=>")) oplen=2;
-        else if (ps->p[0]=='<'||ps->p[0]=='>'||ps->p[0]=='=') { op[1]='\0'; oplen=1; }
-        if (oplen > 0) {
-            ps->p += oplen; skip_ws_p(ps);
-            parse_term_p(ps, rhs);
-            skip_ws_p(ps);
-            while (*ps->p=='+' || *ps->p=='-') {
-                char aop = *ps->p++;
-                parse_term_p(ps, tmp);
-                if (aop=='+') mpf_add(rhs,rhs,tmp); else mpf_sub(rhs,rhs,tmp);
-                skip_ws_p(ps);
-            }
-            int c = mpf_cmp(result, rhs), cmp;
-            if (!strcmp(op,"<>")||!strcmp(op,"><")) cmp=(c!=0);
-            else if (!strcmp(op,"<=")||!strcmp(op,"=<")) cmp=(c<=0);
-            else if (!strcmp(op,">=")||!strcmp(op,"=>")) cmp=(c>=0);
-            else if (op[0]=='<') cmp=(c<0); else if (op[0]=='>') cmp=(c>0);
-            else cmp=(c==0);
-            mpf_set_si(result, cmp ? -1 : 0);
-            skip_ws_p(ps);
-        }
+        return;
     }
-
-    /* AND/XOR only — does NOT consume OR */
+    parse_additive_p(ps, result);
+    int op;
+    while ((op = read_relop(ps))) {               /* A < B < C: (A < B) < C, as QBasic */
+        mpf_t rhs; mpf_init2(rhs, g_prec);
+        parse_additive_p(ps, rhs);
+        int c = mpf_cmp(result, rhs);
+        mpf_clear(rhs);
+        mpf_set_si(result, relop_true(op, c) ? -1 : 0);
+    }
     skip_ws_p(ps);
-    while (kw_match(ps->p,"AND") || kw_match(ps->p,"XOR")) {
-        int is_xor = kw_match(ps->p,"XOR");
+}
+
+static void parse_not_p(Parser *ps, mpf_t result) {
+    skip_ws_p(ps);
+    if (kw_match(ps->p, "NOT")) {
         ps->p += 3;
-        skip_ws_p(ps);
-        parse_and_operand_p(ps, rhs);
-        long lv = mpf_get_si(result);
-        long rv = mpf_get_si(rhs);
-        mpf_set_si(result, is_xor ? (lv ^ rv) : (lv & rv));
+        parse_not_p(ps, result);
+        mpf_set_si(result, ~logic_int(result));
+        return;
+    }
+    parse_relational_p(ps, result);
+}
+
+/* One logical level: operands from `next`, joined by keyword kw. */
+static void parse_logic_level(Parser *ps, mpf_t result, const char *kw,
+                              void (*next)(Parser *, mpf_t), int which) {
+    next(ps, result);
+    skip_ws_p(ps);
+    size_t n = strlen(kw);
+    while (kw_match(ps->p, (char *)kw)) {
+        ps->p += n;
+        mpf_t rhs; mpf_init2(rhs, g_prec);
+        next(ps, rhs);
+        long l = logic_int(result), r = logic_int(rhs), v;
+        mpf_clear(rhs);
+        switch (which) {
+        case 0:  v = l & r;   break;           /* AND */
+        case 1:  v = l | r;   break;           /* OR  */
+        case 2:  v = l ^ r;   break;           /* XOR */
+        case 3:  v = ~(l ^ r); break;          /* EQV */
+        default: v = ~l | r;  break;           /* IMP */
+        }
+        mpf_set_si(result, v);
         skip_ws_p(ps);
     }
-
-    mpf_clear(tmp);
-    mpf_clear(rhs);
 }
+static void parse_and_p(Parser *ps, mpf_t r) { parse_logic_level(ps, r, "AND", parse_not_p, 0); }
+static void parse_or_p (Parser *ps, mpf_t r) { parse_logic_level(ps, r, "OR",  parse_and_p, 1); }
+static void parse_xor_p(Parser *ps, mpf_t r) { parse_logic_level(ps, r, "XOR", parse_or_p,  2); }
+static void parse_eqv_p(Parser *ps, mpf_t r) { parse_logic_level(ps, r, "EQV", parse_xor_p, 3); }
+static void parse_imp_p(Parser *ps, mpf_t r) { parse_logic_level(ps, r, "IMP", parse_eqv_p, 4); }
+
+static void parse_expr_p(Parser *ps, mpf_t result) { parse_imp_p(ps, result); }
 
 static void parse_term_p(Parser *ps, mpf_t result) {
     mpf_t tmp; mpf_init2(tmp, g_prec);
@@ -886,8 +827,8 @@ static void parse_term_p(Parser *ps, mpf_t result) {
                             skip_ws_p(ps); continue; }
         skip_ws_p(ps);
         parse_unary_p(ps, tmp);
-        long lv = (long)mpf_get_d(result);
-        long rv = (long)mpf_get_d(tmp);
+        long lv = logic_int(result);             /* \ and MOD round their operands */
+        long rv = logic_int(tmp);
         if (rv == 0) {
             basic_stderr("Division by zero\n");
             if (g_parse_error_active) {
@@ -963,6 +904,205 @@ static int try_eval_defn(Parser *ps, mpf_t result) {
     return 1;
 }
 
+/* Run user FUNCTION fname (its label line is a FUNCTION). after_name is
+ * just past the name in the caller's text: "(args...)" or nothing. A
+ * numeric result goes to result; a string FUNCTION's (NAME$) to sres. */
+static void user_fn_call(Parser *ps, const char *fname, char *after_name, mpf_t result,
+                         char *sres, int sres_sz) {
+            int has_parens = *after_name == '(';
+            ps->p = has_parens ? after_name + 1 : after_name;
+            skip_ws_p(ps);
+
+            /* Find the FUNCTION definition line to get parameter names */
+            int sub_idx = find_line_by_label((char *)fname);
+            /* Collect parameter names from FUNCTION definition */
+            char param_names[16][MAX_VARNAME];
+            int  n_params = 0;
+            if (sub_idx >= 0) {
+                char *sp = sk(g_lines[sub_idx].text);
+                if (strncasecmp(sp, "FUNCTION", 8) == 0) sp = sk(sp + 8);
+                else if (strncasecmp(sp, "SUB", 3) == 0) sp = sk(sp + 3);
+                while (isalnum((unsigned char)*sp) || *sp == '_') sp++;
+                if (*sp == '#' || *sp == '!' || *sp == '%' || *sp == '&' || *sp == '$') sp++;
+                sp = sk(sp);
+                if (*sp == '(') {
+                    sp = sk(sp + 1);
+                    while (*sp && *sp != ')' && n_params < 16) {
+                        /* The name with its type sigil (FUNCTION Scl(n!) uses n!),
+                         * then an optional "AS type" (A AS STRING makes A A$). */
+                        char pname[MAX_VARNAME];
+                        sp = sk(read_varname(sp, pname));
+                        if (*sp == '(') { while (*sp && *sp != ')') sp++; if (*sp == ')') sp = sk(sp + 1); }
+                        while (*sp && *sp != ',' && *sp != ')') sp++;   /* AS type */
+                        if (pname[0]) bstrncpy(param_names[n_params++], pname, MAX_VARNAME-1);
+                        if (*sp == ',') sp++;
+                        sp = sk(sp);
+                    }
+                }
+            }
+
+            /* Evaluate the arguments, in the caller's scope */
+            mpf_t args_v[16];
+            char *args_s[16] = { 0 };                /* string parameters (NAME$) */
+            int   n_args = 0;
+            for (int ai = 0; ai < n_params && has_parens; ai++) {
+                skip_ws_p(ps);
+                if (*ps->p == ')' || *ps->p == '\0') break;
+                mpf_init2(args_v[ai], g_prec);
+                if (var_is_str_name(param_names[ai])) {
+                    char *sb = (char *)malloc(STR_MAX);
+                    if (sb) { sb[0] = 0; ps->p = eval_str_expr(ps->p, sb, STR_MAX); }
+                    args_s[ai] = sb;
+                } else {
+                    parse_expr_p(ps, args_v[ai]);
+                }
+                n_args++;
+                skip_ws_p(ps);
+                if (*ps->p == ',') ps->p++;
+            }
+
+            /* The call's own scope (see scope_enter); with variables global,
+             * the parameters' variables are saved and put back afterwards
+             * (FnRan(x) mustn't change the caller's x). */
+            int fn_scope = scope_enter();
+            mpf_t saved_params[16];
+            bool  param_was_num[16];
+            char *saved_str[16] = { 0 };
+            bool  param_was_str[16];
+            for (int ai = 0; ai < n_params; ai++) {
+                param_was_num[ai] = param_was_str[ai] = false;
+                if (fn_scope) continue;
+                Var *pv = var_find(param_names[ai]);
+                param_was_num[ai] = (pv && pv->kind == VAR_NUM);
+                param_was_str[ai] = (pv && pv->kind == VAR_STR);
+                mpf_init2(saved_params[ai], g_prec);
+                if (param_was_num[ai]) mpf_set(saved_params[ai], pv->num);
+                if (param_was_str[ai]) saved_str[ai] = str_dup(pv->str ? pv->str : (char *)"");
+            }
+            for (int ai = 0; ai < n_args; ai++) {
+                Var *pv = var_get(param_names[ai]);
+                if (args_s[ai]) {
+                    if (pv->kind == VAR_STR) { free(pv->str); pv->str = str_dup(args_s[ai]); }
+                    free(args_s[ai]);
+                } else if (pv->kind == VAR_NUM) mpf_set(pv->num, args_v[ai]);
+                mpf_clear(args_v[ai]);
+            }
+            /* consume closing paren and any remaining args */
+            skip_ws_p(ps);
+            if (has_parens && *ps->p != ')') {
+                int depth = 1;
+                while (*ps->p && depth > 0) {
+                    if (*ps->p == '(') depth++;
+                    else if (*ps->p == ')') depth--;
+                    if (depth > 0) ps->p++;
+                }
+            }
+            if (has_parens && *ps->p == ')') ps->p++;
+
+            /* Push GOSUB frame and run the function body */
+            if (g_ctrl_top < CTRL_STACK_MAX) {
+                int call_frame = g_ctrl_top;
+                CtrlFrame *fr = &g_ctrl[g_ctrl_top++];
+                strcpy(fr->varname, "\x01" "GOSUB");
+                fr->line_idx = g_current_pc + 1;  /* return address */
+                mpf_init2(fr->limit, g_prec); mpf_set_ui(fr->limit, 0);
+                mpf_init2(fr->step,  g_prec); mpf_set_ui(fr->step,  0);
+
+                int saved_pc = g_current_pc;
+                int pc = sub_idx + 1;  /* first line of function body */
+                while (pc >= 0 && pc < g_nlines) {
+                    g_current_pc = pc;
+                    char *line = g_lines[pc].text;
+                    char *t = sk(line);
+                    /* Stop at END FUNCTION / END SUB -- this function's own:
+                     * the END SUB of a SUB it called returns from that SUB. */
+                    if ((strncasecmp(t,"END",3)==0) &&
+                        (kw_match(sk(t+3),"FUNCTION") || kw_match(sk(t+3),"SUB"))) {
+                        int inner = g_ctrl_top - 1;
+                        while (inner > call_frame &&
+                               strcmp(g_ctrl[inner].varname, "\x01""GOSUB") != 0) inner--;
+                        if (inner <= call_frame) { pc++; break; }
+                    }
+                    basic_frame_tick();
+                    if (g_break) break;      /* Ctrl+C / Ctrl+Break, or the window closed */
+                    Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
+                    int jumped = dispatch(&tmp_ip, line);
+                    if (!tmp_ip.running) break;
+                    if (jumped < 0) break;   /* an error (already reported) ends the call */
+                    pc = jumped ? tmp_ip.pc : pc + 1;
+                    /* EXIT FUNCTION (or a RETURN) pops the call's frame. Loops
+                     * in the body push frames above it, and keep running. */
+                    if (g_ctrl_top <= call_frame ||
+                        strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") != 0) break;
+                }
+                /* Reached END FUNCTION: pop the call's frame, and any loop
+                 * the body left (a GOTO out of a FOR) above it. */
+                if (g_ctrl_top > call_frame &&
+                    strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") == 0) {
+                    while (g_ctrl_top > call_frame) {
+                        g_ctrl_top--;
+                        mpf_clear(g_ctrl[g_ctrl_top].limit);
+                        mpf_clear(g_ctrl[g_ctrl_top].step);
+                    }
+                }
+                g_current_pc = saved_pc;
+            }
+
+            /* Read return value — stored in variable named after function */
+            Var *rv = var_find((char *)fname);
+            if (sres) {
+                snprintf(sres, sres_sz, "%s", rv && rv->kind == VAR_STR && rv->str ? rv->str : "");
+                mpf_set_ui(result, 0);
+            } else if (rv && rv->kind == VAR_NUM) mpf_set(result, rv->num);
+            else    mpf_set_ui(result, 0);
+            /* the result variable belongs to this call: a recursive caller
+             * reads its own afterwards */
+            if (rv && !fn_scope) {
+                if (rv->kind == VAR_STR) { free(rv->str); rv->str = NULL; }
+            }
+
+            /* The call's variables go; or, with variables global, the
+             * caller's variables the parameters overwrote come back */
+            if (fn_scope) {
+                scope_leave(fn_scope);
+            } else {
+                for (int ai = 0; ai < n_params; ai++) {
+                    if (param_was_num[ai]) {
+                        Var *pv = var_find(param_names[ai]);
+                        if (pv) mpf_set(pv->num, saved_params[ai]);
+                    }
+                    if (param_was_str[ai]) {
+                        Var *pv = var_find(param_names[ai]);
+                        if (pv && pv->kind == VAR_STR) { free(pv->str); pv->str = saved_str[ai]; saved_str[ai] = NULL; }
+                    }
+                    free(saved_str[ai]);
+                    mpf_clear(saved_params[ai]);
+                }
+            }
+}
+
+static int is_user_function(const char *name) {
+    int li = find_line_by_label((char *)name);
+    if (li < 0 || li >= g_nlines || !g_lines[li].text) return 0;
+    char *t = sk(g_lines[li].text);
+    return strncasecmp(t, "FUNCTION", 8) == 0 && !isalnum((unsigned char)t[8]);
+}
+
+/* A string FUNCTION call at p (NAME$ or NAME$(args)): its value in buf and
+ * the end of the call, or NULL if p isn't one. */
+char *str_user_fn(char *p, char *buf, int bufsz) {
+    char name[MAX_VARNAME];
+    char *after = read_varname(p, name);
+    size_t n = strlen(name);
+    if (!n || name[n - 1] != '$' || !is_user_function(name)) return NULL;
+    char *an = after; while (isspace((unsigned char)*an)) an++;
+    Parser ps; ps.p = after;
+    mpf_t dummy; mpf_init2(dummy, g_prec);
+    user_fn_call(&ps, name, an, dummy, buf, bufsz);
+    mpf_clear(dummy);
+    return ps.p;
+}
+
 static void parse_primary_p(Parser *ps, mpf_t result) {
     skip_ws_p(ps);
 
@@ -973,11 +1113,11 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         #define EVAL_CMP_TERM(res) do { \
             skip_ws_p(ps); \
             if (is_str_token(ps->p)) { \
-                char _lhs[1024], _rhs[1024]; \
-                ps->p = sk(eval_str_expr(ps->p, _lhs, sizeof _lhs)); \
+                StrBuf _lhs_m, _rhs_m; char *_lhs = _lhs_m.p, *_rhs = _rhs_m.p; \
+                ps->p = sk(eval_str_expr(ps->p, _lhs, STR_MAX)); \
                 char _op[3]={ps->p[0],ps->p[0]?ps->p[1]:'\0','\0'}; int _ol=2; \
                 if(!strcmp(_op,"<>")||!strcmp(_op,"><")||!strcmp(_op,"<=")||!strcmp(_op,"=<")||!strcmp(_op,">=")||!strcmp(_op,"=>"));else{_op[1]='\0';_ol=1;} \
-                ps->p=sk(ps->p+_ol); ps->p=sk(eval_str_expr(ps->p,_rhs,sizeof _rhs)); \
+                ps->p=sk(ps->p+_ol); ps->p=sk(eval_str_expr(ps->p,_rhs,STR_MAX)); \
                 int _c=strcmp(_lhs,_rhs),_cmp; \
                 if(!strcmp(_op,"<>")||!strcmp(_op,"><"))_cmp=(_c!=0); \
                 else if(!strcmp(_op,"<=")||!strcmp(_op,"=<"))_cmp=(_c<=0); \
@@ -1019,12 +1159,16 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         return;
     }
 
-    /* Hex literal &H */
-    if (*ps->p == '&' && (ps->p[1] == 'H' || ps->p[1] == 'h')) {
-        ps->p += 2;
-        long v = strtol(ps->p, (char **)&ps->p, 16);
-        mpf_set_si(result, v);
-        return;
+    /* &H (hex), &O or & (octal), &B (binary) literals; a trailing & (LONG) is allowed */
+    if (*ps->p == '&') {
+        long v;
+        char *end = radix_literal(ps->p, &v);
+        if (end) {
+            ps->p = end;
+            if (*ps->p == '&' || *ps->p == '%') ps->p++;
+            mpf_set_si(result, v);
+            return;
+        }
     }
 
     /* Numeric literal */
@@ -1162,9 +1306,12 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
     /* VAL(str$) */
     if (kw_match(ps->p, "VAL")) {
         ps->p += 3; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
-        char sbuf[DEFAULT_BUFFER];
-        ps->p = eval_str_expr(ps->p, sbuf, sizeof sbuf);
-        mpf_set_d(result, atof(sbuf));
+        StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+        ps->p = eval_str_expr(ps->p, sbuf, STR_MAX);
+        char *q = sbuf; while (*q == ' ' || *q == '\t') q++;
+        long rv;
+        if (*q == '&' && radix_literal(q, &rv)) mpf_set_si(result, rv);   /* VAL("&H1F") */
+        else mpf_set_d(result, atof(sbuf));
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
     }
@@ -1172,8 +1319,8 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
     /* ASC(str$) */
     if (kw_match(ps->p, "ASC")) {
         ps->p += 3; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
-        char sbuf[DEFAULT_BUFFER];
-        ps->p = eval_str_expr(ps->p, sbuf, sizeof sbuf);
+        StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+        ps->p = eval_str_expr(ps->p, sbuf, STR_MAX);
         mpf_set_si(result, sbuf[0] == BASIC_NUL_CH ? 0 : (unsigned char)sbuf[0]);
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
@@ -1182,8 +1329,8 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
     /* LEN(str$) */
     if (kw_match(ps->p, "LEN")) {
         ps->p += 3; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
-        char sbuf[DEFAULT_BUFFER];
-        ps->p = eval_str_expr(ps->p, sbuf, sizeof sbuf);
+        StrBuf sbuf_mem_; char *sbuf = sbuf_mem_.p;
+        ps->p = eval_str_expr(ps->p, sbuf, STR_MAX);
         mpf_set_si(result, (long)strlen(sbuf));
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
@@ -1244,10 +1391,10 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
             else             ps->p = save;
             mpf_clear(s);
         }
-        char hay[1024], needle[DEFAULT_BUFFER];
-        ps->p = (char*)sk(eval_str_expr(ps->p, hay, sizeof hay));
+        StrBuf hay_mem_; char *hay = hay_mem_.p; StrBuf needle_mem_; char *needle = needle_mem_.p;
+        ps->p = (char*)sk(eval_str_expr(ps->p, hay, STR_MAX));
         if (*ps->p == ',') ps->p++;
-        ps->p = (char*)sk(eval_str_expr(sk(ps->p), needle, sizeof needle));
+        ps->p = (char*)sk(eval_str_expr(sk(ps->p), needle, STR_MAX));
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         if (start < 1) start = 1;
         if (start > (int)strlen(hay)) { mpf_set_si(result, 0); return; }
@@ -1354,6 +1501,37 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         return;
     }
 
+    /* UBOUND(arr [, dim]) / LBOUND(arr [, dim]) */
+    if (kw_match(ps->p, "UBOUND") || kw_match(ps->p, "LBOUND")) {
+        int upper = toupper((unsigned char)*ps->p) == 'U';
+        ps->p += 6; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
+        skip_ws_p(ps);
+        char name[MAX_VARNAME];
+        ps->p = read_varname(ps->p, name);
+        skip_ws_p(ps);
+        if (ps->p[0] == '(' && ps->p[1] == ')') ps->p += 2;   /* UBOUND(A()) */
+        skip_ws_p(ps);
+        int d = 1;
+        if (*ps->p == ',') {
+            ps->p++;
+            parse_expr_p(ps, result);
+            d = (int)mpf_get_si(result);
+        }
+        skip_ws_p(ps); if (*ps->p == ')') ps->p++;
+        Var *v = var_find(name);
+        if (!v || (v->kind != VAR_ARRAY_NUM && v->kind != VAR_ARRAY_STR) || !v->ndim) {
+            basic_stderr("%s: %s is not an array\n", upper ? "UBOUND" : "LBOUND", name);
+            mpf_set_si(result, 0);
+            return;
+        }
+        if (d < 1 || d > v->ndim) {
+            basic_stderr("%s: %s has no dimension %d\n", upper ? "UBOUND" : "LBOUND", name, d);
+            d = 1;
+        }
+        int lb = v->lb[d - 1];
+        mpf_set_si(result, upper ? lb + v->dim[d - 1] - 1 : lb);
+        return;
+    }
     /* SGN(x) */
     if (kw_match(ps->p, "SGN")) {
         ps->p += 3; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
@@ -1376,7 +1554,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
     if (kw_match(ps->p, "CINT")) {
         ps->p += 4; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
         parse_expr_p(ps, result);
-        mpf_set_d(result, floor(mpf_get_d(result) + 0.5));
+        mpf_set_si(result, logic_int(result));   /* half to even, as QBasic: CINT(2.5) = 2 */
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
     }
@@ -1384,7 +1562,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
     if (kw_match(ps->p, "CLNG")) {
         ps->p += 4; skip_ws_p(ps); if (*ps->p == '(') ps->p++;
         parse_expr_p(ps, result);
-        mpf_set_d(result, floor(mpf_get_d(result) + 0.5));
+        mpf_set_si(result, logic_int(result));
         skip_ws_p(ps); if (*ps->p == ')') ps->p++;
         return;
     }
@@ -1451,7 +1629,7 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
             skip_ws_p(ps);
             if (*ps->p == ')') ps->p++;
         }
-        mpf_set_si(result, 1);
+        mpf_set_si(result, display_get_col());
         return;
     }
 
@@ -1680,158 +1858,9 @@ static void parse_primary_p(Parser *ps, mpf_t result) {
         char *after_name = pp;
         while (isspace((unsigned char)*after_name)) after_name++;
 
-        if (*after_name == '(' && find_line_by_label(fname) >= 0) {
+        if ((*after_name == '(' && find_line_by_label(fname) >= 0) || is_user_function(fname)) {
             /* It's a user-defined FUNCTION call */
-            ps->p = after_name + 1;  /* skip '(' */
-            skip_ws_p(ps);
-
-            /* Find the FUNCTION definition line to get parameter names */
-            int sub_idx = find_line_by_label(fname);
-            /* Collect parameter names from FUNCTION definition */
-            char param_names[16][MAX_VARNAME];
-            int  n_params = 0;
-            if (sub_idx >= 0) {
-                char *sp = sk(g_lines[sub_idx].text);
-                if (strncasecmp(sp, "FUNCTION", 8) == 0) sp = sk(sp + 8);
-                else if (strncasecmp(sp, "SUB", 3) == 0) sp = sk(sp + 3);
-                while (isalnum((unsigned char)*sp) || *sp == '_') sp++;
-                if (*sp == '#' || *sp == '!' || *sp == '%' || *sp == '&') sp++;
-                sp = sk(sp);
-                if (*sp == '(') {
-                    sp = sk(sp + 1);
-                    while (*sp && *sp != ')' && n_params < 16) {
-                        char pname[MAX_VARNAME]; int pi = 0;
-                        while (*sp && *sp != ',' && *sp != ')' && pi < MAX_VARNAME - 1) {
-                            if (!isspace((unsigned char)*sp)) pname[pi++] = (char)toupper((unsigned char)*sp);
-                            sp++;
-                        }
-                        pname[pi] = '\0';
-                        /* Keep type sigil (!, #, %, &) — it is part of the var name.
-                         * e.g. FUNCTION Scl(n!) uses n! inside the body. */
-                        /* strip AS TYPE annotation */
-                        char *as_p = strstr(pname, "AS");
-                        if (as_p) *as_p = '\0';
-                        /* strip trailing space left by AS removal */
-                        int plen = strlen(pname);
-                        while (plen > 0 && pname[plen-1] == ' ') pname[--plen] = '\0';
-                        if (pname[0]) strncpy(param_names[n_params++], pname, MAX_VARNAME-1);
-                        if (*sp == ',') sp++;
-                        sp = sk(sp);
-                    }
-                }
-            }
-
-            /* Evaluate the arguments, in the caller's scope */
-            mpf_t args_v[16];
-            int   n_args = 0;
-            for (int ai = 0; ai < n_params; ai++) {
-                skip_ws_p(ps);
-                if (*ps->p == ')' || *ps->p == '\0') break;
-                mpf_init2(args_v[ai], g_prec);
-                parse_expr_p(ps, args_v[ai]);
-                n_args++;
-                skip_ws_p(ps);
-                if (*ps->p == ',') ps->p++;
-            }
-
-            /* The call's own scope (see scope_enter); with variables global,
-             * the parameters' variables are saved and put back afterwards
-             * (FnRan(x) mustn't change the caller's x). */
-            int fn_scope = scope_enter();
-            mpf_t saved_params[16];
-            bool  param_was_num[16];
-            for (int ai = 0; ai < n_params; ai++) {
-                param_was_num[ai] = false;
-                if (fn_scope) continue;
-                Var *pv = var_find(param_names[ai]);
-                param_was_num[ai] = (pv && pv->kind == VAR_NUM);
-                mpf_init2(saved_params[ai], g_prec);
-                if (param_was_num[ai]) mpf_set(saved_params[ai], pv->num);
-            }
-            for (int ai = 0; ai < n_args; ai++) {
-                Var *pv = var_get(param_names[ai]);
-                if (pv->kind == VAR_NUM) mpf_set(pv->num, args_v[ai]);
-                mpf_clear(args_v[ai]);
-            }
-            /* consume closing paren and any remaining args */
-            skip_ws_p(ps);
-            if (*ps->p != ')') {
-                int depth = 1;
-                while (*ps->p && depth > 0) {
-                    if (*ps->p == '(') depth++;
-                    else if (*ps->p == ')') depth--;
-                    if (depth > 0) ps->p++;
-                }
-            }
-            if (*ps->p == ')') ps->p++;
-
-            /* Push GOSUB frame and run the function body */
-            if (g_ctrl_top < CTRL_STACK_MAX) {
-                int call_frame = g_ctrl_top;
-                CtrlFrame *fr = &g_ctrl[g_ctrl_top++];
-                strcpy(fr->varname, "\x01" "GOSUB");
-                fr->line_idx = g_current_pc + 1;  /* return address */
-                mpf_init2(fr->limit, g_prec); mpf_set_ui(fr->limit, 0);
-                mpf_init2(fr->step,  g_prec); mpf_set_ui(fr->step,  0);
-
-                int saved_pc = g_current_pc;
-                int pc = sub_idx + 1;  /* first line of function body */
-                while (pc >= 0 && pc < g_nlines) {
-                    g_current_pc = pc;
-                    char *line = g_lines[pc].text;
-                    char *t = sk(line);
-                    /* Stop at END FUNCTION / END SUB -- this function's own:
-                     * the END SUB of a SUB it called returns from that SUB. */
-                    if ((strncasecmp(t,"END",3)==0) &&
-                        (kw_match(sk(t+3),"FUNCTION") || kw_match(sk(t+3),"SUB"))) {
-                        int inner = g_ctrl_top - 1;
-                        while (inner > call_frame &&
-                               strcmp(g_ctrl[inner].varname, "\x01""GOSUB") != 0) inner--;
-                        if (inner <= call_frame) { pc++; break; }
-                    }
-                    basic_frame_tick();
-                    if (g_break) break;      /* Ctrl+C / Ctrl+Break, or the window closed */
-                    Interp tmp_ip; tmp_ip.pc = pc; tmp_ip.running = 1;
-                    int jumped = dispatch(&tmp_ip, line);
-                    if (!tmp_ip.running) break;
-                    if (jumped < 0) break;   /* an error (already reported) ends the call */
-                    pc = jumped ? tmp_ip.pc : pc + 1;
-                    /* EXIT FUNCTION (or a RETURN) pops the call's frame. Loops
-                     * in the body push frames above it, and keep running. */
-                    if (g_ctrl_top <= call_frame ||
-                        strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") != 0) break;
-                }
-                /* Reached END FUNCTION: pop the call's frame, and any loop
-                 * the body left (a GOTO out of a FOR) above it. */
-                if (g_ctrl_top > call_frame &&
-                    strcmp(g_ctrl[call_frame].varname, "\x01""GOSUB") == 0) {
-                    while (g_ctrl_top > call_frame) {
-                        g_ctrl_top--;
-                        mpf_clear(g_ctrl[g_ctrl_top].limit);
-                        mpf_clear(g_ctrl[g_ctrl_top].step);
-                    }
-                }
-                g_current_pc = saved_pc;
-            }
-
-            /* Read return value — stored in variable named after function */
-            Var *rv = var_find(fname);
-            if (rv && rv->kind == VAR_NUM) mpf_set(result, rv->num);
-            else    mpf_set_ui(result, 0);
-
-            /* The call's variables go; or, with variables global, the
-             * caller's variables the parameters overwrote come back */
-            if (fn_scope) {
-                scope_leave(fn_scope);
-            } else {
-                for (int ai = 0; ai < n_params; ai++) {
-                    if (param_was_num[ai]) {
-                        Var *pv = var_find(param_names[ai]);
-                        if (pv) mpf_set(pv->num, saved_params[ai]);
-                    }
-                    mpf_clear(saved_params[ai]);
-                }
-            }
+            user_fn_call(ps, fname, after_name, result, NULL, 0);
             return;
         }
     }

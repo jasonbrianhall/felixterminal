@@ -249,12 +249,14 @@ int basic_printf(char *fmt, ...)
     int r = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 #if defined(WOPR) || defined(FELIX_BASIC)
+    display_note_output(buf);
     wopr_basic_push_line(buf);
 #elif defined(USE_SDL_WINDOW)
     /* Route all output through the SDL text grid via display_print.
      * display.h is included transitively via basic.h / basic_print.h. */
     display_print(buf);
 #else
+    display_note_output(buf);
     fputs(buf, stdout);
     fflush(stdout);
 #endif
