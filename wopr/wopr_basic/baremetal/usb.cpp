@@ -1,6 +1,6 @@
 // xHCI USB keyboard driver (polled, boot protocol).
 //
-// Takes the controller from the BIOS, resets it, enumerates keyboards and
+// Takes every xHCI controller from the BIOS, resets it, enumerates keyboards and
 // mice on the root ports and behind USB 2 hubs (hubs in hubs too, and ones
 // plugged in later), and turns keyboards' 8-byte boot reports into the same
 // PS/2 set-1 scancodes the rest of the kernel already handles. A USB 3
@@ -36,13 +36,9 @@ static void* dma_alloc(size_t size, size_t align) {
 static inline uint64_t phys(const volatile void* p) { return (uint64_t)(uintptr_t)p; }
 
 // ---------------------------------------------------------------- registers
-static volatile uint8_t *cap, *op, *rt;
-static volatile uint32_t* db;
 static inline uint32_t rd(volatile uint8_t* b, uint32_t o) { return *(volatile uint32_t*)(b + o); }
 static inline void wr(volatile uint8_t* b, uint32_t o, uint32_t v) { *(volatile uint32_t*)(b + o) = v; }
 static inline void wr64(volatile uint8_t* b, uint32_t o, uint64_t v) { wr(b, o, (uint32_t)v); wr(b, o + 4, (uint32_t)(v >> 32)); }
-static inline uint32_t portsc(int port) { return rd(op, 0x400 + 0x10 * (port - 1)); }
-static inline void set_portsc(int port, uint32_t v) { wr(op, 0x400 + 0x10 * (port - 1), v); }
 
 // Bits that must be written back unchanged when touching PORTSC; everything
 // else (the write-1-to-clear change bits, PED) is written as 0.
@@ -95,26 +91,43 @@ static uint64_t ring_push(Ring& r, uint32_t d0, uint32_t d1, uint32_t d2, uint32
     return addr;
 }
 
-static Ring cmd_ring;
-static volatile Trb* evt;
-static int evt_deq;
-static uint32_t evt_cycle = 1;
 #define EVT_TRBS 256
 
+// One xHCI controller. A PC can have several (the chipset's plus add-in
+// cards, or separate USB 2/USB 3 controllers on some boards); each gets its
+// own registers, command and event rings and device slots. H is the one
+// being worked on: set it before touching a controller or its devices.
+struct Hc {
+    volatile uint8_t *cap, *op, *rt;
+    volatile uint32_t* db;
+    Ring cmd_ring;
+    volatile Trb* evt;
+    int evt_deq;
+    uint32_t evt_cycle;
+    size_t csz;                            // context size: 32 or 64 bytes
+    volatile uint64_t* dcbaa;
+    int max_slots, num_ports;
+    bool port_dirty[256];
+};
+#define MAX_HC 8
+static Hc hcs[MAX_HC];
+static int num_hc;
+static Hc* H;
+
+static inline uint32_t portsc(int port) { return rd(H->op, 0x400 + 0x10 * (port - 1)); }
+static inline void set_portsc(int port, uint32_t v) { wr(H->op, 0x400 + 0x10 * (port - 1), v); }
+
 static bool next_event(Trb* out) {
-    volatile Trb& e = evt[evt_deq];
-    if ((e.d3 & 1) != evt_cycle) return false;
+    volatile Trb& e = H->evt[H->evt_deq];
+    if ((e.d3 & 1) != H->evt_cycle) return false;
     barrier();
     out->d0 = e.d0; out->d1 = e.d1; out->d2 = e.d2; out->d3 = e.d3;
-    if (++evt_deq == EVT_TRBS) { evt_deq = 0; evt_cycle ^= 1; }
-    wr64(rt, 0x38, phys(&evt[evt_deq]) | (1 << 3));  // ERDP, clear busy
+    if (++H->evt_deq == EVT_TRBS) { H->evt_deq = 0; H->evt_cycle ^= 1; }
+    wr64(H->rt, 0x38, phys(&H->evt[H->evt_deq]) | (1 << 3));  // ERDP, clear busy
     return true;
 }
 
 // ---------------------------------------------------------------- devices
-static size_t csz;                         // context size: 32 or 64 bytes
-static volatile uint64_t* dcbaa;
-static int max_slots, num_ports;
 
 // Everything plugged in that we drive: keyboards, mice and the hubs they
 // hang off. Where a device is: the root port its tree starts at, the route
@@ -124,6 +137,7 @@ static int max_slots, num_ports;
 enum Kind { KBD, MOUSE, HUB };
 struct Keyboard {
     bool active;
+    Hc* hc;                                // the controller it's on
     Kind kind;
     bool mouse;                            // kind == MOUSE (kept for the report code)
     int port;                              // root port
@@ -144,13 +158,11 @@ struct Keyboard {
     uint32_t power_good_ms;
     char where[24];                        // "port 3" / "port 3.2" for messages
 };
-#define MAX_KBD 16
+#define MAX_KBD 32
 static Keyboard kbds[MAX_KBD];
-static bool port_dirty[256];
-static bool ready;
 
 static inline volatile uint32_t* ctx(volatile uint8_t* base, int idx) {
-    return (volatile uint32_t*)(base + idx * csz);
+    return (volatile uint32_t*)(base + idx * H->csz);
 }
 
 // ---------------------------------------------------------------- key reports
@@ -232,13 +244,13 @@ static void dispatch(const Trb& e) {
     int type = (e.d3 >> 10) & 0x3F;
     if (type == TRB_PORT_STATUS) {
         int port = (e.d0 >> 24) & 0xFF;
-        if (port >= 1 && port <= num_ports) port_dirty[port] = true;
+        if (port >= 1 && port <= H->num_ports) H->port_dirty[port] = true;
         return;
     }
     if (type != TRB_TRANSFER_EVENT) return;
     int slot = e.d3 >> 24, ep = (e.d3 >> 16) & 0x1F, cc = e.d2 >> 24;
     for (auto& k : kbds) {
-        if (!k.active || k.slot != slot || k.dci != ep) continue;
+        if (!k.active || k.hc != H || k.slot != slot || k.dci != ep) continue;
         uint64_t trb = (uint64_t)e.d1 << 32 | e.d0;
         int idx = (int)((trb - phys(k.intr.trb)) / sizeof(Trb));
         if (idx >= 0 && idx < RING_TRBS && (cc == 1 || cc == 13)) {
@@ -252,7 +264,7 @@ static void dispatch(const Trb& e) {
             k.active = false;
             printf("USB: %s on %s stopped (code %d)\n", k.kind == HUB ? "hub" : k.mouse ? "mouse" : "keyboard", k.where, cc);
         }
-        db[slot] = k.dci;
+        H->db[slot] = k.dci;
     }
 }
 
@@ -274,8 +286,8 @@ static bool wait_event(int type, int slot, int ep, Trb* out, int ms = 500) {
 }
 
 static int command(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3, Trb* ev) {
-    ring_push(cmd_ring, d0, d1, d2, d3);
-    db[0] = 0;
+    ring_push(H->cmd_ring, d0, d1, d2, d3);
+    H->db[0] = 0;
     Trb e;
     if (!wait_event(TRB_CMD_COMPLETION, 0, 0, &e)) return -1;
     if (ev) *ev = e;
@@ -294,7 +306,7 @@ static bool control(Keyboard& k, uint8_t type, uint8_t req, uint16_t value, uint
         ring_push(k.ep0, (uint32_t)p, (uint32_t)(p >> 32), len, TRB_DATA << 10 | (in ? 1 << 16 : 0));
     }
     ring_push(k.ep0, 0, 0, 0, TRB_STATUS << 10 | (1 << 5) | ((len && in) ? 0 : 1 << 16));
-    db[k.slot] = 1;
+    H->db[k.slot] = 1;
     Trb e;
     if (!wait_event(TRB_TRANSFER_EVENT, k.slot, 1, &e)) return false;
     int cc = e.d2 >> 24;
@@ -341,7 +353,7 @@ static bool configure_intr(Keyboard& k, int ep_addr, int ep_mps, int ep_interval
         interval = ep_interval ? ep_interval - 1 : 0;
         if (interval > 15) interval = 15;
     }
-    memset((void*)k.in_ctx, 0, 33 * csz);
+    memset((void*)k.in_ctx, 0, 33 * H->csz);
     ctx(k.in_ctx, 0)[1] = 1 | 1u << k.dci;
     fill_slot(k, k.dci);
     volatile uint32_t* ep = ctx(k.in_ctx, 1 + k.dci);
@@ -363,12 +375,13 @@ static void forget(int i);
 // slot and an address, and set it up as a keyboard, mouse or hub.
 static void setup_device(int root_port, int parent, int hub_port, int speed) {
     for (auto& k : kbds)                               // already there?
-        if (k.active && k.port == root_port && k.parent == parent && (parent < 0 || k.hub_port == hub_port)) return;
+        if (k.active && k.hc == H && k.port == root_port && k.parent == parent && (parent < 0 || k.hub_port == hub_port)) return;
     int ki = -1;
     for (int i = 0; i < MAX_KBD; i++) if (!kbds[i].active) { ki = i; break; }
     if (ki < 0) { printf("USB: too many devices\n"); return; }
     Keyboard& k = kbds[ki];
     memset((void*)&k, 0, sizeof(k));
+    k.hc = H;
     k.port = root_port;
     k.parent = parent;
     k.hub_port = hub_port;
@@ -389,13 +402,13 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     Trb ev;
     if (command(0, 0, 0, TRB_ENABLE_SLOT << 10, &ev) != 1) { printf("USB: %s: no slot\n", k.where); return; }
     k.slot = ev.d3 >> 24;
-    if (k.slot < 1 || k.slot > max_slots) return;
+    if (k.slot < 1 || k.slot > H->max_slots) return;
 
-    k.out_ctx = (volatile uint8_t*)dma_alloc(32 * csz, 64);
-    k.in_ctx  = (volatile uint8_t*)dma_alloc(33 * csz, 64);
+    k.out_ctx = (volatile uint8_t*)dma_alloc(32 * H->csz, 64);
+    k.in_ctx  = (volatile uint8_t*)dma_alloc(33 * H->csz, 64);
     k.reports = (volatile uint8_t*)dma_alloc(RING_TRBS * 8, 64);
     if (!k.out_ctx || !k.in_ctx || !k.reports || !ring_init(k.ep0) || !ring_init(k.intr)) return;
-    dcbaa[k.slot] = phys(k.out_ctx);
+    H->dcbaa[k.slot] = phys(k.out_ctx);
 
     // Address Device: slot context + endpoint 0.
     int mps0 = k.speed == 2 || k.speed == 1 ? 8 : k.speed == 3 ? 64 : 512;
@@ -416,7 +429,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     int mps = desc[7];
     bool hub = desc[4] == 9;                            // device class: hub
     if (mps && mps != mps0 && k.speed < 4) {            // fix EP0 max packet size
-        memset((void*)ctx(k.in_ctx, 0), 0, csz);
+        memset((void*)ctx(k.in_ctx, 0), 0, H->csz);
         ctx(k.in_ctx, 0)[1] = 0x2;
         ep0[1] = (ep0[1] & 0xFFFF) | (uint32_t)mps << 16;
         command((uint32_t)ic, (uint32_t)(ic >> 32), 0, TRB_EVALUATE_CTX << 10 | (uint32_t)k.slot << 24, nullptr);
@@ -462,7 +475,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
         if (!configure_intr(k, ep_addr, ep_mps, ep_interval)) return;
         k.active = true;
         for (int i = 0; i < 8; i++) queue_report(k);
-        db[k.slot] = k.dci;
+        H->db[k.slot] = k.dci;
         printf("USB: hub on %s (%d ports, %s speed)\n", k.where, k.nports, speed_name(k.speed));
         for (int p = 1; p <= k.nports; p++) control(k, 0x23, 3, 8, p, 0, nullptr);   // SET_FEATURE PORT_POWER
         delay_ms((int)k.power_good_ms + 100);           // power good, then connect debounce
@@ -478,7 +491,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
     k.mouse = is_mouse;
     k.active = true;
     for (int i = 0; i < 8; i++) queue_report(k);
-    db[k.slot] = k.dci;
+    H->db[k.slot] = k.dci;
     printf("USB: %s on %s (slot %d, %s speed)\n", k.mouse ? "mouse" : "keyboard", k.where, k.slot, speed_name(k.speed));
 }
 
@@ -486,6 +499,7 @@ static void setup_device(int root_port, int parent, int hub_port, int speed) {
 static void forget(int i) {
     Keyboard& k = kbds[i];
     if (!k.active) return;
+    H = k.hc;
     for (int j = 0; j < MAX_KBD; j++)
         if (kbds[j].active && kbds[j].parent == i) forget(j);
     if (k.kind != HUB) release_all(k);
@@ -497,6 +511,7 @@ static void forget(int i) {
 // Port `port` of hub h: something plugged in or out (or the first look).
 static void hub_port_change(int h, int port) {
     Keyboard& hb = kbds[h];
+    H = hb.hc;
     static volatile uint8_t st[4] __attribute__((aligned(64)));
     if (!hb.active || !control(hb, 0xA3, 0, 0, port, 4, st)) return;            // GET_STATUS
     uint16_t status = st[0] | st[1] << 8, change = st[2] | st[3] << 8;
@@ -527,21 +542,21 @@ static void hub_port_change(int h, int port) {
 }
 
 static void setup_port(int port) {
-    for (auto& k : kbds) if (k.active && k.port == port && k.parent < 0) return;
+    for (auto& k : kbds) if (k.active && k.hc == H && k.port == port && k.parent < 0) return;
     if (!reset_port(port)) return;
     setup_device(port, -1, 0, (portsc(port) >> 10) & 0xF);    // 1 FS, 2 LS, 3 HS, 4+ SS
 }
 
 // ---------------------------------------------------------------- init
 static bool bios_handoff() {
-    uint32_t xecp = (rd(cap, 0x10) >> 16) * 4;
+    uint32_t xecp = (rd(H->cap, 0x10) >> 16) * 4;
     for (int guard = 0; xecp && guard < 64; guard++) {
-        uint32_t v = rd(cap, xecp);
+        uint32_t v = rd(H->cap, xecp);
         if ((v & 0xFF) == 1) {                          // USB legacy support
-            wr(cap, xecp, v | (1u << 24));              // OS owned
-            for (int i = 0; i < 1000 && (rd(cap, xecp) & (1u << 16)); i++) delay_ms(1);
-            if (rd(cap, xecp) & (1u << 16)) { printf("USB: BIOS won't release the controller\n"); return false; }
-            wr(cap, xecp + 4, 0xE0000000);              // disable SMIs, clear their status
+            wr(H->cap, xecp, v | (1u << 24));              // OS owned
+            for (int i = 0; i < 1000 && (rd(H->cap, xecp) & (1u << 16)); i++) delay_ms(1);
+            if (rd(H->cap, xecp) & (1u << 16)) { printf("USB: BIOS won't release the controller\n"); return false; }
+            wr(H->cap, xecp + 4, 0xE0000000);              // disable SMIs, clear their status
             return true;
         }
         uint32_t next = (v >> 8) & 0xFF;
@@ -558,28 +573,28 @@ static bool init_controller(const PciDevice& d) {
     if (!base || base >= phys_limit) { printf("USB: xHCI registers above 4 GiB\n"); return false; }
     pci_write(d, 0x04, pci_read(d, 0x04) | 0x06);      // memory + bus master
 
-    cap = (volatile uint8_t*)(uintptr_t)base;
-    op = cap + (rd(cap, 0x00) & 0xFF);
-    rt = cap + (rd(cap, 0x18) & ~0x1Fu);
-    db = (volatile uint32_t*)(cap + (rd(cap, 0x14) & ~0x3u));
-    uint32_t hcs1 = rd(cap, 0x04), hcs2 = rd(cap, 0x08), hcc1 = rd(cap, 0x10);
-    max_slots = hcs1 & 0xFF;
-    num_ports = hcs1 >> 24;
-    csz = (hcc1 & (1 << 2)) ? 64 : 32;
-    if (max_slots > 32) max_slots = 32;
+    H->cap = (volatile uint8_t*)(uintptr_t)base;
+    H->op = H->cap + (rd(H->cap, 0x00) & 0xFF);
+    H->rt = H->cap + (rd(H->cap, 0x18) & ~0x1Fu);
+    H->db = (volatile uint32_t*)(H->cap + (rd(H->cap, 0x14) & ~0x3u));
+    uint32_t hcs1 = rd(H->cap, 0x04), hcs2 = rd(H->cap, 0x08), hcc1 = rd(H->cap, 0x10);
+    H->max_slots = hcs1 & 0xFF;
+    H->num_ports = hcs1 >> 24;
+    H->csz = (hcc1 & (1 << 2)) ? 64 : 32;
+    if (H->max_slots > 32) H->max_slots = 32;
 
     if (!bios_handoff()) return false;
 
     // Halt and reset.
-    wr(op, 0x00, rd(op, 0x00) & ~1u);
-    for (int i = 0; i < 100 && !(rd(op, 0x04) & 1); i++) delay_ms(1);
-    wr(op, 0x00, 1 << 1);
-    for (int i = 0; i < 1000 && (rd(op, 0x00) & (1 << 1)); i++) delay_ms(1);
-    for (int i = 0; i < 1000 && (rd(op, 0x04) & (1 << 11)); i++) delay_ms(1);
-    if (rd(op, 0x00) & (1 << 1)) { printf("USB: controller reset timed out\n"); return false; }
+    wr(H->op, 0x00, rd(H->op, 0x00) & ~1u);
+    for (int i = 0; i < 100 && !(rd(H->op, 0x04) & 1); i++) delay_ms(1);
+    wr(H->op, 0x00, 1 << 1);
+    for (int i = 0; i < 1000 && (rd(H->op, 0x00) & (1 << 1)); i++) delay_ms(1);
+    for (int i = 0; i < 1000 && (rd(H->op, 0x04) & (1 << 11)); i++) delay_ms(1);
+    if (rd(H->op, 0x00) & (1 << 1)) { printf("USB: controller reset timed out\n"); return false; }
 
     // Device context array, with scratchpad buffers if the controller wants them.
-    dcbaa = (volatile uint64_t*)dma_alloc((max_slots + 1) * 8, 64);
+    H->dcbaa = (volatile uint64_t*)dma_alloc((H->max_slots + 1) * 8, 64);
     int scratch = ((hcs2 >> 27) & 0x1F) | (((hcs2 >> 21) & 0x1F) << 5);
     if (scratch) {
         volatile uint64_t* arr = (volatile uint64_t*)dma_alloc(scratch * 8, 64);
@@ -588,28 +603,28 @@ static bool init_controller(const PciDevice& d) {
             if (!arr || !page) { printf("USB: out of memory for scratchpad\n"); return false; }
             arr[i] = phys(page);
         }
-        dcbaa[0] = phys(arr);
+        H->dcbaa[0] = phys(arr);
     }
-    if (!dcbaa || !ring_init(cmd_ring)) return false;
+    if (!H->dcbaa || !ring_init(H->cmd_ring)) return false;
 
     // One event ring segment.
-    evt = (volatile Trb*)dma_alloc(EVT_TRBS * sizeof(Trb), 64);
+    H->evt = (volatile Trb*)dma_alloc(EVT_TRBS * sizeof(Trb), 64);
     volatile uint64_t* erst = (volatile uint64_t*)dma_alloc(16, 64);
-    if (!evt || !erst) return false;
-    erst[0] = phys(evt);
+    if (!H->evt || !erst) return false;
+    erst[0] = phys(H->evt);
     erst[1] = EVT_TRBS;
 
-    wr(op, 0x38, max_slots);                            // CONFIG: slots enabled
-    wr64(op, 0x30, phys(dcbaa));
-    wr64(op, 0x18, phys(cmd_ring.trb) | 1);             // CRCR, cycle 1
-    wr(rt, 0x28, 1);                                    // ERSTSZ
-    wr64(rt, 0x38, phys(evt));                          // ERDP
-    wr64(rt, 0x30, phys(erst));                         // ERSTBA
-    wr(rt, 0x20, 0);                                    // IMAN: no interrupts, we poll
-    wr(op, 0x00, 1);                                    // run
-    for (int i = 0; i < 100 && (rd(op, 0x04) & 1); i++) delay_ms(1);
+    wr(H->op, 0x38, H->max_slots);                            // CONFIG: slots enabled
+    wr64(H->op, 0x30, phys(H->dcbaa));
+    wr64(H->op, 0x18, phys(H->cmd_ring.trb) | 1);             // CRCR, cycle 1
+    wr(H->rt, 0x28, 1);                                    // ERSTSZ
+    wr64(H->rt, 0x38, phys(H->evt));                          // ERDP
+    wr64(H->rt, 0x30, phys(erst));                         // ERSTBA
+    wr(H->rt, 0x20, 0);                                    // IMAN: no interrupts, we poll
+    wr(H->op, 0x00, 1);                                    // run
+    for (int i = 0; i < 100 && (rd(H->op, 0x04) & 1); i++) delay_ms(1);
 
-    for (int p = 1; p <= num_ports; p++) {              // make sure ports are powered
+    for (int p = 1; p <= H->num_ports; p++) {              // make sure ports are powered
         uint32_t sc = portsc(p);
         if (!(sc & PORT_PP)) set_portsc(p, (sc & PORT_KEEP) | PORT_PP);
     }
@@ -620,35 +635,45 @@ static bool init_controller(const PciDevice& d) {
 bool usb_init(const char* cmdline) {
     for (const char* p = cmdline; p && *p; p++)
         if (strncmp(p, "usb=off", 7) == 0) { printf("USB: disabled\n"); return false; }
+    // Every xHCI controller, not just the first: keyboards and mice may be
+    // on an add-in card, or on the second of a board's two controllers.
     PciDevice d;
-    if (!pci_find_class(0x0C, 0x03, 0x30, &d)) { printf("USB: no xHCI controller\n"); return false; }
-    if (!init_controller(d)) return false;
-    ready = true;
-    for (int p = 1; p <= num_ports; p++)
-        if (portsc(p) & PORT_CCS) setup_port(p);
-    int n = 0;
-    for (auto& k : kbds) n += k.active && k.kind != HUB;
-    printf("USB: xHCI with %d ports, %d keyboard/mouse device%s\n", num_ports, n, n == 1 ? "" : "s");
+    for (int i = 0; num_hc < MAX_HC && pci_find_class(0x0C, 0x03, 0x30, &d, i); i++) {
+        H = &hcs[num_hc];
+        memset((void*)H, 0, sizeof *H);
+        H->evt_cycle = 1;
+        printf("USB: xHCI %d at PCI %02x:%02x.%x\n", num_hc, d.bus, d.dev, d.fn);
+        if (!init_controller(d)) continue;              // try the others
+        num_hc++;
+        for (int p = 1; p <= H->num_ports; p++)
+            if (portsc(p) & PORT_CCS) setup_port(p);
+        int n = 0;
+        for (auto& k : kbds) n += k.active && k.hc == H && k.kind != HUB;
+        printf("USB: xHCI %d with %d ports, %d keyboard/mouse device%s\n", num_hc - 1, H->num_ports, n, n == 1 ? "" : "s");
+    }
+    if (!num_hc) { printf("USB: no xHCI controller\n"); return false; }
     return true;
 }
 
 void usb_poll() {
-    if (!ready) return;
-    Trb e;
-    for (int i = 0; i < 64 && next_event(&e); i++) dispatch(e);
-    for (int p = 1; p <= num_ports; p++) {
-        if (!port_dirty[p]) continue;
-        port_dirty[p] = false;
-        uint32_t sc = portsc(p);
-        set_portsc(p, (sc & PORT_KEEP) | (sc & PORT_CHANGES));   // ack
-        if (sc & PORT_CCS) {
-            if (sc & PORT_CSC || !(sc & PORT_PED)) setup_port(p);
-        } else {
-            for (int i = 0; i < MAX_KBD; i++)
-                if (kbds[i].active && kbds[i].port == p && kbds[i].parent < 0) forget(i);
+    for (int c = 0; c < num_hc; c++) {
+        H = &hcs[c];
+        Trb e;
+        for (int i = 0; i < 64 && next_event(&e); i++) dispatch(e);
+        for (int p = 1; p <= H->num_ports; p++) {
+            if (!H->port_dirty[p]) continue;
+            H->port_dirty[p] = false;
+            uint32_t sc = portsc(p);
+            set_portsc(p, (sc & PORT_KEEP) | (sc & PORT_CHANGES));   // ack
+            if (sc & PORT_CCS) {
+                if (sc & PORT_CSC || !(sc & PORT_PED)) setup_port(p);
+            } else {
+                for (int i = 0; i < MAX_KBD; i++)
+                    if (kbds[i].active && kbds[i].hc == H && kbds[i].port == p && kbds[i].parent < 0) forget(i);
+            }
         }
     }
-    for (int h = 0; h < MAX_KBD; h++) {                 // hubs' ports
+    for (int h = 0; h < MAX_KBD; h++) {                 // hubs' ports (hub_port_change picks the controller)
         while (kbds[h].active && kbds[h].kind == HUB && kbds[h].dirty) {
             uint32_t d = kbds[h].dirty;
             kbds[h].dirty = 0;
