@@ -35,6 +35,7 @@
 
 #include <thread>
 #include <atomic>
+#include <exception>
 #include <memory>
 #include <cstring>
 #include <cstdio>
@@ -48,6 +49,14 @@
 #include <dirent.h>
 #endif
 #include <sys/stat.h>
+
+#ifdef _WIN32
+// On Windows plain stat()/_stat() keeps st_size in 32 bits, so anything over
+// 2 GB fails to stat and is reported as "not found".  Use the 64-bit variant
+// for both the struct and the call throughout this file.
+#  undef stat
+#  define stat _stat64
+#endif
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -72,6 +81,9 @@
 static std::atomic<bool> g_webserver_running(false);
 static std::atomic<bool> g_webserver_should_exit(false);
 static std::thread *g_webserver_thread = nullptr;
+// Detached per-request threads still in flight.  Shutdown must wait for these,
+// otherwise ssh_disconnect() frees the session under an active download.
+static std::atomic<int>  g_active_requests(0);
 static int g_listen_socket = INVALID_SOCKET;
 static int g_tunnel_counter = 0;
 static SDL_mutex *g_tunnel_mutex = nullptr;
@@ -140,6 +152,7 @@ static int socket_send_safe(int sock, const char *data, int len) {
         int err = WSAGetLastError();
 
         if (err == WSAEWOULDBLOCK) {
+            if (g_webserver_should_exit.load()) return -1;
             SDL_Delay(1);
             continue;
         }
@@ -149,6 +162,7 @@ static int socket_send_safe(int sock, const char *data, int len) {
         int err = errno;
 
         if (err == EAGAIN || err == EWOULDBLOCK) {
+            if (g_webserver_should_exit.load()) return -1;
             SDL_Delay(1);
             continue;
         }
@@ -1429,6 +1443,7 @@ static void handle_http_request_local(int client_socket, int tunnel_id,
                 uint64_t bytes_wanted = is_partial ? (range_end - range_start + 1) : file_size;
 
                 while (total_sent < bytes_wanted) {
+                    if (g_webserver_should_exit.load()) break;
                     if (!socket_is_valid(client_socket)) {
                         SDL_Log("[Tunnel %d] Socket invalid during download: %s (sent %llu/%llu bytes)",
                                 tunnel_id, fs_path.c_str(), total_sent, bytes_wanted);
@@ -1755,6 +1770,12 @@ static void handle_http_request(int client_socket, int tunnel_id) {
                     uint64_t bytes_wanted = is_partial ? (range_end - range_start + 1) : file_size;
                     
                     while (total_sent < bytes_wanted) {
+                        if (g_webserver_should_exit.load()) {
+                            SDL_Log("[Tunnel %d] Server stopping, aborting download: %s",
+                                    tunnel_id, decoded_path.c_str());
+                            transfer_was_cancelled = true;
+                            break;
+                        }
                         // CRITICAL: Check if socket is still valid BEFORE reading
                         if (!socket_is_valid(client_socket)) {
                             SDL_Log("[Tunnel %d] Socket invalid during download: %s (sent %llu/%llu bytes)", 
@@ -2053,8 +2074,21 @@ static void webserver_thread_func() {
         SDL_Log("[Tunnel %d] Opened", tunnel_id);
         
         // Spawn a thread to handle this request so we don't block the accept loop
+        g_active_requests.fetch_add(1);
         std::thread request_handler([client_socket, tunnel_id]() {
-            handle_http_request(client_socket, tunnel_id);
+            struct Done { ~Done() { g_active_requests.fetch_sub(1); } } done;
+            // An exception escaping a detached thread calls std::terminate(),
+            // which kills the whole app with no message (e.g. bad_alloc while
+            // buffering a huge file for audio conversion).  Contain it.
+            try {
+                handle_http_request(client_socket, tunnel_id);
+            } catch (const std::exception &e) {
+                SDL_Log("[Tunnel %d] Request aborted: %s", tunnel_id, e.what());
+                closesocket(client_socket);
+            } catch (...) {
+                SDL_Log("[Tunnel %d] Request aborted: unknown exception", tunnel_id);
+                closesocket(client_socket);
+            }
         });
         request_handler.detach();  // Let it run independently
     }
@@ -2182,6 +2216,15 @@ void sftp_webserver_stop() {
         delete g_webserver_thread;
         g_webserver_thread = nullptr;
     }
+
+    // Wait for in-flight request threads to notice the exit flag and finish
+    // their current chunk.  They hold no lock between chunks, so this is
+    // quick; cap it so a wedged client can't hang shutdown forever.
+    for (int i = 0; i < 1000 && g_active_requests.load() > 0; i++)
+        SDL_Delay(10);
+    if (g_active_requests.load() > 0)
+        SDL_Log("[WebServer] %d request(s) still running at shutdown",
+                g_active_requests.load());
 
     if (g_tunnel_mutex) {
         SDL_DestroyMutex(g_tunnel_mutex);
