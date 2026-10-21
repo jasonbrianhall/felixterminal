@@ -772,6 +772,14 @@ int main(int argc, char **argv) {
     auto guess_remote_cwd = [&]() -> std::string {
         LIBSSH2_SESSION *sess = ssh_get_session();
         if (!sess) return "/";
+        // Don't touch the session (or stall the UI behind the session lock)
+        // while an F4 console transfer owns it.
+        if (sftp_console_transfer_in_progress()) return "/";
+
+        struct SessGuard {
+            SessGuard()  { ssh_session_lock(); }
+            ~SessGuard() { ssh_session_unlock(); }
+        } sess_guard;
 
         libssh2_session_set_blocking(sess, 1);
 

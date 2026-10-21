@@ -1299,6 +1299,14 @@ void ssh_pty_resize(int cols, int rows) {
 
 bool ssh_channel_closed() {
     if (!s_active || !s_channel) return true;
+    // libssh2_channel_eof() walks session->packets, which another thread
+    // (SFTP console / overlay / web server / port-forward) may be mutating
+    // mid-transfer.  Calling it unlocked is a use-after-free that kills the
+    // process silently on large downloads.  Never block the UI thread here:
+    // if someone else holds the session, assume the channel is still open —
+    // we'll check again next frame.
+    std::unique_lock<std::recursive_mutex> lock(s_session_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
     return libssh2_channel_eof(s_channel) != 0;
 }
 

@@ -25,6 +25,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <functional>
 #include <sstream>
@@ -131,7 +132,18 @@ static char                       s_local_cwd[4096]  = {};
 static std::thread                s_worker;
 static std::atomic<bool>          s_busy{false};
 static std::atomic<float>         s_progress{0.f};
-static std::string                s_progress_label;
+static std::atomic<bool>          s_cancel{false};
+// Written by the worker, read by render every frame — must be guarded, or a
+// reassignment (heap realloc for names > SSO length) frees the buffer render
+// is drawing from.
+static std::string                s_progress_label_;
+static std::mutex                 s_label_mtx;
+static void set_progress_label(const std::string &l) {
+    std::lock_guard<std::mutex> g(s_label_mtx); s_progress_label_ = l;
+}
+static std::string get_progress_label() {
+    std::lock_guard<std::mutex> g(s_label_mtx); return s_progress_label_;
+}
 
 // Transfer timeout constants
 static const int TRANSFER_TIMEOUT_SECONDS = 30;  // Max time to read/write one chunk
@@ -348,26 +360,25 @@ static std::string do_get(const char *remote_full, const char *local_full,
     s_progress.store(0.f);
     auto last_progress_time = std::chrono::steady_clock::now();
     
+    bool cancelled = false, timed_out = false;
     for (;;) {
+        if (s_cancel.load()) { ok = false; cancelled = true; break; }
         n = libssh2_sftp_read(fh, buf, TRANSFER_BUFFER_SIZE);
-        if (n == LIBSSH2_ERROR_EAGAIN) { 
-            waitsocket_con(sock, sess); 
-            continue; 
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            // No-progress watchdog must also run while we're waiting,
+            // otherwise a stalled link spins here forever.
+            auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - last_progress_time).count();
+            if (idle > TRANSFER_TIMEOUT_SECONDS) { ok = false; timed_out = true; break; }
+            waitsocket_con(sock, sess);
+            continue;
         }
         if (n < 0) { 
             ok = false; 
             break; 
         }
         if (n == 0) break;
-        
-        // Check timeout - if we haven't made progress in a while, abort
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time).count();
-        if (elapsed > TRANSFER_TIMEOUT_SECONDS) {
-            ok = false;
-            break;
-        }
-        last_progress_time = now;
+        last_progress_time = std::chrono::steady_clock::now();
         
         if (fwrite(buf, 1, (size_t)n, out) != (size_t)n) { ok = false; break; }
         total += (uint64_t)n;
@@ -377,7 +388,17 @@ static std::string do_get(const char *remote_full, const char *local_full,
     while (libssh2_sftp_close(fh) == LIBSSH2_ERROR_EAGAIN) waitsocket_con(sock, sess);
     free(buf);
 
-    if (!ok) return std::string("transfer failed or timeout for '") + remote_full + "'";
+    if (!ok) {
+        // Don't leave a truncated file that looks like a good download.
+        remove(local_full);
+        if (cancelled) return std::string("cancelled: '") + remote_full + "'";
+        if (timed_out) return std::string("timed out (no data for ") +
+                              std::to_string(TRANSFER_TIMEOUT_SECONDS) + "s): '" + remote_full + "'";
+        char e[512];
+        snprintf(e, sizeof(e), "transfer failed for '%s' (ssh err %d, sftp err %lu)",
+                 remote_full, libssh2_session_last_errno(sess), libssh2_sftp_last_error(s_sftp));
+        return e;
+    }
     s_progress.store(1.f);
     return "";
 }
@@ -431,21 +452,20 @@ static std::string do_put(const char *local_full, const char *remote_full) {
     auto last_progress_time = std::chrono::steady_clock::now();
     
     while ((nread = fread(buf, 1, TRANSFER_BUFFER_SIZE, in)) > 0) {
-        // Check timeout - if we haven't made progress in a while, abort
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time).count();
-        if (elapsed > TRANSFER_TIMEOUT_SECONDS) {
-            ok = false;
-            goto put_done;
-        }
-        last_progress_time = now;
-        
         size_t sent = 0;
         while (sent < nread) {
+            if (s_cancel.load()) { ok = false; goto put_done; }
             ssize_t rc = libssh2_sftp_write(fh, buf + sent, nread - sent);
-            if (rc == LIBSSH2_ERROR_EAGAIN) { waitsocket_con(sock, sess); continue; }
+            if (rc == LIBSSH2_ERROR_EAGAIN) {
+                auto idle = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - last_progress_time).count();
+                if (idle > TRANSFER_TIMEOUT_SECONDS) { ok = false; goto put_done; }
+                waitsocket_con(sock, sess);
+                continue;
+            }
             if (rc < 0) { ok = false; goto put_done; }
             sent += (size_t)rc; total += (size_t)rc;
+            last_progress_time = std::chrono::steady_clock::now();
         }
         if (file_size) s_progress.store((float)total / (float)file_size);
     }
@@ -459,6 +479,7 @@ put_done:
     // Lock is released here when lk goes out of scope
     
     if (!ok) {
+        if (s_cancel.load()) return std::string("cancelled: '") + local_full + "'";
         return std::string("transfer failed or timeout for '") + local_full + "'";
     }
     s_progress.store(1.f);
@@ -707,6 +728,23 @@ static bool cmd_instant(const std::vector<std::string> &toks) {
         push_info(buf);
         return true;
     }
+    if (cmd == "cancel") {
+        if (s_busy.load()) { s_cancel.store(true); push_info("Cancelling transfer..."); }
+        else push_info("No transfer in progress");
+        return true;
+    }
+
+    // Everything below talks to the server on the UI thread.  While a transfer
+    // owns the session lock that would freeze the window for the whole download
+    // (Windows then flags it "Not responding" and may kill it), so refuse.
+    if (cmd == "ls" || cmd == "cd" || cmd == "mkdir" || cmd == "rmdir" ||
+        cmd == "rm" || cmd == "rename" || cmd == "chmod") {
+        if (s_busy.load()) {
+            push_err("Busy — wait for the transfer to finish (or type 'cancel')");
+            return true;
+        }
+    }
+
     if (!console_sftp_init()) { push_err("SFTP subsystem not available"); return true; }
 
     if (cmd == "ls") {
@@ -942,7 +980,7 @@ static void cmd_worker(std::vector<std::string> toks) {
             ? toks[1].substr(toks[1].rfind('/')+1) : toks[1];
         std::string lpath = toks.size() >= 3 ? local_abs(toks[2])
                                               : std::string(s_local_cwd) + "/" + fname;
-        s_progress_label = "get " + fname;
+        set_progress_label("get " + fname);
         s_progress.store(0.f);
         std::string err = do_get(rpath.c_str(), lpath.c_str(), fname);
         if (err.empty()) {
@@ -989,6 +1027,7 @@ static void cmd_worker(std::vector<std::string> toks) {
             new (&lk) SessionLock();
             
             for (auto &e : entries) {
+                if (s_cancel.load()) break;
                 if (e.is_dir) continue;
                 if (fnmatch(pattern.c_str(), e.name.c_str(), 0) != 0) continue;
                 
@@ -998,7 +1037,7 @@ static void cmd_worker(std::vector<std::string> toks) {
                 
                 std::string lpath = std::string(s_local_cwd) + "/" + e.name;
                 
-                s_progress_label = "mget " + e.name;
+                set_progress_label("mget " + e.name);
                 s_progress.store(0.f);
                 
                 std::string err = do_get(rpath.c_str(), lpath.c_str(), e.name);
@@ -1020,6 +1059,7 @@ static void cmd_worker(std::vector<std::string> toks) {
                 new (&lk) SessionLock();
                 
                 for (auto &e : entries) {
+                    if (s_cancel.load()) return;
                     // Handle directories
                     if (e.is_dir) {
                         std::string subdir = dir + "/" + e.name;
@@ -1082,7 +1122,7 @@ static void cmd_worker(std::vector<std::string> toks) {
                         ensure_local_dir(local_subdir);
                     }
                     
-                    s_progress_label = "mget " + e.name;
+                    set_progress_label("mget " + e.name);
                     s_progress.store(0.f);
                     
                     std::string err = do_get(rpath.c_str(), lpath.c_str(), e.name);
@@ -1113,7 +1153,7 @@ static void cmd_worker(std::vector<std::string> toks) {
             ? toks[1].substr(toks[1].rfind('/')+1) : toks[1];
         std::string rpath = toks.size() >= 3 ? remote_abs(toks[2])
                                               : std::string(s_remote_cwd) + "/" + fname;
-        s_progress_label = "put " + fname;
+        set_progress_label("put " + fname);
         s_progress.store(0.f);
         std::string err = do_put(lpath.c_str(), rpath.c_str());
         if (err.empty()) {
@@ -1154,9 +1194,10 @@ static void cmd_worker(std::vector<std::string> toks) {
         }
 #endif
         for (auto &name : names) {
+            if (s_cancel.load()) break;
             std::string lpath = std::string(s_local_cwd) + "/" + name;
             std::string rpath = std::string(s_remote_cwd) + "/" + name;
-            s_progress_label = "mput " + name;
+            set_progress_label("mput " + name);
             s_progress.store(0.f);
             std::string err = do_put(lpath.c_str(), rpath.c_str());
             if (err.empty()) {
@@ -1198,6 +1239,7 @@ static void execute(const char *line) {
     if (s_busy.load()) { push_err("Busy — wait for current transfer to finish"); drain_pending(); return; }
     if (!console_sftp_init()) { push_err("SFTP subsystem not available"); drain_pending(); return; }
     s_busy.store(true);
+    s_cancel.store(false);
     if (s_worker.joinable()) {
         s_worker.join();   // blocks until previous command's output is all pushed
         drain_pending();   // flush that output into s_lines immediately
@@ -1220,7 +1262,7 @@ void sftp_console_open(int /*win_w*/, int /*win_h*/) {
     }
 
     // Populate remote CWD from active session if we can
-    if (ssh_active() && console_sftp_init()) {
+    if (ssh_active() && !s_busy.load() && console_sftp_init()) {
         SessionLock lk;
         LIBSSH2_SESSION *sess = ssh_get_session();
         libssh2_session_set_blocking(sess, 0);
@@ -1238,6 +1280,7 @@ void sftp_console_close() {
 }
 
 void sftp_console_join() {
+    s_cancel.store(true);
     if (s_worker.joinable()) s_worker.join();
     if (s_sftp) { libssh2_sftp_shutdown(s_sftp); s_sftp = nullptr; }
 }
@@ -1573,8 +1616,9 @@ void sftp_console_render(int win_w, int win_h) {
         draw_rect(0, progress_y, (float)win_w, bar_h, 0.12f, 0.14f, 0.20f, 1.f);
         if (filled > 0)
             draw_rect(0, progress_y, filled, bar_h, 0.20f, 0.80f, 0.45f, 1.f);
-        if (!s_progress_label.empty()) {
-            con_text(s_progress_label.c_str(), (float)PAD, progress_y - 4, 0.50f, 0.80f, 0.55f);
+        std::string label = get_progress_label();
+        if (!label.empty()) {
+            con_text(label.c_str(), (float)PAD, progress_y - 4, 0.50f, 0.80f, 0.55f);
         }
     }
 
@@ -1655,6 +1699,10 @@ bool sftp_console_transfer_in_progress() {
     return s_busy.load();
 }
 
+void sftp_console_cancel_transfer() {
+    if (s_busy.load()) s_cancel.store(true);
+}
+
 
 void sftp_console_reset_after_fork() {
     // Clean up inherited console state from parent process.
@@ -1678,6 +1726,7 @@ void sftp_console_reset_after_fork() {
     
     // Reset worker state
     s_busy.store(false);
+    s_cancel.store(false);
     s_progress.store(0.f);
     s_pending.clear();
 }
