@@ -17,6 +17,7 @@ on:
       - '**.S'
       - 'wopr/wopr_basic/baremetal/**'
       - 'wopr/wopr_basic/test/**'
+      - 'wopr/wopr_basic/msdos/**'
   pull_request:
     branches: [ main, dev ]
     paths:
@@ -33,6 +34,7 @@ on:
       - '**.S'
       - 'wopr/wopr_basic/baremetal/**'
       - 'wopr/wopr_basic/test/**'
+      - 'wopr/wopr_basic/msdos/**'
   workflow_dispatch:
 
 env:
@@ -248,6 +250,65 @@ jobs:
       with:
         name: felix-basic-i386
         path: dist/*
+        retention-days: 7
+
+  build-msdos:
+    # Felix BASIC for MS-DOS / FreeDOS: a 32-bit DJGPP program with CWSDPMI
+    # built in, on a 386 (with a 387) or later with a VESA or VGA card.
+    runs-on: ubuntu-latest
+    env:
+      DJGPP_URL: https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends wget unzip zip
+
+    - name: Restore DJGPP
+      id: djgpp-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/djgpp
+        key: djgpp-gcc1220-v3.4
+
+    - name: Download DJGPP
+      if: steps.djgpp-cache.outputs.cache-hit != 'true'
+      run: |
+        wget -q "$DJGPP_URL" -O /tmp/djgpp.tar.bz2
+        tar xjf /tmp/djgpp.tar.bz2 -C ~
+
+    - name: Download CWSDPMI
+      working-directory: wopr/wopr_basic/msdos
+      run: |
+        for url in \
+          http://na.mirror.garr.it/mirrors/djgpp/current/v2misc/csdpmi7b.zip \
+          https://www.delorie.com/pub/djgpp/current/v2misc/csdpmi7b.zip \
+          http://ftp.fu-berlin.de/pc/languages/djgpp/current/v2misc/csdpmi7b.zip; do
+          wget -q -T 30 "$url" -O csdpmi7b.zip && unzip -o -q csdpmi7b.zip -d csdpmi && break
+        done
+        test -f csdpmi/bin/CWSDSTUB.EXE
+
+    - name: Build
+      working-directory: wopr/wopr_basic/msdos
+      run: |
+        export PATH="$HOME/djgpp/bin:$PATH"
+        make DOCKER=0
+
+    - name: Prepare Artifacts
+      run: |
+        mkdir -p dist/FelixBASIC-DOS
+        cp wopr/wopr_basic/msdos/felixbas.exe dist/FelixBASIC-DOS/FELIXBAS.EXE
+        cp -r wopr/wopr_basic/test dist/FelixBASIC-DOS/TEST
+        (cd dist && zip -r -q FelixBASIC-DOS.zip FelixBASIC-DOS)
+        ls -l dist
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: felix-basic-dos
+        path: dist/FelixBASIC-DOS.zip
         retention-days: 7
 
   build-msi-windows:
@@ -619,7 +680,7 @@ jobs:
         retention-days: 7
 
   create-release:
-    needs: [build-windows, build-msi-windows, build-msix-windows, build-debug-standalone, build-baremetal-i386]
+    needs: [build-windows, build-msi-windows, build-msix-windows, build-debug-standalone, build-baremetal-i386, build-msdos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -658,6 +719,12 @@ jobs:
         name: felix-basic-i386
         path: release
 
+    - name: Download DOS BASIC Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: felix-basic-dos
+        path: release
+
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
@@ -670,6 +737,7 @@ jobs:
           release/FelixTerminal-Debug-x64.zip
           release/FelixBASIC-i386-floppy.img
           release/FelixBASIC-i386.iso
+          release/FelixBASIC-DOS.zip
         tag_name: ${{ github.ref == 'refs/heads/main' && format('v{0}', github.run_number) || format('dev-v{0}', github.run_number) }}
         name: ${{ github.ref == 'refs/heads/main' && format('Release v{0}', github.run_number) || format('Dev Build v{0}', github.run_number) }}
         draft: false
@@ -691,6 +759,7 @@ jobs:
           - **FelixTerminal-Portable-x64.zip** / **FelixTerminal-Portable-arm64.zip** — Portable versions, no installation required
           - **FelixBASIC-i386-floppy.img** — Bare-metal Felix BASIC: a bootable 1.44 MB floppy that boots straight into BASIC on a 386 (with a 387) or later, 4 MB of RAM; programs are saved on the floppy. Write it with `dd if=FelixBASIC-i386-floppy.img of=/dev/fd0`, or try it with `qemu-system-i386 -m 8 -drive file=FelixBASIC-i386-floppy.img,if=floppy,format=raw -boot a`
           - **FelixBASIC-i386.iso** — The same for CD or USB stick (files go to a RAM disk)
+          - **FelixBASIC-DOS.zip** — Felix BASIC for MS-DOS / FreeDOS (FELIXBAS.EXE, DPMI built in) with the sample programs in TEST; 386 with a 387 or later, VESA or VGA. Runs in DOSBox too
 
           ### ✨ Installer Features (MSI)
           - ✅ Start Menu shortcuts for cmd.exe and PowerShell
