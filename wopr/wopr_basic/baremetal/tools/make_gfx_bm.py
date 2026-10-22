@@ -105,8 +105,10 @@ static void layout() {
     int dh = std::min(fh, fw * 3 / 4);
     int dw = std::min(fw, dh * 4 / 3);
     if (!s_gfx_active) {
-        s_text_rows = TEXT_ROWS_DEF;
-        int bw = 640 / s_text_cols, bh = 16, th = s_text_rows * bh;
+        // WIDTH , 43 / 50: the 8x16 font squeezed into shorter cells, as
+        // an EGA or VGA did with its 8x8 font
+        s_text_rows = s_text_lock_rows > 0 ? s_text_lock_rows : TEXT_ROWS_DEF;
+        int bw = 640 / s_text_cols, bh = s_text_rows > 25 ? 8 : 16, th = s_text_rows * bh;
         int k = std::max(1, std::min(dw / 640, dh / th));
         if (640 * k * 5 >= dw * 4 && th * k * 5 >= dh * 4) {
             s_cell_w = bw * k; s_cell_h = bh * k;            // crisp
@@ -397,10 +399,18 @@ static void render_text_row(uint32_t* strip, int row, int y0, int lines) {
             int sy = cy0 + y - y0;
             if (sy < 0 || sy >= lines) continue;
             int gy = gym[y];
+            // Cells shorter than 14 lines (43 / 50 rows) squeeze the font:
+            // each line shows all the font rows it covers, so no stroke
+            // (B's middle bar, say) drops out.
+            int gy_end = gy + 1;
+            if (chh < 14 && gy >= 0) gy_end = std::max(gy + 1, std::min(16, (y + 1) * 16 / chh));
             Uint32* d = &strip[(size_t)sy * w + x0];
             for (int x = 0; x < cw; x++) {
                 int gx = gxm[x];
-                d[x] = (!blank && gy >= 0 && gx >= 0 && glyph_px(ch, gx, gy)) ? fg : bg;
+                bool on = false;
+                if (!blank && gy >= 0 && gx >= 0)
+                    for (int r = gy; r < gy_end && !on; r++) on = glyph_px(ch, gx, r);
+                d[x] = on ? fg : bg;
             }
         }
     }

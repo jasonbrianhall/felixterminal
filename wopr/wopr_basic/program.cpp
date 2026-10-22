@@ -154,7 +154,8 @@ void normalize_kw(char *src, char *dst, int dstsz) {
                      * the keyword itself.  Check: read the full identifier
                      * at s; if its length != len, this is a longer word
                      * like "TOP" matching "TO" — don't split. */
-                    if (isalnum((unsigned char)after) || after == '$') {
+                    /* (Not before '$': INPUT$ is a function, not INPUT.) */
+                    if (isalnum((unsigned char)after)) {
                         /* measure the full identifier length at s */
                         int idlen = 0;
                         while (isalnum((unsigned char)s[idlen]) || s[idlen] == '_') idlen++;
@@ -682,7 +683,10 @@ void prescan_data(void) {
         char *p = sk(g_lines[li].text);
         if (!kw_match(p, "DATA")) continue;
         p = sk(p + 4);
-        while (*p) {
+        /* A comma at the very end leaves one more, empty, item, as in
+         * QBasic: "DATA a, b," is three items (SORTDEMO counts on it). */
+        bool more = *p != '\0';
+        while (more) {
             p = sk(p);
             char item[DEFAULT_BUFFER]; int i = 0;
             if (*p == '"') {
@@ -700,7 +704,8 @@ void prescan_data(void) {
                 g_data_count++;
             }
             p = sk(p);
-            if (*p == ',') p++;
+            more = *p == ',';
+            if (more) p++;
         }
     }
 }

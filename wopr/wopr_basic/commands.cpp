@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "basic.h"
 #include <stdarg.h>
+#include <chrono>
 #include "basic_print.h"
 #define printf(...) basic_printf(__VA_ARGS__)
 
@@ -627,6 +628,19 @@ static int cmd_beep(Interp *ip, char *args) {
 }
 
 /* SOUND freq, duration   freq in Hz, duration in 18.2-tick clock units */
+/* SOUND starts its note and the program goes on, but the next SOUND waits
+ * for that note to finish, as in QBasic: programs pace themselves with it
+ * (SORTDEMO's sorts take a SOUND per step, SOUND 30000 when the sound is
+ * off), whether or not there is any audio to hear. */
+static double sound_clock(void) {
+#ifdef USE_SDL_WINDOW
+    return SDL_GetTicks() / 1000.0;
+#else
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+static double s_sound_end;               /* when the last SOUND's note ends */
+
 static int cmd_sound(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
@@ -634,8 +648,16 @@ static int cmd_sound(Interp *ip, char *args) {
     p = sk(eval_expr(p, freq));
     if (*p == ',') p = sk(p + 1);
     eval_expr(p, dur);
-    sound_tone(mpf_get_d(freq), mpf_get_d(dur));
+    double f = mpf_get_d(freq), ticks = mpf_get_d(dur);
     mpf_clears(freq, dur, NULL);
+    double now = sound_clock();
+    if (ticks > 0 && s_sound_end > now) {
+        basic_wait(s_sound_end - now);
+        if (g_break) return 0;
+        now = sound_clock();
+    }
+    sound_tone(f, ticks);
+    s_sound_end = ticks > 0 ? now + ticks / 18.2 : now;
     return 0;
 }
 
@@ -691,22 +713,10 @@ static int cmd_randomize(Interp *ip, char *args) {
     return 0;
 }
 
+static int cmd_swap_places(char *args);
 static int cmd_swap(Interp *ip, char *args) {
     (void)ip;
-    char *p = sk(args);
-    char name1[MAX_VARNAME], name2[MAX_VARNAME];
-    p = sk(read_varname(p, name1));
-    if (*p == ',') p = sk(p + 1);
-    read_varname(p, name2);
-    Var *a = var_get(name1), *b = var_get(name2);
-    if (var_is_str_name(name1)) {
-        char *tmp = a->str; a->str = b->str; b->str = tmp;
-    } else {
-        mpf_t tmp; mpf_init2(tmp, g_prec);
-        mpf_set(tmp, a->num); mpf_set(a->num, b->num); mpf_set(b->num, tmp);
-        mpf_clear(tmp);
-    }
-    return 0;
+    return cmd_swap_places(args);
 }
 
 static int cmd_erase(Interp *ip, char *args) {
@@ -968,6 +978,15 @@ static int cmd_return(Interp *ip, char *args);
 static void byref_return(int fi);
 typedef struct { char base[MAX_VARNAME], field[MAX_VARNAME]; int nidx, i, j; } FieldRef;
 static char *parse_field_varname(char *p, char *out, FieldRef *fr);
+typedef struct {
+    int    is_str;
+    char **s;          /* is_str */
+    mpf_t *n;          /* !is_str */
+    Var   *v;          /* for INTEGER rounding */
+    int    fixed;      /* AS STRING * n */
+} Place;
+#define MAX_PLACES MAX_TYPE_FIELDS
+static char *parse_places(char *p, Place *pl, int *np, TypeDef **td);
 static int eval_one_cmp(char **pp);
 
 /* Evaluate a full boolean expression: one or more comparisons joined by AND/OR */
@@ -2237,11 +2256,179 @@ static int field_fixed_len(const char *field) {
 }
 
 /* ================================================================
+ * Places: what can stand on the left of = or in SWAP -- a variable, an
+ * array element, a TYPE field (P.X, P(3).X), or a whole record (P, P(3)),
+ * which is one place per field.
+ * ================================================================ */
+/* The TYPE of record variable `base` (an array of records when is_arr):
+ * the one whose fields all exist for it. */
+static TypeDef *record_type(const char *base, int is_arr) {
+    for (int ti = 0; ti < g_ntypedefs; ti++) {
+        TypeDef *td = &g_typedefs[ti];
+        if (td->nfields == 0) continue;
+        int ok = 1;
+        for (int fi = 0; fi < td->nfields && ok; fi++) {
+            const TypeField *f = &td->fields[fi];
+            if (is_arr) {
+                int fs;
+                Var *fa = field_array(base, f->name, &fs);
+                ok = fa && fs == f->is_str;
+            } else {
+                char n[MAX_VARNAME * 2 + 2];
+                snprintf(n, sizeof n, "%s.%s%s", base, f->name, f->is_str ? "$" : "");
+                Var *v = var_find(n);
+                ok = v && (v->kind == VAR_NUM || v->kind == VAR_STR);
+            }
+        }
+        if (ok) return td;
+    }
+    return NULL;
+}
+
+/* A field of record `base` (element i, j of an array of records when
+ * nidx > 0) as a place. */
+static int field_place(const char *base, int nidx, int i, int j, const char *field, Place *pl) {
+    memset(pl, 0, sizeof *pl);
+    pl->fixed = field_fixed_len(field);
+    if (nidx) {
+        int fs;
+        Var *fa = field_array(base, field, &fs);
+        if (!fa) return 0;
+        pl->v = fa; pl->is_str = fs;
+        if (fs) pl->s = arr_str_elem(fa, i, j); else pl->n = arr_num_elem(fa, i, j);
+        return fs ? pl->s != NULL : pl->n != NULL;
+    }
+    char n[MAX_VARNAME * 2 + 2];
+    snprintf(n, sizeof n, "%s.%s$", base, field);
+    Var *v = var_find(n);
+    if (v && v->kind == VAR_STR) { pl->v = v; pl->is_str = 1; pl->s = &v->str; return 1; }
+    n[strlen(n) - 1] = '\0';
+    v = var_get(n);
+    pl->v = v; pl->is_str = 0; pl->n = &v->num;
+    return 1;
+}
+
+/* Parse a place at p into pl[] (more than one for a whole record; *td is
+ * then its TYPE, else NULL). Returns the text after it, or NULL. */
+static char *parse_places(char *p, Place *pl, int *np, TypeDef **td) {
+    *np = 0; *td = NULL;
+    p = sk(p);
+    if (!isalpha((unsigned char)*p) && *p != '_') return NULL;
+    FieldRef fr;
+    char flat[MAX_VARNAME];
+    char *after = parse_field_varname(p, flat, &fr);
+    if (after) {                                    /* P.X, P(3).X */
+        if (!field_place(fr.base, fr.nidx, fr.i, fr.j, fr.field, &pl[0])) return NULL;
+        *np = 1;
+        return sk(after);
+    }
+    char name[MAX_VARNAME];
+    char *q = sk(read_varname(p, name));
+    int nidx = 0, i = 0, j = g_option_base;
+    if (*q == '(') {
+        q = sk(q + 1);
+        mpf_t t; mpf_init2(t, g_prec);
+        q = sk(eval_expr(q, t)); i = (int)mpf_get_si(t); nidx = 1;
+        if (*q == ',') { q = sk(q + 1); q = sk(eval_expr(q, t)); j = (int)mpf_get_si(t); nidx = 2; }
+        mpf_clear(t);
+        if (*q != ')') return NULL;
+        q = sk(q + 1);
+    }
+    if (g_ntypedefs > 0) {
+        char ubase[MAX_VARNAME]; int k = 0;
+        for (; name[k] && k < MAX_VARNAME - 1; k++) ubase[k] = (char)toupper((unsigned char)name[k]);
+        ubase[k] = '\0';
+        TypeDef *t = record_type(ubase, nidx > 0);
+        if (t) {                                    /* a whole record */
+            for (int fi = 0; fi < t->nfields; fi++)
+                if (!field_place(ubase, nidx, i, j, t->fields[fi].name, &pl[fi])) return NULL;
+            *np = t->nfields; *td = t;
+            return q;
+        }
+    }
+    Place *x = &pl[0];
+    memset(x, 0, sizeof *x);
+    x->is_str = var_is_str_name(name);
+    x->fixed = x->is_str ? strdecl_fixed_len(name) : 0;
+    Var *v = var_get(name);
+    x->v = v;
+    if (nidx) {
+        if (x->is_str) x->s = arr_str_elem(v, i, j); else x->n = arr_num_elem(v, i, j);
+        if (x->is_str ? !x->s : !x->n) return NULL;
+    } else {
+        if (x->is_str) x->s = &v->str; else x->n = &v->num;
+    }
+    *np = 1;
+    return q;
+}
+
+static int stmt_end(char *p) { p = sk(p); return !*p || *p == ':' || *p == '\''; }
+
+/* SWAP a, b: any two places of the same kind -- variables, array
+ * elements, fields or whole records. */
+static int cmd_swap_places(char *args) {
+    Place a[MAX_PLACES], b[MAX_PLACES];
+    int na, nb; TypeDef *ta, *tb;
+    char *p = parse_places(args, a, &na, &ta);
+    if (p && *p == ',') p = parse_places(p + 1, b, &nb, &tb); else p = NULL;
+    if (!p || na != nb || ta != tb) { basic_stderr("SWAP: type mismatch\n"); return -1; }
+    for (int k = 0; k < na; k++) {
+        if (a[k].is_str != b[k].is_str) { basic_stderr("SWAP: type mismatch\n"); return -1; }
+        if (a[k].is_str) { char *t = *a[k].s; *a[k].s = *b[k].s; *b[k].s = t; }
+        else {
+            mpf_t t; mpf_init2(t, g_prec);
+            mpf_set(t, *a[k].n); mpf_set(*a[k].n, *b[k].n); mpf_set(*b[k].n, t);
+            mpf_clear(t);
+        }
+    }
+    return 0;
+}
+
+/* Rec1 = Rec2, SortArray(I) = SortBackup(I): copy every field. Returns
+ * 1 when the statement was one (and has been done). */
+static int record_assign(char *p) {
+    if (g_ntypedefs == 0) return 0;
+    /* Cheap test first: the right-hand side is a bare name or element. */
+    char *eq = p;
+    int depth = 0, in_q = 0;
+    for (; *eq; eq++) {
+        if (*eq == '"') in_q = !in_q;
+        if (in_q) continue;
+        if (*eq == '(') depth++; else if (*eq == ')') depth--;
+        else if (*eq == '=' && depth == 0) break;
+        else if (*eq == '.' && depth == 0) return 0;      /* a field: not a whole record */
+    }
+    if (*eq != '=') return 0;
+    char *r = sk(eq + 1);
+    if (!isalpha((unsigned char)*r)) return 0;
+    while (isalnum((unsigned char)*r) || *r == '_') r++;
+    if (*r == '(') {
+        depth = 0;
+        for (; *r; r++) { if (*r == '(') depth++; else if (*r == ')' && --depth == 0) { r++; break; } }
+    }
+    if (!stmt_end(r)) return 0;
+    /* Both sides must be records of one TYPE. */
+    Place dst[MAX_PLACES], src[MAX_PLACES];
+    int nd, ns; TypeDef *td, *ts;
+    char *q = parse_places(p, dst, &nd, &td);
+    if (!q || !td || *sk(q) != '=') return 0;
+    q = parse_places(sk(q) + 1, src, &ns, &ts);
+    if (!q) return 0;
+    if (ts != td) { basic_stderr("Type mismatch\n"); return 1; }
+    for (int k = 0; k < nd; k++) {
+        if (dst[k].is_str) str_store_fixed(dst[k].s, *src[k].s ? *src[k].s : "", dst[k].fixed);
+        else { mpf_set(*dst[k].n, *src[k].n); var_fix_int(dst[k].v, *dst[k].n); }
+    }
+    return 1;
+}
+
+/* ================================================================
  * LET / implicit assignment
  * ================================================================ */
 static int cmd_let(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
+    if (record_assign(p)) return 0;
 
     /* Check for struct field access: identifier optionally followed by (idx).field */
     {
@@ -3248,7 +3435,24 @@ static int eval_one_cmp(char **pp) {
     char *p = sk(*pp);
     int cmp = 0;
 
+    /* "(A) < (B)", "(I - Low) * 2 > X": the parentheses are just part of
+     * the left-hand expression, not a whole condition in brackets, when an
+     * operator follows them; the general comparison below handles that. */
+    int bracketed = 0;
     if (*p == '(') {
+        int depth = 0, in_q = 0;
+        char *q = p;
+        for (; *q; q++) {
+            if (*q == '"') in_q = !in_q;
+            if (in_q) continue;
+            if (*q == '(') depth++;
+            else if (*q == ')' && --depth == 0) { q++; break; }
+        }
+        q = sk(q);
+        bracketed = !(strchr("<>=+-*/^\\", *q) && *q) && !kw_match(q, "MOD");
+    }
+
+    if (bracketed) {
         p++;
         if (is_str_token(p)) {
             StrBuf lhs_mem_; char *lhs = lhs_mem_.p; StrBuf rhs_mem_; char *rhs = rhs_mem_.p;
@@ -3531,29 +3735,15 @@ static int cmd_read(Interp *ip, char *args) {
     (void)ip;
     char *p = sk(args);
     while (*p) {
-        char name[MAX_VARNAME];
-        p = sk(read_varname(sk(p), name));
-        int arr_i = 0, arr_j = 1, is_arr = 0;
-        if (*p == '(') {
-            is_arr = 1; p = sk(p + 1);
-            mpf_t i1; mpf_init2(i1, g_prec);
-            p = sk(eval_expr(p, i1)); arr_i = (int)mpf_get_si(i1); mpf_clear(i1);
-            if (*p==',') { p=sk(p+1); mpf_t i2; mpf_init2(i2,g_prec); p=sk(eval_expr(p,i2)); arr_j=(int)mpf_get_si(i2); mpf_clear(i2); }
-            if (*p==')') p = sk(p + 1);
-        }
+        /* Any place: a variable, an array element or a TYPE field. */
+        Place pl[MAX_PLACES]; int np; TypeDef *td;
+        char *q = parse_places(p, pl, &np, &td);
+        if (!q || td) { basic_stderr("READ: syntax error\n"); return -1; }
         if (g_data_pos >= g_data_count) { basic_stderr("READ: out of data\n"); return -1; }
         char *item = g_data[g_data_pos++];
-        Var *v = var_get(name);
-        if (var_is_str_name(name)) {
-            if (is_arr && v->kind == VAR_ARRAY_STR) {
-                char **slot = arr_str_elem(v, arr_i, arr_j);
-                free(*slot); *slot = str_dup(item);
-            } else { free(v->str); v->str = str_dup(item); }
-        } else {
-            if (is_arr) { mpf_t *e = arr_num_elem(v, arr_i, arr_j); mpf_set_d(*e, atof(item)); var_fix_int(v, *e); }
-            else        { mpf_set_d(v->num, atof(item)); var_fix_int(v, v->num); }
-        }
-        p = sk(p); if (*p == ',') p = sk(p + 1); else break;
+        if (pl[0].is_str) str_store_fixed(pl[0].s, item, pl[0].fixed);
+        else { mpf_set_d(*pl[0].n, atof(item)); var_fix_int(pl[0].v, *pl[0].n); }
+        p = sk(q); if (*p == ',') p = sk(p + 1); else break;
     }
     return 0;
 }

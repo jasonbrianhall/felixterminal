@@ -222,15 +222,15 @@ int strdecl_fixed_len(const char *name) {
 
 void str_store_fixed(char **slot, const char *s, int fixed_len) {
     if (fixed_len <= 0) { char *n = str_dup((char *)s); free(*slot); *slot = n; return; }
-    /* Cut to the length. QBasic also pads a shorter value with spaces, but
-     * this interpreter's programs (test/test2.bas) compare such fields to
-     * the unpadded text, so a shorter value is kept as it is. */
+    /* As in QBasic: cut to the length, or padded with spaces to it (SORTDEMO
+     * prints its bars from such a field, the padding erasing a longer bar). */
     size_t k = strlen(s);
     if (k > (size_t)fixed_len) k = (size_t)fixed_len;
-    char *n = (char *)malloc(k + 1);
+    char *n = (char *)malloc((size_t)fixed_len + 1);
     if (!n) return;
     memcpy(n, s, k);
-    n[k] = '\0';
+    memset(n + k, ' ', (size_t)fixed_len - k);
+    n[fixed_len] = '\0';
     free(*slot); *slot = n;
 }
 

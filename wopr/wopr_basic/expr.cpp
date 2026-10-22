@@ -10,6 +10,9 @@
 
 #ifdef USE_SDL_WINDOW
 #include "basic_gfx.h"
+#else
+#include <chrono>
+#include <thread>
 #endif
 
 BASIC_NS_BEGIN
@@ -458,10 +461,28 @@ static char *eval_str_primary(char *p, char *buf, int bufsz) {
         if (count < 0) count = 0;
         if (count >= bufsz) count = bufsz - 1;
         int i = 0;
-        while (i < count) {
-            int ch = fgetc(src_fp);
-            if (ch == EOF) break;
-            buf[i++] = (char)ch;
+        if (src_fp != stdin) {
+            while (i < count) {
+                int ch = fgetc(src_fp);
+                if (ch == EOF) break;
+                buf[i++] = (char)ch;
+            }
+        } else {
+            /* The keyboard: wait for each key, without echo, as QBasic
+             * does (SORTDEMO's menu: Choice$ = UCASE$(INPUT$(1))). Arrows
+             * and function keys aren't characters and are skipped. */
+            while (i < count && !g_break) {
+#ifdef USE_SDL_WINDOW
+                int ch = display_getchar();
+#else
+                int ch;
+                while (!(ch = display_inkey()) && !g_break)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+#endif
+                if (g_break) break;
+                if (ch <= 0 || ch >= 0x100) continue;
+                buf[i++] = (char)ch;
+            }
         }
         buf[i] = '\0';
         return p;

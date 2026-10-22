@@ -245,7 +245,7 @@ int     var_name_is_int(const char *name);
  * string variables without the $, stored as NAME$. */
 void    strdecl_apply(char *name);            /* NAME -> NAME$ if declared so */
 int     strdecl_fixed_len(const char *name);  /* AS STRING * n: n, else 0 */
-/* Store s in a string slot, cut to fixed_len when that's > 0. */
+/* Store s in a string slot; fixed_len > 0: cut or space-padded to it. */
 void    str_store_fixed(char **slot, const char *s, int fixed_len);
 void    var_fix_int(Var *v, mpf_t x);   /* round x as QBasic does if v is an integer */
 
