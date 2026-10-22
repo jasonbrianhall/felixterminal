@@ -14,9 +14,24 @@
 struct timespec { time_t tv_sec; long tv_nsec; };
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
-static inline int clock_gettime(int, struct timespec* ts) {
-    struct timeval tv; gettimeofday(&tv, 0);
-    ts->tv_sec = tv.tv_sec; ts->tv_nsec = tv.tv_usec * 1000L;
+/* DJGPP's gettimeofday() only moves every BIOS tick (55 ms), so TIMER
+ * would stand still across a short loop (Nibbles times FOR 1 TO 1000 to
+ * set its speed, then divides by the difference). The wall clock is read
+ * once; after that time comes from uclock(), the PIT, to the microsecond. */
+inline int clock_gettime(int, struct timespec* ts) {
+    static bool init;
+    static struct timeval base_tv;
+    static uclock_t base_uc;
+    if (!init) {
+        struct timeval a; gettimeofday(&a, 0);       /* start on a tick edge */
+        do gettimeofday(&base_tv, 0); while (base_tv.tv_sec == a.tv_sec && base_tv.tv_usec == a.tv_usec);
+        base_uc = uclock();
+        init = true;
+    }
+    unsigned long long us = (unsigned long long)(uclock() - base_uc) * 1000000ull / UCLOCKS_PER_SEC
+                          + (unsigned long long)base_tv.tv_usec;
+    ts->tv_sec = base_tv.tv_sec + (time_t)(us / 1000000ull);
+    ts->tv_nsec = (long)(us % 1000000ull) * 1000L;
     return 0;
 }
 #endif
