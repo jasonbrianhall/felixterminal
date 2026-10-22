@@ -4,7 +4,6 @@
  */
 #include "basic.h"
 #include <setjmp.h>
-#include <algorithm>
 
 #include "basic_print.h"
 #define printf(...) basic_printf(__VA_ARGS__)
@@ -105,8 +104,33 @@ int line_cmp(const void *a, const void *b) {
  * DOS build GOSUB 1480 then landed on the line's RETURN, past its
  * assignment). */
 void lines_sort(void) {
-    std::stable_sort(g_lines, g_lines + g_nlines,
-                     [](const Line &a, const Line &b) { return a.linenum < b.linenum; });
+    /* A merge sort of our own (std::stable_sort needs operator new, which
+     * the bare-metal build doesn't have), or an insertion sort without the
+     * memory for one. Both stable. */
+    int n = g_nlines;
+    if (n < 2) return;
+    Line *tmp = (Line *)malloc((size_t)n * sizeof(Line));
+    if (!tmp) {
+        for (int i = 1; i < n; i++) {
+            Line x = g_lines[i]; int j = i;
+            while (j > 0 && g_lines[j - 1].linenum > x.linenum) { g_lines[j] = g_lines[j - 1]; j--; }
+            g_lines[j] = x;
+        }
+        return;
+    }
+    Line *src = g_lines, *dst = tmp;
+    for (int w = 1; w < n; w *= 2) {
+        for (int lo = 0; lo < n; lo += 2 * w) {
+            int mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
+            int a = lo, b = mid, o = lo;
+            while (a < mid && b < hi) dst[o++] = (src[b].linenum < src[a].linenum) ? src[b++] : src[a++];
+            while (a < mid) dst[o++] = src[a++];
+            while (b < hi) dst[o++] = src[b++];
+        }
+        Line *t = src; src = dst; dst = t;
+    }
+    if (src != g_lines) memcpy(g_lines, src, (size_t)n * sizeof(Line));
+    free(tmp);
 }
 
 extern int g_program_freeform;
