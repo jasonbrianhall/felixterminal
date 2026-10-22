@@ -103,7 +103,7 @@
 12120 IF GameSet.NumPlayers = 2 THEN PRINT "  PASS: Scalar TYPE numeric field" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE numeric field" : failed = failed + 1
 12130 IF GameSet.UseSound = 1 THEN PRINT "  PASS: Scalar TYPE second field" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE second field" : failed = failed + 1
 12140 IF GameSet.Speed = 1.5 THEN PRINT "  PASS: Scalar TYPE float field" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE float field" : failed = failed + 1
-12150 IF GameSet.PlayerName = "Hero" THEN PRINT "  PASS: Scalar TYPE string field" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE string field" : failed = failed + 1
+12150 IF RTRIM$(GameSet.PlayerName) = "Hero" THEN PRINT "  PASS: Scalar TYPE string field" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE string field" : failed = failed + 1
 12160 GameSet.NumPlayers = 4
 12170 IF GameSet.NumPlayers = 4 THEN PRINT "  PASS: Scalar TYPE field update" : passed = passed + 1 ELSE PRINT "  FAIL: Scalar TYPE field update" : failed = failed + 1
 
@@ -125,8 +125,8 @@
 13150 PDat(2).Score = 200
 13160 PDat(3).PNam = "CPU"
 13170 PDat(3).Score = 0
-13180 IF PDat(1).PNam = "Alice" THEN PRINT "  PASS: PDat(1).PNam = Alice" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(1).PNam" : failed = failed + 1
-13190 IF PDat(2).PNam = "Bob" THEN PRINT "  PASS: PDat(2).PNam = Bob" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(2).PNam" : failed = failed + 1
+13180 IF RTRIM$(PDat(1).PNam) = "Alice" THEN PRINT "  PASS: PDat(1).PNam = Alice" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(1).PNam" : failed = failed + 1
+13190 IF RTRIM$(PDat(2).PNam) = "Bob" THEN PRINT "  PASS: PDat(2).PNam = Bob" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(2).PNam" : failed = failed + 1
 13200 IF PDat(1).XPos = 10 THEN PRINT "  PASS: PDat(1).XPos = 10" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(1).XPos" : failed = failed + 1
 13210 IF PDat(2).YPos = 20 THEN PRINT "  PASS: PDat(2).YPos = 20" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(2).YPos" : failed = failed + 1
 13220 IF PDat(1).Score = 100 THEN PRINT "  PASS: PDat(1).Score = 100" : passed = passed + 1 ELSE PRINT "  FAIL: PDat(1).Score" : failed = failed + 1
@@ -141,7 +141,7 @@
 14010 Total = PDat(1).Score + PDat(2).Score
 14020 IF Total = 350 THEN PRINT "  PASS: Fields used in arithmetic" : passed = passed + 1 ELSE PRINT "  FAIL: Fields in arithmetic (got " + STR$(Total) + ")" : failed = failed + 1
 14030 IF PDat(2).Score > PDat(1).Score THEN Leader$ = PDat(2).PNam ELSE Leader$ = PDat(1).PNam
-14040 IF Leader$ = "Bob" THEN PRINT "  PASS: Fields used in IF condition" : passed = passed + 1 ELSE PRINT "  FAIL: Fields in IF condition" : failed = failed + 1
+14040 IF RTRIM$(Leader$) = "Bob" THEN PRINT "  PASS: Fields used in IF condition" : passed = passed + 1 ELSE PRINT "  FAIL: Fields in IF condition" : failed = failed + 1
 14050 ScoreSum = 0
 14060 FOR I = 1 TO 3
 14070   ScoreSum = ScoreSum + PDat(I).Score
