@@ -4,6 +4,7 @@
  */
 #include "basic.h"
 #include <setjmp.h>
+#include <algorithm>
 
 #include "basic_print.h"
 #define printf(...) basic_printf(__VA_ARGS__)
@@ -96,6 +97,16 @@ int find_line_by_label(char *name) {
  * ================================================================ */
 int line_cmp(const void *a, const void *b) {
     return ((Line *)a)->linenum - ((Line *)b)->linenum;
+}
+
+/* Put the program in line-number order. A line with several statements is
+ * stored as one entry per statement, all with its number, so the sort must
+ * keep their order: qsort() doesn't promise to (DJGPP's doesn't, and in the
+ * DOS build GOSUB 1480 then landed on the line's RETURN, past its
+ * assignment). */
+void lines_sort(void) {
+    std::stable_sort(g_lines, g_lines + g_nlines,
+                     [](const Line &a, const Line &b) { return a.linenum < b.linenum; });
 }
 
 extern int g_program_freeform;
@@ -394,7 +405,7 @@ void load(char *filename) {
         }
         fclose(f);
         free(buf);  /* Free buffer before returning */
-        qsort(g_lines, g_nlines, sizeof(Line), line_cmp);
+        lines_sort();
         return;
     }
 

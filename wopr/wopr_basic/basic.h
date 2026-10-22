@@ -261,6 +261,7 @@ extern Line* g_lines;
 extern int  g_nlines;
 
 int  line_cmp(const void *a, const void *b);
+void lines_sort(void);                 /* stable: keeps a line's statements in order */
 int  find_line_idx(int num);
 int  find_line_by_label(char *name);
 int  find_target_line(int num);

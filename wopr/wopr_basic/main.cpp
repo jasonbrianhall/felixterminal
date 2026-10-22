@@ -644,7 +644,7 @@ return 0;
                     }
                 }
             }
-            qsort(g_lines, g_nlines, sizeof(Line), line_cmp);
+            lines_sort();
             printf("Renumbered %d logical lines starting at %d step %d.\n", nmap, new_start, step);
 
         } else if (strncasecmp(p,"HELP",4)==0) {

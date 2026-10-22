@@ -874,6 +874,23 @@ static void parse_unary_p(Parser *ps, mpf_t result) {
     else                              parse_power_p(ps, result);
 }
 
+/* x ^ y. A whole-number power is worked out by multiplying, as QBasic
+ * does: exact for small powers, and it doesn't depend on the C library's
+ * pow(), which gave 0 for (1 + r) ^ 360 in the DOS build (MORTGAGE). */
+static double basic_pow(double x, double y) {
+    if (y == floor(y) && fabs(y) <= 2147483647.0) {
+        long long n = (long long)fabs(y);
+        double r = 1.0, b = x;
+        while (n) {
+            if (n & 1) r *= b;
+            n >>= 1;
+            if (n) b *= b;
+        }
+        return y < 0 ? 1.0 / r : r;
+    }
+    return pow(x, y);
+}
+
 static void parse_power_p(Parser *ps, mpf_t result) {
     parse_primary_p(ps, result);
     skip_ws_p(ps);
@@ -881,7 +898,7 @@ static void parse_power_p(Parser *ps, mpf_t result) {
         ps->p++;
         mpf_t exp; mpf_init2(exp, g_prec);
         parse_unary_p(ps, exp);
-        mpf_set_d(result, pow(mpf_get_d(result), mpf_get_d(exp)));
+        mpf_set_d(result, basic_pow(mpf_get_d(result), mpf_get_d(exp)));
         mpf_clear(exp);
     }
 }
