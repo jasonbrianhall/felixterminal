@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #endif
 
 #include "basic_print.h"
@@ -671,6 +672,146 @@ int display_getchar(void)
 #else
     int c = getchar();
     return (c == EOF) ? 0 : (unsigned char)c;
+#endif
+}
+
+/* ----------------------------------------------------------------
+ * For the editor (editor.cpp)
+ * ---------------------------------------------------------------- */
+int display_get_rows(void)
+{
+#if !defined(WOPR) && !defined(FELIX_BASIC) && !defined(_WIN32)
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+        return ws.ws_row;
+#endif
+    return 25;
+}
+
+#if !defined(WOPR) && !defined(FELIX_BASIC) && !defined(_WIN32)
+static int s_editor_keys = 0;
+#endif
+
+/* Editor key mode: every key reaches the editor (no Ctrl+C break, no
+ * Ctrl+S / Ctrl+Q flow control, no Ctrl+V literal-next), and reads block. */
+void display_raw_keys(int on)
+{
+#if !defined(WOPR) && !defined(FELIX_BASIC) && !defined(_WIN32)
+    if (on) {
+        struct termios t = g_orig_termios;
+        t.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+        t.c_iflag &= ~(IXON | ICRNL | INLCR);
+        t.c_cc[VMIN]  = 1;
+        t.c_cc[VTIME] = 0;
+        int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+        tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        g_raw = 1;
+        s_editor_keys = 1;
+    } else if (s_editor_keys) {
+        s_editor_keys = 0;
+        g_raw = 1;
+        leave_raw();           /* back to the terminal's own settings, */
+        enter_raw();           /* then the interpreter's usual raw mode */
+    }
+#else
+    (void)on;
+#endif
+}
+
+#if !defined(WOPR) && !defined(FELIX_BASIC) && !defined(_WIN32)
+/* A byte of an escape sequence, if one follows within ms milliseconds. */
+static int esc_byte(int ms)
+{
+    fd_set fds; FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv = { 0, ms * 1000 };
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+    unsigned char c;
+    return read(STDIN_FILENO, &c, 1) == 1 ? c : -1;
+}
+
+/* Alt+key as INKEY$ gives it: CHR$(0) + the key's PC scan code. */
+static int alt_key(int c)
+{
+    static const char rows[] = "qwertyuiop\0\0\0\0asdfghjkl\0\0\0\0\0zxcvbnm";
+    c = tolower(c);
+    if (c >= '1' && c <= '9') return KEY_EXT(120 + c - '1');
+    if (c == '0') return KEY_EXT(129);
+    for (int i = 0; i < (int)sizeof rows - 1; i++)
+        if (rows[i] && rows[i] == c) return KEY_EXT(16 + i);
+    return 0;
+}
+#endif
+
+void  display_clipboard_set(const char *text) { (void)text; }
+char *display_clipboard_get(void) { return NULL; }
+
+int display_getkey(void)
+{
+#if defined(WOPR) || defined(FELIX_BASIC) || defined(_WIN32)
+    return display_getchar();
+#else
+    for (;;) {
+        fflush(stdout);
+        unsigned char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 0) return -1;                       /* end of input */
+        if (n < 0) { if (errno == EINTR || errno == EAGAIN) { usleep(1000); continue; } return -1; }
+        if (c == 127 || c == 8) return 8;
+        if (c == '\r') return '\r';
+        if (c == '\n') return '\n';             /* (a pasted CR LF is one Enter) */
+        if (c != 27) return c;
+
+        int b = esc_byte(30);
+        if (b < 0) return 27;                        /* Esc on its own */
+        if (b != '[' && b != 'O') {
+            int k = alt_key(b);                      /* ESC x: Alt+x */
+            if (k) return k;
+            continue;
+        }
+        /* CSI / SS3: parameters, then a final byte */
+        char seq[16]; int len = 0, fin = 0;
+        while (len < (int)sizeof seq - 1) {
+            int d = esc_byte(30);
+            if (d < 0) break;
+            if (isalpha(d) || d == '~') { fin = d; break; }
+            seq[len++] = (char)d;
+        }
+        seq[len] = '\0';
+        if (!fin) continue;
+        int p1 = atoi(seq), mod = 1;
+        char *semi = strchr(seq, ';');
+        if (semi) mod = atoi(semi + 1);
+        if (mod < 1) mod = 1;
+        int shift = ((mod - 1) & 1) ? KEY_SHIFT : 0;
+        if (fin == '~' && p1 == 200) return KEY_PASTE_BEGIN;
+        if (fin == '~' && p1 == 201) return KEY_PASTE_END;
+        int ctrl  = ((mod - 1) & 4) != 0;
+        switch (fin) {
+        case 'A': return KEY_UP | shift;
+        case 'B': return KEY_DOWN | shift;
+        case 'C': return (ctrl ? KEY_EXT(116) : KEY_RIGHT) | shift;
+        case 'D': return (ctrl ? KEY_EXT(115) : KEY_LEFT) | shift;
+        case 'H': return KEY_EXT(ctrl ? 119 : SCAN_HOME) | shift;
+        case 'F': return KEY_EXT(ctrl ? 117 : SCAN_END) | shift;
+        case 'Z': return KEY_EXT(15);                /* Shift+Tab */
+        case 'P': case 'Q': case 'R': case 'S': return KEY_EXT(SCAN_F1 + (fin - 'P')) | shift;
+        case '~':
+            switch (p1) {
+            case 1: case 7: return KEY_EXT(ctrl ? 119 : SCAN_HOME) | shift;
+            case 4: case 8: return KEY_EXT(ctrl ? 117 : SCAN_END) | shift;
+            case 2: return KEY_EXT(ctrl ? 146 : SCAN_INS) | shift;
+            case 3: return KEY_EXT(SCAN_DEL) | shift;
+            case 5: return KEY_EXT(ctrl ? 132 : SCAN_PGUP) | shift;
+            case 6: return KEY_EXT(ctrl ? 118 : SCAN_PGDN) | shift;
+            case 11: case 12: case 13: case 14: case 15: return KEY_EXT(SCAN_F1 + p1 - 11) | shift;
+            case 17: case 18: case 19: case 20: case 21: return KEY_EXT(SCAN_F1 + 5 + p1 - 17) | shift;
+            case 23: return KEY_EXT(SCAN_F11) | shift;
+            case 24: return KEY_EXT(SCAN_F12) | shift;
+            }
+        }
+        /* anything else (bracketed paste markers, focus events): ignore */
+    }
 #endif
 }
 

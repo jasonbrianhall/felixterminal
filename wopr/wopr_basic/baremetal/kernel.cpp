@@ -417,6 +417,12 @@ static void key_event(bool ext, uint8_t code, bool down) {
         return;
     }
     if (code == 0x37) { gfx_bm_key('*'); return; }      // keypad *
+    if (alt && !ctrl) {                                 // Alt+letter / Alt+digit: CHR$(0) + scan code, as QBasic's INKEY$
+        if ((code >= 0x10 && code <= 0x19) || (code >= 0x1E && code <= 0x26) || (code >= 0x2C && code <= 0x32)) {
+            gfx_bm_key(KEY_EXT(code)); return;
+        }
+        if (code >= 0x02 && code <= 0x0B) { gfx_bm_key(KEY_EXT(code - 0x02 + 0x78)); return; }
+    }
     static const char lower[] = "\0\0" "1234567890-=\0\0" "qwertyuiop[]\0\0" "asdfghjkl;'`\0\\" "zxcvbnm,./\0\0\0 ";
     static const char upper[] = "\0\0" "!@#$%^&*()_+\0\0" "QWERTYUIOP{}\0\0" "ASDFGHJKL:\"~\0|" "ZXCVBNM<>?\0\0\0 ";
     if (code >= sizeof lower - 1) return;

@@ -73,11 +73,11 @@ endif
 # --------------------------------------------------------------------
 # SOURCES → per-target object paths
 # --------------------------------------------------------------------
-SRCS = main.cpp vars.cpp expr.cpp program.cpp commands.cpp display_ansi.cpp basic_print.cpp $(SOUND_SRC)
+SRCS = main.cpp vars.cpp expr.cpp program.cpp commands.cpp editor.cpp display_ansi.cpp basic_print.cpp $(SOUND_SRC)
 OBJS = $(patsubst %.cpp,$(BUILDDIR)/%.o,$(SRCS))
 
 # SDL window build uses basic_gfx_sdl.cpp instead of display_ansi.cpp
-SDL_WIN_SRCS = main.cpp vars.cpp expr.cpp program.cpp commands.cpp basic_gfx_sdl.cpp basic_print.cpp $(SOUND_SRC)
+SDL_WIN_SRCS = main.cpp vars.cpp expr.cpp program.cpp commands.cpp editor.cpp basic_gfx_sdl.cpp basic_print.cpp $(SOUND_SRC)
 SDL_WIN_OBJS = $(patsubst %.cpp,$(BUILDDIR)/sdlwin/%.o,$(SDL_WIN_SRCS))
 
 # --------------------------------------------------------------------

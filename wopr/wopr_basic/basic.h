@@ -255,6 +255,7 @@ void    var_fix_int(Var *v, mpf_t x);   /* round x as QBasic does if v is an int
 typedef struct {
     int  linenum;
     char *text;   /* dynamically allocated (bstrdup), not fixed-size */
+    int  srcline; /* line of the source text it was loaded from (1-based), 0 if typed */
 } Line;
 
 extern Line* g_lines;
@@ -269,8 +270,12 @@ void normalize_kw(char *src, char *dst, int dstsz);
 void load(char *filename);
 void save_program(char *filename);
 void source_capture(FILE *f);
+void source_set(const char *text, size_t len);
+const char *g_source_text(size_t *len);
+void load_text(const char *text, size_t len);
 void source_invalidate(void);
 extern int g_program_freeform;
+extern char g_program_path[DEFAULT_BUFFER];   /* last LOADed / SAVEd file */
 void load_program(char *filename);
 void clear_program(void);
 

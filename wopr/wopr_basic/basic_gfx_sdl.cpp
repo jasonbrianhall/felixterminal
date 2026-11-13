@@ -147,6 +147,7 @@ static Cell s_grid[TEXT_ROWS_MAX][TEXT_COLS_MAX];
 static int  s_text_cols  = TEXT_COLS_DEF;
 static int  s_text_rows  = TEXT_ROWS_DEF;
 static int  s_text_lock_rows = 0;   // SCREEN 0 after WIDTH: a fixed cols x rows grid (0: fit the window)
+static bool s_raw_keys   = false;   // the editor's key mode (display_raw_keys)
 static int  s_cur_row    = 0, s_cur_col = 0;
 static int  s_cur_fg     = 7, s_cur_bg  = 0;
 static bool s_cursor_vis = false;
@@ -887,6 +888,51 @@ static void mouse_backend_cursor() {
     SDL_ShowCursor(mouse_cursor_wanted() ? SDL_ENABLE : SDL_DISABLE);
 }
 
+// The editor's keys (display_raw_keys on): Ctrl+letters as 1-26, Alt+letter
+// as KEY_EXT(PC scan code), Shift on the movement keys, Ctrl+arrows as the
+// PC's word-move codes. Returns false for a key to handle as usual.
+static bool s_alt_alone = false;
+static bool editor_key(const SDL_Keysym &ks) {
+    SDL_Keycode sym = ks.sym;
+    Uint16 mod = ks.mod;
+    if (sym == SDLK_LALT || sym == SDLK_RALT) { s_alt_alone = true; return true; }
+    s_alt_alone = false;
+    bool altgr = (mod & KMOD_RALT) != 0;     // AltGr types characters
+    bool ctrl  = (mod & KMOD_CTRL) && !altgr;
+    bool alt   = (mod & KMOD_LALT) != 0;
+    if (alt && ((sym >= SDLK_a && sym <= SDLK_z) || (sym >= SDLK_0 && sym <= SDLK_9))) {
+        static const char rows[] = "qwertyuiop\0\0\0\0asdfghjkl\0\0\0\0\0zxcvbnm";
+        int sc = 0;
+        if (sym >= SDLK_0 && sym <= SDLK_9) sc = sym == SDLK_0 ? 129 : 120 + (int)(sym - SDLK_1);
+        else for (int i = 0; i < (int)sizeof rows; i++) if (rows[i] == (char)sym) { sc = 16 + i; break; }
+        if (sc) { key_push(KEY_EXT(sc)); return true; }
+    }
+    if (ctrl && sym >= SDLK_a && sym <= SDLK_z) { key_push((int)(sym - SDLK_a) + 1); return true; }
+    int shift = (mod & KMOD_SHIFT) ? KEY_SHIFT : 0;
+    int k = 0;
+    switch (sym) {
+    case SDLK_UP:       k = 0x1000; break;
+    case SDLK_DOWN:     k = 0x1001; break;
+    case SDLK_LEFT:     k = ctrl ? KEY_EXT(115) : 0x1002; break;
+    case SDLK_RIGHT:    k = ctrl ? KEY_EXT(116) : 0x1003; break;
+    case SDLK_HOME:     k = KEY_EXT(ctrl ? 119 : SCAN_HOME); break;
+    case SDLK_END:      k = KEY_EXT(ctrl ? 117 : SCAN_END); break;
+    case SDLK_PAGEUP:   k = KEY_EXT(ctrl ? 132 : SCAN_PGUP); break;
+    case SDLK_PAGEDOWN: k = KEY_EXT(ctrl ? 118 : SCAN_PGDN); break;
+    case SDLK_INSERT:   k = KEY_EXT(ctrl ? 146 : SCAN_INS); break;
+    case SDLK_DELETE:   k = KEY_EXT(SCAN_DEL); break;
+    case SDLK_TAB:      if (shift) { key_push(KEY_EXT(15)); return true; } return false;
+    default:
+        if (shift && sym >= SDLK_F1 && sym <= SDLK_F10) {
+            key_push(KEY_EXT(SCAN_F1 + (int)(sym - SDLK_F1)) | KEY_SHIFT);
+            return true;
+        }
+        return false;
+    }
+    key_push(k | shift);
+    return true;
+}
+
 bool gfx_sdl_pump() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
@@ -906,8 +952,16 @@ bool gfx_sdl_pump() {
                 s_needs_render = true;
             }
             break;
+        case SDL_KEYUP:
+            // Alt pressed and let go by itself: the editor's menu bar
+            if (s_raw_keys && s_alt_alone &&
+                (e.key.keysym.sym == SDLK_LALT || e.key.keysym.sym == SDLK_RALT))
+                key_push(KEY_ALT_ALONE);
+            s_alt_alone = false;
+            break;
         case SDL_KEYDOWN: {
             SDL_Keycode sym = e.key.keysym.sym;
+            if (s_raw_keys && editor_key(e.key.keysym)) break;
             if (sym == SDLK_c && (e.key.keysym.mod & KMOD_CTRL)) {
                 // Ctrl+C — copy selection to clipboard (or break if no selection)
                 std::string text;
@@ -968,6 +1022,9 @@ bool gfx_sdl_pump() {
             break;
         }
         case SDL_TEXTINPUT:
+            // Alt+letter / Ctrl+letter were sent as keys by editor_key
+            if (s_raw_keys && (SDL_GetModState() & (KMOD_LALT | KMOD_CTRL)) &&
+                !(SDL_GetModState() & KMOD_RALT)) break;
             for (const char *p = e.text.text; *p; p++)
                 key_push((unsigned char)*p);
             break;
@@ -1892,6 +1949,35 @@ int display_getchar(void) {
         if (c < 0) SDL_Delay(10);
     }
     return c;
+}
+
+// ---- for the editor (editor.cpp) ----
+int  display_get_rows(void) { return s_text_rows; }
+void display_raw_keys(int on) { s_raw_keys = on != 0; }
+
+// Blocking key read; -1 once the window has been closed, 0 when the text
+// grid changed size (so the editor redraws).
+int display_getkey(void) {
+    int cols = s_text_cols, rows = s_text_rows;
+    for (;;) {
+        if (!gfx_sdl_pump()) return -1;
+        if (cols != s_text_cols || rows != s_text_rows) return 0;
+        gfx_sdl_render();
+        int c = key_pop();
+        if (c >= 0) return c;
+        SDL_Delay(10);
+    }
+}
+
+// System clipboard (the editor's Cut / Copy / Paste)
+void display_clipboard_set(const char *text) { SDL_SetClipboardText(text); }
+char *display_clipboard_get(void) {
+    if (!SDL_HasClipboardText()) return NULL;
+    char *t = SDL_GetClipboardText();
+    if (!t) return NULL;
+    char *r = strdup(t);
+    SDL_free(t);
+    return r;
 }
 
 // Blocking line input with echo and command history

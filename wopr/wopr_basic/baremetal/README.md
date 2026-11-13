@@ -2,6 +2,8 @@
 
 Boots straight into Felix BASIC the way an early-’80s home computer did: no operating system, just the `Ok` prompt. Type programs, `RUN` them, `LIST` them, `SAVE` them, and `LOAD` them from the same floppy the machine started from.
 
+It starts in a QBasic-style full-screen editor (Alt or F10 for the menus, F5 to run). File > Command Line (F6) gives the classic `Ok` prompt, and `EDIT` goes back to the editor.
+
 ```
 sudo apt install build-essential g++-multilib qemu-system-x86 grub-pc-bin grub-common mtools dosfstools xorriso
 make floppy            # felixbasic-floppy.img — 1.44 MB boot floppy (64-bit)

@@ -251,18 +251,54 @@ static int is_label_def(char *p, char *name_out) {
  *              g_lines themselves.
  *              The array is NOT sorted (file order is execution order).
  * ================================================================ */
+/* Reads lines from the program text the way fgets reads them from a file. */
+struct SrcReader { const char *p, *end, *start; int lineno; };
+static char *src_gets(char *buf, int n, SrcReader *r) {
+    if (r->p >= r->end || n <= 1) return NULL;
+    int i = 0;
+    while (r->p < r->end && i < n - 1) {
+        char c = *r->p++;
+        buf[i++] = c;
+        if (c == '\n') break;
+    }
+    buf[i] = '\0';
+    r->lineno++;
+    return buf;
+}
+
+static void load_parse(void);
+const char *g_source_text(size_t *len = NULL);
+void source_set(const char *text, size_t len);
+
 void load(char *filename) {
-    FILE *f = fopen(filename, "r");
+    FILE *f = fopen(filename, "rb");
     if (!f) { perror(filename); return; }
+    source_capture(f);
+    fclose(f);
+    if (!g_source_text()) { basic_stderr("%s: out of memory\n", filename); return; }
+    load_parse();
+}
+
+/* Load a program from text in memory (the editor's buffer), as LOAD would
+ * load the same text from a file; SAVE then writes this text back. */
+void load_text(const char *text, size_t len) {
+    source_set(text, len);
+    load_parse();
+}
+
+static void load_parse(void) {
+    size_t src_len = 0;
+    const char *src = g_source_text(&src_len);
+    SrcReader rd = { src, src + src_len, src, 0 };
+    SrcReader *f = &rd;
 
     label_clear();
-    source_capture(f);
 
     /* ---- detect format by scanning for the first code line ---- */
     int numbered = 0;
     char *buf = (char *)malloc(MAX_LINE_LEN);
-    if (!buf) { perror("malloc"); fclose(f); return; }
-    while (fgets(buf, MAX_LINE_LEN, f)) {
+    if (!buf) { perror("malloc"); return; }
+    while (src_gets(buf, MAX_LINE_LEN, f)) {
         buf[strcspn(buf, "\r\n")] = '\0';
         char *p = buf;
         while (isspace((unsigned char)*p)) p++;
@@ -270,13 +306,14 @@ void load(char *filename) {
         numbered = isdigit((unsigned char)*p);
         break;
     }
-    rewind(f);
+    rd.p = rd.start;
+    rd.lineno = 0;
     g_program_freeform = !numbered;
 
     /* ---- NUMBERED path ---- */
     if (numbered) {
         int inside_type_n = 0;
-        while (fgets(buf, MAX_LINE_LEN, f)) {
+        while (src_gets(buf, MAX_LINE_LEN, f)) {
             buf[strcspn(buf, "\r\n")] = '\0';
             char *p = buf;
             while (isspace((unsigned char)*p)) p++;
@@ -379,6 +416,7 @@ void load(char *filename) {
                     _linebuf[MAX_LINE_LEN - 1] = '\0'; \
                 } \
                 g_lines[g_nlines].text = bstrdup(_linebuf); \
+                g_lines[g_nlines].srcline = f->lineno; \
                 g_nlines++; \
             } while(0)
 
@@ -427,7 +465,6 @@ void load(char *filename) {
             }
             #undef STORE_SEG
         }
-        fclose(f);
         free(buf);  /* Free buffer before returning */
         lines_sort();
         return;
@@ -442,7 +479,7 @@ void load(char *filename) {
     memset(pending_buf, 0, sizeof pending_buf);
     int pending_count = 0;
 
-    while (fgets(buf, MAX_LINE_LEN, f)) {
+    while (src_gets(buf, MAX_LINE_LEN, f)) {
         buf[strcspn(buf, "\r\n")] = '\0';
         /* Line continuation: join lines ending with _ */
         {
@@ -455,7 +492,7 @@ void load(char *filename) {
                 *tail = '\0';
                 char *cont = (char *)malloc(MAX_LINE_LEN);
                 if (!cont) { basic_stderr("malloc failed\n"); break; }
-                if (!fgets(cont, MAX_LINE_LEN, f)) { free(cont); break; }
+                if (!src_gets(cont, MAX_LINE_LEN, f)) { free(cont); break; }
                 cont[strcspn(cont, "\r\n")] = '\0';
                 char *cp = cont; while (isspace((unsigned char)*cp)) cp++;
                 int cur = (int)strlen(buf);
@@ -659,6 +696,7 @@ void load(char *filename) {
                 _linebuf[MAX_LINE_LEN - 1] = '\0'; \
             } \
             g_lines[g_nlines].text = bstrdup(_linebuf); \
+            g_lines[g_nlines].srcline = f->lineno; \
             g_nlines++; \
         } while(0)
 
@@ -705,7 +743,6 @@ void load(char *filename) {
         }
         #undef STORE_FREE
     }
-    fclose(f);
     free(buf);
     /* Free-form: do NOT sort — insertion order is execution order. */
 }
@@ -806,6 +843,7 @@ void clear_program(void) {
     label_clear();
     source_invalidate();
     g_program_freeform = 0;
+    g_program_path[0] = '\0';
     const_clear();
     const_init_builtins();
     sprites_reset();
@@ -823,6 +861,7 @@ void clear_program(void) {
  * line, DELETE, RENUM, NEW) invalidates it.
  * ================================================================ */
 int g_program_freeform = 0;   /* 1 = last LOAD was a free-form (unnumbered) file */
+char g_program_path[DEFAULT_BUFFER] = "";   /* file last LOADed / SAVEd ("" after NEW) */
 
 static char  *g_source     = NULL;
 static size_t g_source_len = 0;
@@ -833,6 +872,23 @@ void source_invalidate(void) {
     g_source_len = 0;
 }
 
+/* The source text (NUL-terminated), or NULL when there is none. */
+const char *g_source_text(size_t *len) {
+    if (len) *len = g_source ? g_source_len : 0;
+    return g_source;
+}
+
+void source_set(const char *text, size_t len) {
+    if (text == g_source) return;
+    source_invalidate();
+    char *buf = (char *)malloc(len + 1);
+    if (!buf) return;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+    g_source = buf;
+    g_source_len = len;
+}
+
 void source_capture(FILE *f) {
     source_invalidate();
     size_t cap = 65536, len = 0;
@@ -841,12 +897,13 @@ void source_capture(FILE *f) {
     size_t n;
     while ((n = fread(buf + len, 1, cap - len, f)) > 0) {
         len += n;
-        if (len == cap) {
+        if (len + 1 >= cap) {
             char *nb = (char *)realloc(buf, cap * 2);
             if (!nb) { free(buf); rewind(f); return; }
             buf = nb; cap *= 2;
         }
     }
+    buf[len] = '\0';
     rewind(f);
     g_source = buf;
     g_source_len = len;
@@ -872,6 +929,7 @@ void save_program(char *filename) {
         if (!f) { perror(path); return; }
         fwrite(g_source, 1, g_source_len, f);
         fclose(f);
+        snprintf(g_program_path, sizeof g_program_path, "%s", path);
         printf("Saved %s\n", path);
         return;
     }
@@ -892,6 +950,7 @@ void save_program(char *filename) {
             fprintf(f, "%s\n", g_lines[i].text);
     }
     fclose(f);
+    snprintf(g_program_path, sizeof g_program_path, "%s", path);
     printf("Saved %s\n", path);
 }
 
@@ -908,6 +967,7 @@ void load_program(char *filename) {
     clear_program();
     load(path);
     prescan_data();
+    if (g_source_text(NULL)) snprintf(g_program_path, sizeof g_program_path, "%s", path);
     printf("Loaded %s (%d lines)\n", path, g_nlines);
 }
 

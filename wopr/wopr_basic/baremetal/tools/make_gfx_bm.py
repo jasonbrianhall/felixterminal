@@ -76,6 +76,18 @@ s = sub(s, '#include <unordered_map>\n', '#include <map>\n')
 # ---- scrollback: 5000 lines x 220 columns is 3 MB; keep 200 on bare metal
 s = sub(s, '#define SCROLLBACK_LINES 5000', '#define SCROLLBACK_LINES 200')
 
+# ---- no system clipboard: the editor keeps its own
+s = sub(s, '''void display_clipboard_set(const char *text) { SDL_SetClipboardText(text); }
+char *display_clipboard_get(void) {
+    if (!SDL_HasClipboardText()) return NULL;
+    char *t = SDL_GetClipboardText();
+    if (!t) return NULL;
+    char *r = strdup(t);
+    SDL_free(t);
+    return r;
+}''', '''void display_clipboard_set(const char *text) { (void)text; }
+char *display_clipboard_get(void) { return NULL; }''')
+
 # ---- FreeType, keyboard queue, init, pump, render -> bare-metal versions
 NEW_CORE = r'''// ============================================================================
 // Font metrics: the on-screen cell size (the 8x16 font scaled to fit)

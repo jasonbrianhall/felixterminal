@@ -443,7 +443,10 @@ static void key_in(int k) {
         }
         if (sc >= 0x3B && sc <= 0x44) { gfx_bm_key(KEY_EXT(sc)); return; }   // F1-F10
         if (k >= 0x200 && (k & 0xFF00) == 0x200) return;
-        return;                                          // Alt+letter etc.: ignored
+        // Alt+letter / Alt+digit: CHR$(0) + scan code, as QBasic's INKEY$
+        if ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) ||
+            (sc >= 0x2C && sc <= 0x32) || (sc >= 0x78 && sc <= 0x81)) { gfx_bm_key(KEY_EXT(sc)); return; }
+        return;                                          // anything else: ignored
     }
     switch (k) {
     case 13: case 10: gfx_bm_key('\r'); return;

@@ -81,6 +81,39 @@ int display_get_col(void);
  * display_get_col stays right. Escape sequences are understood. */
 void display_note_output(const char *s);
 
+/* ---- For the full-screen editor (editor.cpp) ----
+ *
+ * Rows of the text screen. */
+int display_get_rows(void);
+
+/* Editor key mode on/off. While on, display_getkey sees every key the
+ * editor uses: Ctrl+letters as 1-26 (Ctrl+C and Ctrl+V too, not break or
+ * paste), Alt+letter as KEY_EXT(its PC scan code) as INKEY$ gives it,
+ * KEY_ALT_ALONE when Alt is pressed and let go by itself, and the
+ * movement keys with KEY_SHIFT added when Shift is held (where the
+ * keyboard can tell). A backend that can't tell some of these simply
+ * doesn't send them. */
+void display_raw_keys(int on);
+
+/* Blocking key read for the editor: display_getchar's codes, plus the
+ * extras above while editor key mode is on. Returns -1 if the window was
+ * closed. */
+int display_getkey(void);
+
+/* The system clipboard where there is one: set copies text to it; get
+ * returns a malloc'd copy of its text (free it), or NULL. */
+void  display_clipboard_set(const char *text);
+char *display_clipboard_get(void);
+
+#define KEY_SHIFT      0x10000
+#define KEY_PASTE_BEGIN 0x20000   /* terminal bracketed paste: text follows */
+#define KEY_PASTE_END   0x20001
+#define KEY_ALT_ALONE  KEY_EXT(56)
+#define KEY_UP         0x1000
+#define KEY_DOWN       0x1001
+#define KEY_LEFT       0x1002
+#define KEY_RIGHT      0x1003
+
 BASIC_NS_END
 
 #endif /* DISPLAY_H */

@@ -104,7 +104,7 @@ KERNEL := felixbasic$(SUFFIX).elf
 ISO    := felixbasic$(SUFFIX).iso
 FLOPPY := felixbasic$(SUFFIX)-floppy.img
 
-CORE     := main vars expr program commands basic_print
+CORE     := main vars expr program commands editor basic_print
 PLATFORM := kernel sound_bm libc runtime stdhooks rbtree pci $(USB_OBJ) floppy fat12 storage
 IRQ_OBJS := irq sound_player audio
 

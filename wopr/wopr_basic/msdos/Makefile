@@ -65,7 +65,7 @@ CXXFLAGS = -O2 -march=i386 -mtune=i586 -std=gnu++17 -fno-rtti -fpermissive -w \
            -DUSE_SDL_WINDOW -DBASIC_BAREMETAL -DDONTUSEGMP $(LIMITS)
 LDFLAGS  = -s -Wl,--gc-sections
 
-CORE_SRCS = $(addprefix $(SRC)/,main.cpp vars.cpp expr.cpp program.cpp commands.cpp basic_print.cpp)
+CORE_SRCS = $(addprefix $(SRC)/,main.cpp vars.cpp expr.cpp program.cpp commands.cpp editor.cpp basic_print.cpp)
 DOS_SRCS  = $(CORE_SRCS) basic_gfx_dos.cpp $(BM)/sound_bm.cpp dos_platform.cpp dos_sound.cpp
 
 CORE_HDRS = $(wildcard $(SRC)/*.h) $(wildcard $(BM)/*.hpp) $(BM)/font.h $(BM)/overrides/SDL2/SDL.h dos_compat.h

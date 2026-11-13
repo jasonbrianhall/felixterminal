@@ -4086,12 +4086,16 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
                 mpf_t result; mpf_init2(result, g_prec);
                 extern jmp_buf g_parse_error_jmp;
                 extern int g_parse_error_active;
+                /* keep an outer handler (immediate line, the editor's RUN) */
+                jmp_buf outer_jmp; memcpy(outer_jmp, g_parse_error_jmp, sizeof outer_jmp);
+                int outer_active = g_parse_error_active;
                 g_parse_error_active = 1;
                 if (setjmp(g_parse_error_jmp) == 0) {
                     eval_expr(p, result);
                     print_mpf(result);
                 }
-                g_parse_error_active = 0;
+                memcpy(g_parse_error_jmp, outer_jmp, sizeof outer_jmp);
+                g_parse_error_active = outer_active;
                 mpf_clear(result);
                 return 0;
             }
@@ -4105,12 +4109,15 @@ int dispatch_one(Interp *ip, char *stmt, char *full_line) {
         mpf_t result; mpf_init2(result, g_prec);
         extern jmp_buf g_parse_error_jmp;
         extern int g_parse_error_active;
+        jmp_buf outer_jmp; memcpy(outer_jmp, g_parse_error_jmp, sizeof outer_jmp);
+        int outer_active = g_parse_error_active;
         g_parse_error_active = 1;
         if (setjmp(g_parse_error_jmp) == 0) {
             eval_expr(p, result);
             print_mpf(result);
         }
-        g_parse_error_active = 0;
+        memcpy(g_parse_error_jmp, outer_jmp, sizeof outer_jmp);
+        g_parse_error_active = outer_active;
         mpf_clear(result);
         return 0;
     }

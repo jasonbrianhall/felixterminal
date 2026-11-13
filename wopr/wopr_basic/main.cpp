@@ -37,6 +37,7 @@ static char *strcasestr(char *haystack, char *needle) {
 
 
 #include "basic_print.h"
+#include "editor.h"
 #define printf(...) basic_printf(__VA_ARGS__)
 
 #if defined(WOPR) || defined(FELIX_BASIC)
@@ -166,8 +167,12 @@ static int ran_into_immediate(int old_pc, int pc) {
 static void run_lines(int start_pc, int fresh);
 void run_from(int start_pc) { run_lines(start_pc, 1); }
 
+/* The statement an error stopped the last run at (no ON ERROR), or -1. */
+int g_run_error_pc = -1;
+
 static void run_lines(int start_pc, int fresh) {
     g_break = 0;
+    g_run_error_pc = -1;
     Interp ip = { .pc = start_pc, .running = 1 };
     if (fresh) sound_init();
 
@@ -211,6 +216,7 @@ static void run_lines(int start_pc, int fresh) {
             } else if (ip.pc == old_pc) {
                 /* No ON ERROR: stop here rather than retry the statement forever. */
                 g_cont_pc = -1;
+                g_run_error_pc = old_pc;
                 break;
             }
         } else if (!jumped) {
@@ -245,6 +251,7 @@ static void run_lines(int start_pc, int fresh) {
             } else if (ip.pc == old_pc) {
                 /* No ON ERROR: stop here rather than retry the statement forever. */
                 g_cont_pc = -1;
+                g_run_error_pc = old_pc;
                 break;
             }
         } else if (!jumped) {
@@ -274,6 +281,36 @@ int basic_main(int argc, char **argv) {
     g_prec = DEFAULT_PREC;
     mpf_set_default_prec(g_prec);
     clear_program();   /* flush g_nlines/g_nvar/etc. left over from a prior session */
+
+    /* --cli: start at the Ok prompt rather than in the editor;
+     * --edit FILE: open FILE in the editor. */
+    int start_cli = 0;
+    const char *edit_file = NULL;
+    (void)start_cli; (void)edit_file;
+#if !defined(WOPR) && !defined(FELIX_BASIC) && !defined(INLINEBASIC)
+    {
+        int ai = 1;
+        while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
+            if (!strcmp(argv[ai], "--cli") || !strcmp(argv[ai], "-c")) start_cli = 1;
+            else if ((!strcmp(argv[ai], "--edit") || !strcmp(argv[ai], "-e")) && ai + 1 < argc) edit_file = argv[++ai];
+            else if (!strcmp(argv[ai], "--help") || !strcmp(argv[ai], "-h")) {
+                fprintf(stdout,
+                    "Usage: %s [options] [program.bas [precision_bits]]\n"
+                    "  program.bas       run the program and exit\n"
+                    "  -e, --edit FILE   open FILE in the editor\n"
+                    "  -c, --cli         start at the Ok prompt instead of the editor\n"
+                    "                    (EDIT goes to the editor from there)\n"
+                    "  -h, --help        this help\n", argv[0]);
+                return 0;
+            }
+            else break;
+            ai++;
+        }
+        argv += ai - 1;
+        argc -= ai - 1;
+    }
+#endif
+
     srand((unsigned)time(NULL));
     display_init();
     install_sigint();
@@ -378,12 +415,32 @@ return 0;
     } while(0)
 
     /* ----------------------------------------------------------------
+     * The editor, unless --cli asked for the command line
+     * ---------------------------------------------------------------- */
+    int from_editor = 0;
+#ifdef BASIC_HAS_EDITOR
+    if (!start_cli) {
+        if (editor_main(edit_file) == EDITOR_EXIT) {
+            display_shutdown();
+            clear_program();
+            return 0;
+        }
+        from_editor = 1;
+    }
+#endif
+
+    /* ----------------------------------------------------------------
      * Interactive REPL
      * ---------------------------------------------------------------- */
     display_cls();
     display_print("Felix BASIC\n");
     display_print("In loving memory of Felix the lovebird.\n");
-    display_print("Type HELP for a list of commands, or SYSTEM to exit.\n\n");
+    display_print("Type HELP for a list of commands, or SYSTEM to exit.\n");
+#ifdef BASIC_HAS_EDITOR
+    display_print("Type EDIT to use the full-screen editor.\n");
+#endif
+    display_print("\n");
+    (void)from_editor;
 
     char line[DEFAULT_BUFFER];
     int suppress_ok = 0;
@@ -411,6 +468,17 @@ return 0;
         if (strncasecmp(p,"SYSTEM",6)==0 || strncasecmp(p,"EXIT",4)==0 ||
             strncasecmp(p,"QUIT",4)==0   || strncasecmp(p,"BYE",3)==0) {
             break;
+
+        } else if (strncasecmp(p,"EDIT",4)==0 && !isalnum((unsigned char)p[4]) && p[4] != '_' && p[4] != '$' && !strchr(sk(p+4), '=')) {
+#ifdef BASIC_HAS_EDITOR
+            /* EDIT ["file"]: the full-screen editor, with the program in memory */
+            p += 4;
+            char name[DEFAULT_BUFFER]; PARSE_FILENAME(name, p); EXPAND_TILDE(name);
+            if (editor_main(*name ? name : NULL) == EDITOR_EXIT) break;
+            display_print("Felix BASIC -- type EDIT to go back to the editor.\n");
+#else
+            display_print("The full-screen editor isn't available here.\n");
+#endif
 
         } else if (strncasecmp(p,"NEW",3)==0 && !isalnum((unsigned char)p[3])) {
             clear_program();
@@ -663,6 +731,9 @@ return 0;
                 "  LIST [n[-m]]     List program lines (optionally range n to m)\n"
                 "  DELETE n[-m]     Delete program line(s)\n"
                 "  RENUM [s[,i]]    Renumber lines (start, step)\n"
+#ifdef BASIC_HAS_EDITOR
+                "  EDIT [\"file\"]    Full-screen editor (File > Command Line returns)\n"
+#endif
                 "\n"
                 "FILE MANAGEMENT\n"
                 "  FILES / DIR / LS [\"pat\"]    List files in current directory\n"
@@ -732,6 +803,7 @@ return 0;
                 for (int k = 0; k < nseg; k++) {
                     g_lines[ins+k].linenum = num;
                     g_lines[ins+k].text = bstrdup(segs[k]);
+                    g_lines[ins+k].srcline = 0;
                 }
                 g_nlines += nseg;
             }
@@ -750,6 +822,7 @@ return 0;
             for (int k = 0; k < nseg; k++) {
                 g_lines[base+k].linenum = IMMEDIATE_LINE;
                 g_lines[base+k].text = bstrdup(segs[k]);
+                g_lines[base+k].srcline = 0;
             }
             g_nlines += nseg;
             g_imm_base = base;

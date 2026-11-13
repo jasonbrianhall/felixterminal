@@ -1666,6 +1666,25 @@ int display_getchar(void) {
     return c;
 }
 
+// ---- for the editor (editor.cpp) ----
+int  display_get_rows(void) { return s_text_rows; }
+void display_raw_keys(int on) { (void)on; }
+
+// Blocking key read; -1 if the display has gone.
+int display_getkey(void) {
+    for (;;) {
+        if (!gfx_sdl_pump()) return -1;
+        gfx_sdl_render();
+        int c = key_pop();
+        if (c >= 0) return c;
+        SDL_Delay(10);
+    }
+}
+
+// No system clipboard here: the editor keeps its own
+void  display_clipboard_set(const char *text) { (void)text; }
+char *display_clipboard_get(void) { return NULL; }
+
 // Blocking line input with echo and command history
 int display_getline(char *buf, int bufsz) {
     #define SDL_HIST_MAX 64
