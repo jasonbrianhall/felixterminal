@@ -743,6 +743,8 @@ static int alt_key(int c)
 }
 #endif
 
+void display_fill_screen(int on) { (void)on; }   /* the terminal's own size is used */
+
 void  display_clipboard_set(const char *text) { (void)text; }
 char *display_clipboard_get(void) { return NULL; }
 

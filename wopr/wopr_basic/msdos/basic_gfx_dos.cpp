@@ -138,6 +138,7 @@ static Cell s_grid[TEXT_ROWS_MAX][TEXT_COLS_MAX];
 static int  s_text_cols  = TEXT_COLS_DEF;
 static int  s_text_rows  = TEXT_ROWS_DEF;
 static int  s_text_lock_rows = 0;   // SCREEN 0 after WIDTH: a fixed cols x rows grid (0: fit the window)
+static bool s_fill_screen = false;  // the editor: as many text rows as fit (display_fill_screen)
 static int  s_cur_row    = 0, s_cur_col = 0;
 static int  s_cur_fg     = 7, s_cur_bg  = 0;
 static bool s_cursor_vis = false;
@@ -577,6 +578,8 @@ static void layout() {
         int k = std::max(1, std::min(dw / 640, dh / th));
         if (640 * k * 5 >= dw * 4 && th * k * 5 >= dh * 4) {
             s_cell_w = bw * k; s_cell_h = bh * k;            // crisp
+            if (s_fill_screen && s_text_lock_rows <= 0)       // the editor: every row there's room for
+                s_text_rows = std::min(TEXT_ROWS_MAX, dh / s_cell_h);
         } else {
             s_cell_w = std::max(bw, dw / s_text_cols);       // stretched to fit
             s_cell_h = std::max(bh, dh / s_text_rows);
@@ -1669,6 +1672,11 @@ int display_getchar(void) {
 // ---- for the editor (editor.cpp) ----
 int  display_get_rows(void) { return s_text_rows; }
 void display_raw_keys(int on) { (void)on; }
+void display_fill_screen(int on) {
+    if (s_fill_screen == (on != 0)) return;
+    s_fill_screen = on != 0;
+    if (!s_gfx_active) layout();
+}
 
 // Blocking key read; -1 if the display has gone.
 int display_getkey(void) {

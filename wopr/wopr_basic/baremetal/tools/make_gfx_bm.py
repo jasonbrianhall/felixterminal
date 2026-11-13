@@ -76,6 +76,14 @@ s = sub(s, '#include <unordered_map>\n', '#include <map>\n')
 # ---- scrollback: 5000 lines x 220 columns is 3 MB; keep 200 on bare metal
 s = sub(s, '#define SCROLLBACK_LINES 5000', '#define SCROLLBACK_LINES 200')
 
+# ---- the editor's full-screen text grid: lay the screen out again
+s = sub(s, '''void display_fill_screen(int on) { s_fill_screen = on != 0; }   // the window's rows already fit it''',
+'''void display_fill_screen(int on) {
+    if (s_fill_screen == (on != 0)) return;
+    s_fill_screen = on != 0;
+    if (!s_gfx_active) layout();
+}''')
+
 # ---- no system clipboard: the editor keeps its own
 s = sub(s, '''void display_clipboard_set(const char *text) { SDL_SetClipboardText(text); }
 char *display_clipboard_get(void) {
@@ -124,6 +132,8 @@ static void layout() {
         int k = std::max(1, std::min(dw / 640, dh / th));
         if (640 * k * 5 >= dw * 4 && th * k * 5 >= dh * 4) {
             s_cell_w = bw * k; s_cell_h = bh * k;            // crisp
+            if (s_fill_screen && s_text_lock_rows <= 0)       // the editor: every row there's room for
+                s_text_rows = std::min(TEXT_ROWS_MAX, dh / s_cell_h);
         } else {
             s_cell_w = std::max(bw, dw / s_text_cols);       // stretched to fit
             s_cell_h = std::max(bh, dh / s_text_rows);

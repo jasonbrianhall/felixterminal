@@ -100,6 +100,10 @@ void display_raw_keys(int on);
  * closed. */
 int display_getkey(void);
 
+/* Editor: use every text row the screen has room for. (The PC-style
+ * displays otherwise keep 25 rows, which can leave bands above and below.) */
+void display_fill_screen(int on);
+
 /* The system clipboard where there is one: set copies text to it; get
  * returns a malloc'd copy of its text (free it), or NULL. */
 void  display_clipboard_set(const char *text);

@@ -58,7 +58,11 @@ static inline unsigned char A(int fg, int bg) { return (unsigned char)((fg & 15)
 #define AT_TEXT    A(7, 1)              /* the editing window */
 #define AT_SEL     A(1, 7)              /* selected text */
 #define AT_BAR     A(0, 7)              /* menu bar, menus, dialogs */
-#define AT_HOT     A(15, 7)             /* a menu's / item's hot key */
+#ifdef USE_SDL_WINDOW
+#define AT_HOT     A(15, 7)             /* a menu's / item's hot key: QBasic's bright white */
+#else
+#define AT_HOT     A(4, 7)              /* a terminal's grey is near white: red reads */
+#endif
 #define AT_BARSEL  A(7, 0)              /* the highlighted menu / item */
 #define AT_HOTSEL  A(15, 0)
 #define AT_GREY    A(8, 7)              /* an item that can't be used now */
@@ -1562,6 +1566,7 @@ static void run_program(bool cont) {
     display_print((char *)"\033[?2004l");
 #endif
     display_raw_keys(0);
+    display_fill_screen(0);     /* programs get the usual 25 rows */
     display_color(7, 0);
     display_cls();
     display_cursor(1);
@@ -1584,6 +1589,7 @@ static void run_program(bool cont) {
     /* back to the editor */
 #ifdef USE_SDL_WINDOW
     if (gfx_active()) gfx_screen(0);
+    display_fill_screen(1);
 #else
     display_print((char *)"\033[?2004h");
 #endif
@@ -1754,6 +1760,7 @@ int editor_main(const char *file) {
     cur_at = -1;
     terminal_screen(true);
     display_raw_keys(1);
+    display_fill_screen(1);
 
     static bool first = true;
     bool welcome = false;
@@ -1900,6 +1907,7 @@ int editor_main(const char *file) {
 
     /* leave the screen as the command line expects it */
     display_raw_keys(0);
+    display_fill_screen(0);
     terminal_screen(false);
     display_color(7, 0);
     display_cls();

@@ -148,6 +148,7 @@ static int  s_text_cols  = TEXT_COLS_DEF;
 static int  s_text_rows  = TEXT_ROWS_DEF;
 static int  s_text_lock_rows = 0;   // SCREEN 0 after WIDTH: a fixed cols x rows grid (0: fit the window)
 static bool s_raw_keys   = false;   // the editor's key mode (display_raw_keys)
+static bool s_fill_screen = false;  // the editor: as many text rows as fit (display_fill_screen)
 static int  s_cur_row    = 0, s_cur_col = 0;
 static int  s_cur_fg     = 7, s_cur_bg  = 0;
 static bool s_cursor_vis = false;
@@ -1954,6 +1955,7 @@ int display_getchar(void) {
 // ---- for the editor (editor.cpp) ----
 int  display_get_rows(void) { return s_text_rows; }
 void display_raw_keys(int on) { s_raw_keys = on != 0; }
+void display_fill_screen(int on) { s_fill_screen = on != 0; }   // the window's rows already fit it
 
 // Blocking key read; -1 once the window has been closed, 0 when the text
 // grid changed size (so the editor redraws).
