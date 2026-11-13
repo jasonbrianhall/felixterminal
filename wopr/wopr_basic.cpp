@@ -492,47 +492,11 @@ static int basic_thread_fn(void *userdata)
         SDL_Log("[basic] longjmp from exit_()");
     }
     
-    /* Clean up BASIC interpreter state before thread exit.
-     * Arrays are now statically allocated in Var struct, so we only need to
-     * free the individual string elements and scalar string variables. */
-    {
-        using namespace WoprBasic;
-        if (g_vars) {
-            for (int i = 0; i < MAX_VARS; i++) {
-                Var *v = &g_vars[i];
-                if (!v->name) continue;
-                
-                if (v->kind == VAR_STR && v->str) { 
-                    free(v->str); 
-                    v->str = nullptr; 
-                }
-                else if (v->kind == VAR_ARRAY_STR) {
-                    /* Free individual string elements (the array itself is static) */
-                    int size = 0;
-                    if (v->ndim == 1) size = v->dim[0];
-                    else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-                    else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-                    for (int j = 0; j < size; j++) {
-                        if (v->arr_str[j]) { free(v->arr_str[j]); v->arr_str[j] = nullptr; }
-                    }
-                }
-                else if (v->kind == VAR_ARRAY_NUM) {
-                    /* Clear mpf_t values (array is static in Var struct) */
-                    int size = 0;
-                    if (v->ndim == 1) size = v->dim[0];
-                    else if (v->ndim == 2) size = v->dim[0] * v->dim[1];
-                    else if (v->ndim > 0 && v->dim[0] > 0) size = v->dim[0] * (v->dim[1] > 0 ? v->dim[1] : 1);
-                    for (int j = 0; j < size; j++) mpf_clear(v->arr_num[j]);
-                }
-                mpf_clear(v->num);
-            }
-        }
-        /* Free DATA items */
-        for (int i = 0; i < MAX_DATA_ITEMS; i++) {
-            if (g_data[i]) { free(g_data[i]); g_data[i] = nullptr; }
-        }
-    }
-    
+    /* Free the program, variables, arrays and DATA (a normal exit has
+     * done this already; a longjmp out of a running program hasn't). The
+     * interpreter's own clear_program knows its data layout. */
+    WoprBasic::clear_program();
+
     g_basic_game_over = 1;
     SDL_SemPost(zs->done_sem);
     return 0;
