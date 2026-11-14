@@ -1043,6 +1043,12 @@ bool gfx_sdl_pump() {
                 s_needs_render = true;
             } else if (s_mouse_owned) {
                 mouse_report(mouse_fx(mx), mouse_fy(my), s_mouse.buttons, delta);
+            } else if (s_raw_keys && !s_gfx_active) {
+                // The editor: wheel clicks as keys (display.h KEY_MOUSE)
+                int col = std::max(0, std::min(mx / std::max(1, s_cell_w), s_text_cols - 1));
+                int row = std::max(0, std::min(my / std::max(1, s_cell_h), s_text_rows - 1));
+                for (int i = 0; i < std::min(5, std::abs(delta)); i++)
+                    key_push(KEY_MOUSE(col, row, s_mouse.buttons, delta));
             } else if (delta) {
                 // Wheel at the prompt: through the history, 3 lines a click
                 int lines_in_scrollback = std::min(s_scrollback_count, SCROLLBACK_LINES);
@@ -1070,6 +1076,16 @@ bool gfx_sdl_pump() {
             if (s_gfx_active || s_mouse_owned) break;
             int col = std::max(0, std::min(mx / std::max(1, s_cell_w), s_text_cols - 1));
             int row = std::max(0, std::min(my / std::max(1, s_cell_h), s_text_rows - 1));
+            if (s_raw_keys) {
+                // The editor: presses, releases, and moves to another cell
+                // with a button held, as keys (display.h KEY_MOUSE)
+                static int last_col = -1, last_row = -1;
+                bool moved = col != last_col || row != last_row;
+                last_col = col; last_row = row;
+                if (e.type != SDL_MOUSEMOTION || (moved && buttons))
+                    key_push(KEY_MOUSE(col, row, buttons, 0));
+                break;
+            }
             if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) sel_press(row, col);
             else if (e.type == SDL_MOUSEMOTION) sel_drag(row, col);
             else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) sel_release();
@@ -1954,7 +1970,16 @@ int display_getchar(void) {
 
 // ---- for the editor (editor.cpp) ----
 int  display_get_rows(void) { return s_text_rows; }
-void display_raw_keys(int on) { s_raw_keys = on != 0; }
+void display_raw_keys(int on) {
+    s_raw_keys = on != 0;
+    if (s_raw_keys) return;
+    // Leaving the editor: mouse events it didn't read aren't keys for anyone else
+    std::lock_guard<std::mutex> lk(s_keys_mx);
+    std::queue<int> keep;
+    for (; !s_keys.empty(); s_keys.pop())
+        if (!IS_KEY_MOUSE(s_keys.front())) keep.push(s_keys.front());
+    s_keys.swap(keep);
+}
 void display_fill_screen(int on) { s_fill_screen = on != 0; }   // the window's rows already fit it
 
 // Blocking key read; -1 once the window has been closed, 0 when the text

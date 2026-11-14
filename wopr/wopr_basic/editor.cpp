@@ -240,11 +240,26 @@ static int alt_letter(int k) {
     return 0;
 }
 
-static int getkey(void) {
+/* The mouse (display.h KEY_MOUSE), as the last event left it: the text
+ * cell it's over, the buttons held, and what changed. */
+static int m_x, m_y, m_btn, m_wheel, m_press, m_release;
+
+static void mouse_decode(int k) {
+    int prev = m_btn;
+    m_x = KEY_MOUSE_COL(k); m_y = KEY_MOUSE_ROW(k);
+    m_btn = KEY_MOUSE_BUTTONS(k); m_wheel = KEY_MOUSE_WHEEL(k);
+    m_press = m_btn & ~prev; m_release = prev & ~m_btn;
+}
+
+/* A key or a mouse event (IS_KEY_MOUSE: see m_x...). Every loop that
+ * reads keys here handles the mouse, or passes its events over. */
+static int getkey_m(void) {
     int k = display_getkey();
     g_break = 0;            /* Ctrl+C is a key here, not a break */
+    if (IS_KEY_MOUSE(k)) mouse_decode(k);
     return k;
 }
+
 
 /* ================================================================
  * The program being edited
@@ -814,12 +829,34 @@ static void draw_menu_bar(int active) {
     }
 }
 
+/* The menu whose name is at column x of the menu bar, or -1. */
+static int menu_at(int x) {
+    for (int m = 0; m < NMENUS; m++)
+        if (x >= menu_x(m) - 1 && x < menu_x(m) + hot_len(MENUS[m].name) + 1) return m;
+    return -1;
+}
+
+/* The left edge of menu m when it's dropped down. */
+static int dropdown_x(int m) {
+    int w = menu_width(m), x = menu_x(m) - 1;
+    if (x + w + 2 > W) x = W - w - 2;
+    if (x < 0) x = 0;
+    return x;
+}
+
+/* The item of dropped-down menu m at cell (x, y): -1 for none, -2 for
+ * the box's frame. */
+static int dropdown_item_at(int m, int x, int y) {
+    int dx = dropdown_x(m), w = menu_width(m);
+    if (x < dx || x >= dx + w || y < 1 || y >= MENUS[m].n + 3) return -1;
+    if (x == dx || x == dx + w - 1 || y == 1 || y == MENUS[m].n + 2) return -2;
+    return MENUS[m].items[y - 2].label[0] == '-' ? -2 : y - 2;
+}
+
 static void draw_dropdown(int m, int item) {
     const Menu &mn = MENUS[m];
     int w = menu_width(m), h = mn.n + 2;
-    int x = menu_x(m) - 1;
-    if (x + w + 2 > W) x = W - w - 2;
-    if (x < 0) x = 0;
+    int x = dropdown_x(m);
     box(x, 1, w, h, AT_BAR);
     shadow(x, 1, w, h);
     for (int i = 0; i < mn.n; i++) {
@@ -861,8 +898,34 @@ static int menu_loop(int m, bool open) {
         }
         flush();
         display_cursor(0);
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; return CMD_NONE; }
+        if (IS_KEY_MOUSE(k)) {
+            /* Press on a menu's name to drop it down (again to put it away),
+             * then click an item, or hold the button, slide to the item and
+             * let go there. A press anywhere else leaves the menus. */
+            if (m_wheel) continue;
+            int bar = m_y == 0 ? menu_at(m_x) : -1;
+            int at = open ? dropdown_item_at(m, m_x, m_y) : -1;
+            if (m_press & 1) {
+                if (bar >= 0) {
+                    if (bar == m && open) return CMD_NONE;
+                    m = bar; open = true; item = 0;
+                    continue;
+                }
+                if (at == -1) return CMD_NONE;
+            }
+            if (m_btn & 1) {
+                if (bar >= 0 && (bar != m || !open)) { m = bar; open = true; item = 0; }
+                else if (at >= 0) item = at;
+            }
+            if ((m_release & 1) && at >= 0) {
+                item = at;
+                const MenuItem &it = MENUS[m].items[item];
+                if (cmd_enabled(it.cmd)) return it.cmd;
+            }
+            continue;
+        }
         int base = k & ~KEY_SHIFT;
         int al = alt_letter(base);
         if (k == 27 || base == K_F(10) || k == KEY_ALT_ALONE) return CMD_NONE;
@@ -906,6 +969,10 @@ static std::string base_name(const std::string &p) {
     size_t s = p.find_last_of("/\\:");
     return s == std::string::npos ? p : p.substr(s + 1);
 }
+
+/* The status line's keys, which can be clicked too */
+#define STATUS_KEYS "<F1=Help> <F10=Menus> <F5=Run> <F6=Command Line> <Ctrl+S=Save>"
+static bool status_keys_shown;
 
 static void draw_status(const char *left) {
     fill(0, H - 1, W, 1, ' ', AT_STATUS);
@@ -966,8 +1033,9 @@ static void draw_editor(void) {
         put(2 + pos, y, ' ', A(0, 0));
     }
 
-    if (!status_msg.empty()) draw_status(status_msg.c_str());
-    else draw_status("<F1=Help> <F10=Menus> <F5=Run> <F6=Command Line> <Ctrl+S=Save>");
+    status_keys_shown = status_msg.empty();
+    if (!status_keys_shown) draw_status(status_msg.c_str());
+    else draw_status(STATUS_KEYS);
 }
 
 /* ================================================================
@@ -1004,6 +1072,17 @@ static void draw_buttons(int x, int y, int w, const std::vector<std::string> &b,
     }
 }
 
+/* The button at column mx of a row drawn by draw_buttons, or -1. */
+static int button_at(int x, int w, const std::vector<std::string> &b, int mx) {
+    int bx = x + (w - buttons_width(b)) / 2;
+    for (size_t i = 0; i < b.size(); i++) {
+        int bw = (int)b[i].size() + 4;
+        if (mx >= bx && mx < bx + bw) return (int)i;
+        bx += bw + 3;
+    }
+    return -1;
+}
+
 static std::vector<std::string> split_lines(const std::string &s) {
     std::vector<std::string> v;
     size_t a = 0;
@@ -1035,8 +1114,15 @@ static int message_box(const char *title, const std::string &msg,
         draw_buttons(x, y + h - 2, w, b, focus);
         flush();
         display_cursor(0);
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; return -1; }
+        if (IS_KEY_MOUSE(k)) {
+            if ((m_press & 1) && m_y == y + h - 2) {
+                int i = button_at(x, w, b, m_x);
+                if (i >= 0) return i;
+            }
+            continue;
+        }
         int base = k & ~KEY_SHIFT;
         if (k == 27) return -1;
         if (k == '\r' || k == ' ') return focus;
@@ -1114,8 +1200,26 @@ static int form(const char *title, const std::vector<Field> &fields,
         draw_buttons(x, y + h - 2, w, b, focus >= nf ? focus - nf : -1);
         flush();
         show_cursor_at(cur_x, cur_y);
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; return -1; }
+        if (IS_KEY_MOUSE(k)) {
+            if (!(m_press & 1)) continue;
+            if (m_y == y + h - 2) {
+                int i = button_at(x, w, b, m_x);
+                if (i >= 0) return i;
+            }
+            for (int i = 0; i < nf; i++) {   /* a click in a field puts the cursor there */
+                int fy = y + 2 + extra + i * 2 - 1, fx = x + 3 + lw, fw = w - lw - 5;
+                if (m_y != fy || m_x < fx || m_x >= fx + fw) continue;
+                int p = focus == i ? pos[(size_t)i] : (int)fields[(size_t)i].val->size();
+                int off = p >= fw ? p - fw + 1 : 0;
+                int np = off + m_x - fx, len = (int)fields[(size_t)i].val->size();
+                pos[(size_t)i] = np < len ? np : len;
+                focus = i;
+                fresh[(size_t)i] = 0;
+            }
+            continue;
+        }
         int base = k & ~KEY_SHIFT;
         if (k == 27) return -1;
         if (k == '\t' || (focus >= nf && (base == KEY_RIGHT || base == KEY_DOWN))) { focus = (focus + 1) % (nf + nb); continue; }
@@ -1164,8 +1268,13 @@ static void viewer(const char *title, const std::string &body) {
         }
         flush();
         display_cursor(0);
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; return; }
+        if (IS_KEY_MOUSE(k)) {
+            if (m_wheel) top -= 3 * m_wheel;
+            else if ((m_press & 1) && m_y == y + h - 2 && button_at(x, w, { "OK" }, m_x) >= 0) return;
+            continue;
+        }
         int base = k & ~KEY_SHIFT;
         if (k == 27 || k == '\r' || k == ' ') return;
         if (base == KEY_DOWN) top++;
@@ -1346,8 +1455,44 @@ static void open_dialog(void) {
         flush();
         if (focus == 0) show_cursor_at(cur_x, y + 2); else display_cursor(0);
 
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; return; }
+        if (IS_KEY_MOUSE(k)) {
+            /* the wheel goes through the list; a click picks a name (a
+             * second click on it opens it); OK opens what's in the field */
+            if (m_wheel) {
+                sel_i -= 3 * m_wheel;
+                if (sel_i >= (int)ents.size()) sel_i = (int)ents.size() - 1;
+                if (sel_i < 0) sel_i = 0;
+                if (focus != 1) focus = 1;
+                if (!ents.empty() && !ents[(size_t)sel_i].dir) { name = ents[(size_t)sel_i].name; pos = (int)name.size(); }
+                continue;
+            }
+            if (!(m_press & 1)) continue;
+            if (m_y == y + h - 2) {
+                int i = button_at(x, w, { "OK", "Cancel" }, m_x);
+                if (i == 1) return;
+                if (i != 0) continue;
+                focus = 2;
+                k = '\r';
+            } else if (m_y == y + 2 && m_x >= x + 13 && m_x < x + 13 + w - 16) {
+                focus = 0;
+                int fw = w - 16, off = pos >= fw ? pos - fw + 1 : 0, np = off + m_x - (x + 13);
+                pos = np < (int)name.size() ? np : (int)name.size();
+                continue;
+            } else if (m_y > ly && m_y <= ly + lh && m_x > lx && m_x < lx + lw - 1 &&
+                       scroll + m_y - ly - 1 < (int)ents.size()) {
+                int i = scroll + m_y - ly - 1;
+                bool again = focus == 1 && i == sel_i;
+                sel_i = i;
+                focus = 1;
+                if (!ents[(size_t)i].dir) { name = ents[(size_t)i].name; pos = (int)name.size(); }
+                if (!again) continue;
+                k = '\r';
+            } else {
+                continue;
+            }
+        }
         int base = k & ~KEY_SHIFT;
         if (k == 27 || (focus == 3 && (k == '\r' || k == ' '))) return;
         if (k == '\t') { focus = (focus + 1) % 4; continue; }
@@ -1545,7 +1690,8 @@ static void wait_any_key(void) {
     display_color(15, 0);
     display_print((char *)"Press any key to continue");
     display_raw_keys(1);
-    int k = getkey();
+    int k;
+    do k = getkey_m(); while (IS_KEY_MOUSE(k) && !m_press);   /* a click will do too */
     if (k < 0) quit_now = true;
 }
 
@@ -1752,6 +1898,88 @@ static void take_program_from_memory(void) {
     modified = from_listing && !mem.empty();
 }
 
+/* ---- the mouse in the editing window ---- */
+static bool m_dragging;      /* the left button went down in the text: dragging selects */
+
+/* Scroll the text n lines, keeping the cursor in the window. */
+static void scroll_view(int n) {
+    top_line += n;
+    if (top_line > (int)L.size() - 1) top_line = (int)L.size() - 1;
+    if (top_line < 0) top_line = 0;
+    if (cy < top_line) cy = top_line;
+    if (cy > top_line + TH() - 1) cy = top_line + TH() - 1;
+    clamp_cursor();
+    sel = false;
+}
+
+static void editor_mouse(int *result) {
+    int th = TH(), tw = TW();
+    if (m_wheel) { scroll_view(-3 * m_wheel); return; }
+    if (m_release & 1) { m_dragging = false; return; }
+    if ((m_btn & 1) && !(m_press & 1)) {
+        /* dragging: the selection runs from where the button went down */
+        if (!m_dragging) return;
+        int x = m_x - TX(), y = m_y - TY();
+        if (y < 0) y = -1;                 /* past the edges: scrolls */
+        if (y >= th) y = th;
+        if (x < 0) x = left_col > 0 ? -1 : 0;
+        if (x >= tw) x = tw;
+        cx = left_col + x; cy = top_line + y;
+        clamp_cursor();
+        sel = cx != ax || cy != ay;
+        return;
+    }
+    if (!(m_press & 1)) return;
+    m_dragging = false;
+    if (m_y == 0) {                        /* the menu bar */
+        int m = menu_at(m_x);
+        if (m >= 0) do_cmd(menu_loop(m, true), result);
+        return;
+    }
+    if (m_y == H - 1) {                    /* the status line's keys */
+        if (!status_keys_shown) return;
+        static const int cmds[] = { CMD_HELP_KEYS, -1, CMD_CONT, CMD_CLI, CMD_SAVE };
+        const char *p = STATUS_KEYS;
+        int x = 1;
+        for (int i = 0; i < 5 && *p; i++) {
+            const char *e = strchr(p, '>');
+            if (!e) break;
+            int len = (int)(e - p) + 1;
+            if (m_x >= x && m_x < x + len) {
+                if (cmds[i] < 0) do_cmd(menu_loop(0, false), result);
+                else do_cmd(cmds[i], result);
+                return;
+            }
+            x += len + 1; p = e + 1;
+            while (*p == ' ') p++;
+        }
+        return;
+    }
+    if (m_x == W - 1 && m_y >= TY() && m_y < TY() + th && th >= 3) {   /* the scroll bar */
+        int track = th - 2, n = (int)L.size();
+        int thumb = TY() + 1 + (n > 1 ? (int)((long long)cy * (track - 1) / (n - 1)) : 0);
+        if (m_y == TY()) scroll_view(-1);
+        else if (m_y == TY() + th - 1) scroll_view(1);
+        else if (m_y < thumb) scroll_view(-(th - 1));
+        else if (m_y > thumb) scroll_view(th - 1);
+        return;
+    }
+    if (m_y == H - 2 && tw >= 3) {        /* the horizontal scroll bar's arrows */
+        if (m_x == 1 && left_col > 0) { left_col--; if (cx >= left_col + tw) cx = left_col + tw - 1; }
+        else if (m_x == W - 2 && left_col < 255) { left_col++; if (cx < left_col) cx = left_col; }
+        return;
+    }
+    if (m_x >= TX() && m_x < TX() + tw && m_y >= TY() && m_y < TY() + th) {   /* the text */
+        cx = left_col + m_x - TX();
+        cy = top_line + m_y - TY();
+        clamp_cursor();
+        sel = false;
+        ax = cx < len_of(cy) ? cx : len_of(cy); ay = cy;
+        last_kind = 0;
+        m_dragging = true;
+    }
+}
+
 int editor_main(const char *file) {
     int result = -1;
     quit_now = false;
@@ -1791,9 +2019,19 @@ int editor_main(const char *file) {
         flush();
         show_cursor_at(TX() + cx - left_col, TY() + cy - top_line);
 
-        int k = getkey();
+        int k = getkey_m();
         if (k < 0) { quit_now = true; break; }
         if (k == 0) continue;   /* the screen changed size */
+        if (IS_KEY_MOUSE(k)) {
+            if (m_press || m_wheel) status_msg.clear();
+            int keep_y = cy;
+            editor_mouse(&result);
+            if (cy != keep_y && edited_line >= 0 && edited_line != cy) {
+                capitalize_line(edited_line);
+                edited_line = -1;
+            }
+            continue;
+        }
         if (k != KEY_PASTE_BEGIN && k != KEY_PASTE_END) status_msg.clear();
 
         int shift = k & KEY_SHIFT;

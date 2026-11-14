@@ -109,6 +109,21 @@ void display_fill_screen(int on);
 void  display_clipboard_set(const char *text);
 char *display_clipboard_get(void);
 
+/* The mouse, for the editor: while editor key mode is on, display_getkey
+ * also returns KEY_MOUSE(...) when a button is pressed or let go, for each
+ * click of the wheel, and when the pointer moves to another text cell with
+ * a button held. col and row count from 0; buttons: 1 left, 2 right,
+ * 4 middle (those held now); wheel: +1 away from you, -1 towards you. */
+#define KEY_MOUSE_FLAG 0x40000000
+#define KEY_MOUSE(col, row, buttons, wheel) \
+    (KEY_MOUSE_FLAG | ((col) & 0x1FF) | ((row) & 0xFF) << 9 | ((buttons) & 7) << 17 | \
+     ((wheel) > 0 ? 1 : (wheel) < 0 ? 2 : 0) << 20)
+#define IS_KEY_MOUSE(k)       ((k) >= 0 && ((k) & KEY_MOUSE_FLAG))
+#define KEY_MOUSE_COL(k)      ((k) & 0x1FF)
+#define KEY_MOUSE_ROW(k)      (((k) >> 9) & 0xFF)
+#define KEY_MOUSE_BUTTONS(k)  (((k) >> 17) & 7)
+#define KEY_MOUSE_WHEEL(k)    ((((k) >> 20) & 3) == 1 ? 1 : (((k) >> 20) & 3) == 2 ? -1 : 0)
+
 #define KEY_SHIFT      0x10000
 #define KEY_PASTE_BEGIN 0x20000   /* terminal bracketed paste: text follows */
 #define KEY_PASTE_END   0x20001

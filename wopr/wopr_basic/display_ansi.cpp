@@ -131,7 +131,7 @@ static void leave_raw(void) {}
 
 static void cleanup_terminal(void) {
     leave_raw();
-    printf("\033[0m\033[?25h\n");
+    printf("\033[0m\033[?25h\033[?1002l\033[?1006l\n");   /* (the editor's mouse off) */
     fflush(stdout);
 }
 
@@ -708,8 +708,12 @@ void display_raw_keys(int on)
         tcsetattr(STDIN_FILENO, TCSANOW, &t);
         g_raw = 1;
         s_editor_keys = 1;
+        fputs("\033[?1002h\033[?1006h", stdout);   /* the mouse: presses, drags, wheel (SGR) */
+        fflush(stdout);
     } else if (s_editor_keys) {
         s_editor_keys = 0;
+        fputs("\033[?1002l\033[?1006l", stdout);
+        fflush(stdout);
         g_raw = 1;
         leave_raw();           /* back to the terminal's own settings, */
         enter_raw();           /* then the interpreter's usual raw mode */
@@ -781,6 +785,19 @@ int display_getkey(void)
         }
         seq[len] = '\0';
         if (!fin) continue;
+        if (seq[0] == '<' && (fin == 'M' || fin == 'm')) {
+            /* SGR mouse: ESC [ < button ; col ; row M (press, drag) or m (release) */
+            static int held = 0;
+            int b = 0, col = 1, row = 1;
+            if (sscanf(seq + 1, "%d;%d;%d", &b, &col, &row) != 3) continue;
+            int wheel = 0;
+            if (b & 64) wheel = (b & 1) ? -1 : 1;
+            else if (!(b & 32)) {            /* a button, not a drag */
+                int bit = (b & 3) == 0 ? 1 : (b & 3) == 1 ? 4 : (b & 3) == 2 ? 2 : 0;
+                if (fin == 'M') held |= bit; else held &= ~bit;
+            }
+            return KEY_MOUSE(col - 1, row - 1, held, wheel);
+        }
         int p1 = atoi(seq), mod = 1;
         char *semi = strchr(seq, ';');
         if (semi) mod = atoi(semi + 1);

@@ -139,6 +139,7 @@ static int  s_text_cols  = TEXT_COLS_DEF;
 static int  s_text_rows  = TEXT_ROWS_DEF;
 static int  s_text_lock_rows = 0;   // SCREEN 0 after WIDTH: a fixed cols x rows grid (0: fit the window)
 static bool s_fill_screen = false;  // the editor: as many text rows as fit (display_fill_screen)
+static bool s_raw_keys   = false;   // the editor's key mode (display_raw_keys): it gets the mouse
 static int  s_cur_row    = 0, s_cur_col = 0;
 static int  s_cur_fg     = 7, s_cur_bg  = 0;
 static bool s_cursor_vis = false;
@@ -686,6 +687,17 @@ static void scroll_lines(int n) {
     s_needs_render = true;
 }
 
+// The editor (display_raw_keys on) gets the mouse as keys (display.h
+// KEY_MOUSE): presses and releases, wheel clicks, and moves to another
+// cell while a button is held.
+static void editor_mouse_key(int col, int row, int buttons, int wheel, int changed) {
+    static int last_col = -1, last_row = -1;
+    bool moved = col != last_col || row != last_row;
+    last_col = col; last_row = row;
+    if (changed || (moved && buttons)) gfx_bm_key(KEY_MOUSE(col, row, buttons, 0));
+    for (int i = 0; i < std::min(5, std::abs(wheel)); i++) gfx_bm_key(KEY_MOUSE(col, row, buttons, wheel));
+}
+
 void gfx_bm_mouse(int dx, int dy, int buttons, int wheel) {
     mouse_place();
     int k = std::max(1, s_disp_w / 640);                  // the same hand movement on any screen
@@ -700,10 +712,14 @@ void gfx_bm_mouse(int dx, int dy, int buttons, int wheel) {
     s_mbuttons = buttons;
     mouse_report(mouse_fx(), mouse_fy(), buttons, s_mouse_owned ? wheel : 0);
     if (s_mouse_owned) return;
-    if (wheel) scroll_lines(wheel * 3);
-    if (s_gfx_active) return;
     int col = std::max(0, std::min(s_text_cols - 1, (s_mpx - s_disp_x) / std::max(1, s_cell_w)));
     int row = std::max(0, std::min(s_text_rows - 1, (s_mpy - s_disp_y) / std::max(1, s_cell_h)));
+    if (s_raw_keys && !s_gfx_active) {                  // the editor: menus, dialogs, the text
+        editor_mouse_key(col, row, buttons, wheel, pressed | released);
+        return;
+    }
+    if (wheel) scroll_lines(wheel * 3);
+    if (s_gfx_active) return;
     if (pressed & 1) sel_press(row, col);
     else if (buttons & 1) sel_drag(row, col);
     if (released & 1) sel_release();
@@ -1671,7 +1687,17 @@ int display_getchar(void) {
 
 // ---- for the editor (editor.cpp) ----
 int  display_get_rows(void) { return s_text_rows; }
-void display_raw_keys(int on) { (void)on; }
+void display_raw_keys(int on) {
+    s_raw_keys = on != 0;
+    if (s_raw_keys) return;
+    // Leaving the editor: mouse events it didn't read aren't keys for anyone else
+    unsigned n = s_key_head - s_key_tail, t = s_key_tail;
+    s_key_head = s_key_tail;
+    for (unsigned i = 0; i < n; i++) {
+        int c = s_keys[(t + i) % 256];
+        if (!IS_KEY_MOUSE(c)) gfx_bm_key(c);
+    }
+}
 void display_fill_screen(int on) {
     if (s_fill_screen == (on != 0)) return;
     s_fill_screen = on != 0;
