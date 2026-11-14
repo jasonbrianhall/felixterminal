@@ -375,11 +375,23 @@ void video_band_done() {
 }
 
 // ---------------------------------------------------------------- time
+// uclock() reads the PIT and the BIOS tick count. When the PIT has wrapped
+// but the tick interrupt hasn't been serviced yet, it comes back up to 55 ms
+// (65536 uclocks) early: the DJGPP manual says it isn't monotonic. Within
+// 55 ms of start-up that is before t_start, and the unsigned microseconds
+// came out as about 180 days, so the first SDL_Delay waited that long and
+// the program froze at start-up, now and then. Time here only goes forward.
 static uclock_t t_start;
-static uint64_t now_us() {
+uint64_t dos_clock_us() {
+    static uint64_t last;
     uclock_t t = uclock() - t_start;
-    return (uint64_t)t * 1000000ull / UCLOCKS_PER_SEC;
+    if (t > 0) {
+        uint64_t us = (uint64_t)t * 1000000ull / UCLOCKS_PER_SEC;
+        if (us > last) last = us;
+    }
+    return last;
 }
+static uint64_t now_us() { return dos_clock_us(); }
 static void poll_all();
 
 // Frames at most every dos_frame_ms (patch_gfx_dos.py); one held back is
@@ -463,18 +475,33 @@ static void key_in(int k) {
 // ---------------------------------------------------------------- mouse
 static bool mouse_ok, mouse_wheel;
 static void mouse_init() {
+    // No driver: INT 33h may point nowhere (0000:0000), and calling that hangs
+    uint32_t vec = _farpeekl(_dos_ds, 0x33 * 4);
+    if (!vec || _farpeekb(_dos_ds, ((vec >> 16) << 4) + (vec & 0xFFFF)) == 0xCF) {   // null, or IRET
+        klogf("Mouse: none (load a mouse driver for one)\n");
+        return;
+    }
+    // Software reset (function 21h): the driver's state only. Function 0
+    // also resets the mouse itself, which takes a while and can lose the
+    // PS/2 mouse's packets if it's moving; it's only for drivers without 21h.
     __dpmi_regs r;
     memset(&r, 0, sizeof r);
-    r.x.ax = 0x0000;
+    r.x.ax = 0x0021;
     __dpmi_int(0x33, &r);
+    if (r.x.ax != 0xFFFF) {
+        memset(&r, 0, sizeof r);
+        r.x.ax = 0x0000;
+        __dpmi_int(0x33, &r);
+    }
     mouse_ok = r.x.ax == 0xFFFF;
     if (!mouse_ok) { klogf("Mouse: none (load a mouse driver for one)\n"); return; }
+    int nbuttons = r.x.bx == 3 ? 3 : 2;                  // (FFFFh: two)
     memset(&r, 0, sizeof r);
     r.x.ax = 0x0011;                                     // CuteMouse wheel API
     __dpmi_int(0x33, &r);
     mouse_wheel = r.x.ax == 0x574D && (r.x.cx & 1);
     memset(&r, 0, sizeof r); r.x.ax = 0x000B; __dpmi_int(0x33, &r);   // reset the counters
-    klogf("Mouse: %d buttons%s\n", r.x.bx == 0xFFFF ? 2 : 3, mouse_wheel ? ", wheel" : "");
+    klogf("Mouse: %d buttons%s\n", nbuttons, mouse_wheel ? ", wheel" : "");
 }
 static void mouse_poll() {
     if (!mouse_ok) return;

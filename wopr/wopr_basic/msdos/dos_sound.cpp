@@ -6,6 +6,8 @@
 #include <pc.h>
 #include <time.h>
 
+uint64_t dos_clock_us();                  // dos_platform.cpp: only goes forward
+
 namespace {
 struct Note { uint32_t centi_hz, tone_us, gap_us; };
 constexpr int QSIZE = 1024;
@@ -15,7 +17,7 @@ bool playing, in_gap;
 Note cur;
 uint64_t phase_end;                       // when the current tone (or gap) ends, us
 
-uint64_t now_us() { return (uint64_t)uclock() * 1000000ull / UCLOCKS_PER_SEC; }
+uint64_t now_us() { return dos_clock_us(); }
 
 void speaker(uint32_t centi_hz) {
     if (!centi_hz) { outportb(0x61, inportb(0x61) & ~3); return; }
