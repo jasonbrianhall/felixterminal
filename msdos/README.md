@@ -35,7 +35,7 @@ sockets; no X11 forwarding). What's DOS-specific is in this folder:
   libstdc++ has no `std::mutex`).
 
 Not in the DOS build: the OpenGL effects, sound, Felix BASIC graphics, WOPR,
-Felix Chirp, SFTP, the web server, port forwarding, the SSH key manager,
+Felix Chirp (a DOS program of its own: `chirp/`, CHIRP.EXE), SFTP, the web server, port forwarding, the SSH key manager,
 telnet, serial, a local shell, menus and the clipboard.
 
 Options

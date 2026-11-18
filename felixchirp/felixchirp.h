@@ -9,7 +9,7 @@
 // GStreamer was present. Default that assumption back on here so existing
 // Makefile-driven Linux builds keep working without needing to learn about
 // this flag. Windows/vcpkg builds never define it, so they stay excluded.
-#if !defined(_WIN32) && !defined(HAVE_GSTREAMER)
+#if !defined(_WIN32) && !defined(__DJGPP__) && !defined(NO_GSTREAMER) && !defined(HAVE_GSTREAMER)
 #define HAVE_GSTREAMER 1
 #endif
 #ifdef HAVE_GSTREAMER
@@ -216,6 +216,9 @@ void iv_refresh();
 void iv_load_local(const char *filepath, const char *label);
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label);
 void iv_list_local(const char *path, std::vector<IVEntry> &out);
+#ifdef __DJGPP__
+bool iv_is_drive_name(const char *name);   // "D:" (DOS: drives in a root's listing)
+#endif
 void iv_list_remote(const char *path, std::vector<IVEntry> &out);
 void iv_free_tex();
 void iv_upload_texture(const unsigned char *rgba, int w, int h);

@@ -230,8 +230,41 @@ void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *l
 // DIRECTORY LISTING
 // ============================================================================
 
+#ifdef __DJGPP__
+#include <dos.h>
+#include <ctype.h>
+// DOS: a drive's root ("C:\") lists the other drives, as folders named "D:",
+// so the browser can change drives (iv_enter_selected goes to "D:\").
+bool iv_is_drive_name(const char *n) {
+    return n && isalpha((unsigned char)n[0]) && n[1] == ':' && !n[2];
+}
+static bool iv_is_drive_root(const char *p) {
+    return isalpha((unsigned char)p[0]) && p[1] == ':' && (!p[2] || ((p[2] == '\\' || p[2] == '/') && !p[3]));
+}
+// The drives DOS has (by setting the current drive and reading it back,
+// which touches no disk, so an empty floppy drive doesn't hold things up).
+static void iv_list_drives(const char *path, std::vector<IVEntry> &out) {
+    unsigned cur = 0, n = 0, got = 0;
+    _dos_getdrive(&cur);
+    for (unsigned d = 1; d <= 26; d++) {
+        _dos_setdrive(d, &n);
+        _dos_getdrive(&got);
+        if (got != d || (int)toupper((unsigned char)path[0]) - 'A' + 1 == (int)d) continue;
+        IVEntry e{};
+        e.name[0] = (char)('A' + d - 1); e.name[1] = ':';
+        e.is_dir = true;
+        out.push_back(e);
+    }
+    _dos_setdrive(cur, &n);
+}
+#endif
+
 void iv_list_local(const char *path, std::vector<IVEntry> &out) {
     out.clear();
+#ifdef __DJGPP__
+    if (iv_is_drive_root(path)) iv_list_drives(path, out);
+    else
+#endif
 #ifndef _WIN32
     if (strcmp(path, "/") != 0) {
         IVEntry up{}; strncpy(up.name, "..", sizeof(up.name)-1); up.is_dir = true;
