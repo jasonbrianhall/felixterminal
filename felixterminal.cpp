@@ -255,6 +255,15 @@ int main(int argc, char **argv) {
             ssh_cfg.x11_forward = false;
             continue;
         }
+        // -4 / -6: IPv4 or IPv6 only, as ssh -4 / -6 (else the resolver's order)
+        if (strcmp(arg, "-4") == 0 || strcmp(arg, "--ipv4") == 0) {
+            ssh_cfg.family = 4;
+            continue;
+        }
+        if (strcmp(arg, "-6") == 0 || strcmp(arg, "--ipv6") == 0) {
+            ssh_cfg.family = 6;
+            continue;
+        }
         if ((strcmp(arg, "-L") == 0 || strcmp(arg, "--forward-local") == 0) && i + 1 < argc) {
             int lp, rp; std::string rh;
             if (pf_parse_spec(argv[++i], &lp, &rh, &rp))
@@ -368,6 +377,8 @@ int main(int argc, char **argv) {
             SDL_Log("  --ssh-known-hosts <path>    Known hosts file (default: ~/.ssh/known_hosts;\n"
                     "                              Windows: %%USERPROFILE%%\\.ssh\\known_hosts)\n");
             SDL_Log("  --no-x11                    Disable X11 forwarding\n");
+            SDL_Log("  -4, --ipv4                  Connect over IPv4 only\n");
+            SDL_Log("  -6, --ipv6                  Connect over IPv6 only\n");
             SDL_Log("  -c <command>                Execute remote command (alias: --ssh-command)\n");
             SDL_Log("  -L local_port:remote_host:remote_port   Local port forward\n");
             SDL_Log("  -R remote_port:local_host:local_port    Remote port forward\n");
@@ -1955,6 +1966,8 @@ int main(int argc, char **argv) {
                                     if (!ssh_cfg.key_path.empty())         { dup.push_back("-i"); dup.push_back(ssh_cfg.key_path); }
                                     if (!ssh_cfg.known_hosts_path.empty()) { dup.push_back("--ssh-known-hosts"); dup.push_back(ssh_cfg.known_hosts_path); }
                                     if (!ssh_cfg.x11_forward)              dup.push_back("--no-x11");
+                                    if (ssh_cfg.family == 4)               dup.push_back("-4");
+                                    if (ssh_cfg.family == 6)               dup.push_back("-6");
                                     if (!ssh_cfg.command.empty())          { dup.push_back("-c"); dup.push_back(ssh_cfg.command); }
                                 } else if (use_telnet) {
                                     dup.push_back("--telnet");

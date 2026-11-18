@@ -41,8 +41,8 @@ telnet, serial, a local shell, menus and the clipboard.
 Options
 -------
 
-    FLT [-p port] [-l user] [-i keyfile] [-g WxH[xBITS]] [-f size]
-        [user@]host[:port] [command]
+    FLT [-4|-6] [-p port] [-l user] [-i keyfile] [-g WxH[xBITS]] [-f size]
+        [-t theme] [user@]host[:port] [command]
 
 * `-g` (or `SET FLT_VIDEO=WxH`): the VESA mode. The default is 1024x768,
   32-bit if there is one, else 16-bit; otherwise the largest mode of
@@ -52,8 +52,26 @@ Options
 * `-i`: the private key. Otherwise `~/.ssh/config`'s IdentityFile, then
   the usual `~/.ssh/id_ed25519`, `id_rsa`, ... `~` is `%HOME%`, `C:\HOME` if
   not set (as vmdos's SSH); `known_hosts` is there too.
+* `-4` / `-6`: IPv4 or IPv6 only (as `ssh -4` / `-6`). Otherwise the
+  resolver's order: IPv6 first only if this PC has a global address, so a
+  host with both is reached over IPv4 when vmdos has just a ULA.
+* `-t` (or `SET FLT_THEME=`): a theme, by name (or its start) or number.
 * Shift+PgUp/PgDn/Home/End scroll back (images too); any other key goes
   back.
+
+Mouse (a DOS mouse driver, e.g. CTMOUSE, or vmdos's):
+
+* Left-drag selects and copies on release; middle-click or Shift+Insert
+  pastes (FLT's own clipboard; bracketed paste if the program asked).
+* When a program asks for the mouse (vim `set mouse=a`, htop, mc), clicks
+  go to it; hold Shift to select instead.
+* Right-click: a menu with Copy, Paste, Themes and Resolution. Resolution
+  lists the VESA modes and switches at once (the PTY is resized). Esc
+  closes it.
+
+The theme and mode chosen are kept in `%HOME%\FLT.CFG` (`theme=`, `mode=WxHxBITS`);
+`-g`/`FLT_VIDEO` and `-t`/`FLT_THEME` override it. `SET FLT_LOG=file` writes
+a debug log.
 
 TERM is `xterm-256color`. `timg -pk` draws with kitty graphics and
 `timg -ps` with sixel; timg reads the cell size from the pixel size FLT

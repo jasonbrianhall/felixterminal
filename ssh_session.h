@@ -45,6 +45,7 @@
 struct SshConfig {
     std::string host;           // real host to connect to (after ~/.ssh/config HostName)
     int         port        = 22;
+    int         family      = 0;  // 0: IPv4 or IPv6 (the resolver's order), 4 or 6 only (ssh -4 / -6)
     std::string user;
     std::string alias;          // name as typed when ~/.ssh/config HostName replaced it ("" otherwise)
     // Authentication: tried in order —

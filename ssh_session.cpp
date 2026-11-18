@@ -88,12 +88,12 @@ static std::string last_ssh2_error(const char *context) {
 
 // Resolve hostname and open a non-blocking TCP socket.
 // Returns a valid socket fd or -1 on failure.
-static int tcp_connect(const std::string &host, int port) {
+static int tcp_connect(const std::string &host, int port, int family = 0) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
     struct addrinfo hints = {}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
+    hints.ai_family   = family == 4 ? AF_INET : family == 6 ? AF_INET6 : AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0) {
@@ -983,7 +983,7 @@ bool ssh_connect(const SshConfig &cfg, Terminal *t) {
     }
 
     // TCP connection
-    s_sock = tcp_connect(cfg.host, cfg.port);
+    s_sock = tcp_connect(cfg.host, cfg.port, cfg.family);
     if (s_sock < 0) return false;
 
     // Create session (non-blocking)
