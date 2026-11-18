@@ -25,7 +25,11 @@
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#if defined(__DJGPP__)
+#  include <pwd.h>      // MS-DOS (msdos/): no Unix sockets, no X11
+#  include <tcp.h>      // close_s, ioctlsocket: vmdos's sockets (msdos/README.md)
+#  include <sys/ioctl.h> // FIONBIO
+#elif !defined(_WIN32)
 #  include <sys/un.h>
 #  include <pwd.h>
 #else
@@ -105,7 +109,9 @@ static int tcp_connect(const std::string &host, int port) {
         if (connect(fd, r->ai_addr, (int)r->ai_addrlen) == 0)
             break;
 
-#ifndef _WIN32
+#if defined(__DJGPP__)
+        close_s(fd);
+#elif !defined(_WIN32)
         close(fd);
 #else
         closesocket(fd);
@@ -120,7 +126,10 @@ static int tcp_connect(const std::string &host, int port) {
     }
 
     // Set non-blocking
-#ifndef _WIN32
+#if defined(__DJGPP__)
+    int nb = 1;
+    ioctlsocket(fd, FIONBIO, (char *)&nb);
+#elif !defined(_WIN32)
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 #else
@@ -763,7 +772,7 @@ static bool verify_host_key(const SshConfig &cfg) {
     return trusted;
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__DJGPP__)
 // ============================================================================
 // X11 FORWARDING — always requested; forwards the remote DISPLAY back to the
 // local X server, substituting libssh2's fake auth cookie with the real
@@ -1127,7 +1136,7 @@ bool ssh_connect(const SshConfig &cfg, Terminal *t) {
     }
 
     // Open channel
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__DJGPP__)
     if (cfg.x11_forward)
         libssh2_session_callback_set(s_session, LIBSSH2_CALLBACK_X11, (void *)x11_open_callback);
 #endif
@@ -1158,7 +1167,7 @@ bool ssh_connect(const SshConfig &cfg, Terminal *t) {
         SDL_Log("%s (continuing without PTY)\n", last_ssh2_error("pty request failed").c_str());
 
     // X11 forwarding. Non-fatal if the server refuses it.
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__DJGPP__)
     if (cfg.x11_forward) {
         while ((rc = libssh2_channel_x11_req_ex(s_channel, 0, nullptr, nullptr, 0)) ==
                LIBSSH2_ERROR_EAGAIN)
@@ -1328,7 +1337,9 @@ void ssh_disconnect() {
         s_session = nullptr;
     }
     if (s_sock >= 0) {
-#ifndef _WIN32
+#if defined(__DJGPP__)
+        close_s(s_sock);
+#elif !defined(_WIN32)
         close(s_sock);
 #else
         closesocket(s_sock);

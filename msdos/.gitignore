@@ -1,0 +1,5 @@
+build/
+deps/
+build-djgpp/
+FLT.EXE
+*.exe
