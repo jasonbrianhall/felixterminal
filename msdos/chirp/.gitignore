@@ -1,0 +1,13 @@
+# (the top .gitignore allows only some file types)
+!.gitignore
+!*.c
+!*.sh
+!SOURCES
+!README.chirp
+!*.EXE
+!*.doc
+!*.CWS
+!*.txt
+build/
+deps/
+/CHIRP.EXE

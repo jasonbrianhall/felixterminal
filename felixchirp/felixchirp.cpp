@@ -819,6 +819,14 @@ void iv_enter_selected() {
             iv_refresh();
             return;
         }
+#ifdef __DJGPP__
+        // DOS: "D:" in a drive root's listing (iv_list_local) is that drive
+        if (!g_iv.remote && iv_is_drive_name(e.name)) {
+            snprintf(g_iv.path, sizeof(g_iv.path), "%c:\\", toupper((unsigned char)e.name[0]));
+            iv_refresh();
+            return;
+        }
+#endif
         // Navigate into directory
         char newpath[4096];
         if (strcmp(e.name, "..") == 0) {
@@ -833,6 +841,10 @@ void iv_enter_selected() {
                 if (!slash) slash = strrchr(tmp, '/');
                 if (slash && slash != tmp) { *slash = '\0'; }
                 else { tmp[0]='\\'; tmp[1]='\0'; }
+#ifdef __DJGPP__
+                // "C:\GAMES" -> "C:", which DOS takes as C:'s current folder: the root, "C:\"
+                if (tmp[0] && tmp[1] == ':' && !tmp[2]) { tmp[2] = '\\'; tmp[3] = '\0'; }
+#endif
             }
             strncpy(g_iv.path, tmp, sizeof(g_iv.path)-1);
         } else {
