@@ -1,0 +1,18 @@
+SDL3 with its DOS port (VESA, Sound Blaster, keyboard, mouse), for FLT.EXE
+(../Makefile) and CHIRP.EXE (../chirp/Makefile): exact copies of the files of
+github.com/jasonbrianhall/SDLPoPDOS (main, commit d1ef79a) that its DOS build
+compiles into libSDL3.a, from its msdos/ folder. Nothing here needs an
+SDLPoPDOS checkout; the build uses these files only.
+
+  SDL3/          SDL3 3.5.0 (libsdl.org, commit 4ca1b1c, zlib license:
+                 SDL3/LICENSE.txt): the 206 sources in SOURCES, the headers
+                 they use, and the public headers (SDL3/include/SDL3)
+  sdl3-config/   SDLPoPDOS's generated SDL_build_config.h and SDL_revision.h
+  sdl3.mk        the rules both Makefiles include: SOURCES compiled with
+                 SDLPoPDOS's SDL_CFLAGS into build/libSDL3.a
+
+SOURCES is SDLPoPDOS's SDL_SRCS. The rest of SDL's tree (other platforms,
+tests) is left out. To update: copy the same files from a newer SDLPoPDOS
+msdos/ over these (and its SDL_SRCS into SOURCES), and change the commit
+above. ../chirp/cwsdpmi has CWSDPMI r7's stub (CWSDSTUB.EXE), its
+documentation and license, from SDLPoPDOS's msdos/cwsdpmi.
