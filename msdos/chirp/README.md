@@ -17,6 +17,10 @@ What it reads
 
 * Pictures: JPEG, PNG, BMP, GIF, WebP (stb_image, libwebp). Zoom with + and - (or the
   wheel, where the mouse driver has one), drag to pan, R rotates, 0 resets, L runs a slideshow.
+  A picture over 2048 pixels on its long side is shown from a smaller copy;
+  zoomed in past that, the whole picture is decoded ("Loading full detail")
+  and the part on screen drawn from it, every pixel there. Its memory goes
+  back when the zoom returns to the whole picture, or another opens.
 * Music: MP3, OGG Vorbis, FLAC, WAV, AIFF, VOC, MIDI (played on
   felixterminal's own OPL3 FM synth), and tracker modules: MOD, XM, IT,
   S3M, 669, MED, MTM and the rest libxmp knows. Opus isn't in the DOS build.

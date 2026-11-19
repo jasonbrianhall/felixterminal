@@ -79,7 +79,7 @@ bool iv_keydown(SDL_Keycode sym) {
             if (sym == SDLK_MINUS || sym == SDLK_KP_MINUS)                     zf = 1.f / 1.25f;
             if (zf != 0.f) {
                 float old_zoom = g_iv.zoom;
-                g_iv.zoom = std::max(0.1f, std::min(g_iv.zoom * zf, 16.0f));
+                g_iv.zoom = std::max(0.1f, std::min(g_iv.zoom * zf, iv_max_zoom()));
                 if (g_iv.zoom > 0.97f && g_iv.zoom < 1.03f) g_iv.zoom = 1.0f;   // (back to a whole picture exactly)
                 float r = g_iv.zoom / old_zoom;
                 g_iv.pan_x *= r;
@@ -502,7 +502,7 @@ bool iv_mousewheel(int x, int y, int delta_y, int win_w, int win_h) {
 
     float old_zoom = g_iv.zoom;
     float factor   = (delta_y > 0) ? 1.15f : (1.0f / 1.15f);
-    g_iv.zoom = std::max(0.1f, std::min(g_iv.zoom * factor, 16.0f));
+    g_iv.zoom = std::max(0.1f, std::min(g_iv.zoom * factor, iv_max_zoom()));
 
     // Zoom towards cursor: adjust pan so the point under cursor stays fixed.
     float cx = ix + iw * 0.5f;
