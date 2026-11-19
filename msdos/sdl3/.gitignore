@@ -1,0 +1,7 @@
+# (the top .gitignore allows only some file types)
+!.gitignore
+!*.c
+!*.txt
+!SOURCES
+!README.sdl3
+!sdl3.mk

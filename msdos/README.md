@@ -19,7 +19,7 @@ sockets; no X11 forwarding). What's DOS-specific is in this folder:
 
 * `flt_dos.cpp`, the front end in place of `felixterminal.cpp`,
   `term_ui.cpp`, `ft_font.cpp` and the GL renderer. The screen is a VESA
-  mode through SDL3's DOS port (from SDLPoPDOS), fullscreen. The text is
+  mode through SDL3's DOS port (in `sdl3/`), fullscreen. The text is
   drawn with FreeType and the embedded DejaVu Sans Mono (bold and oblique
   too, FreeMono for symbols it lacks) into a buffer in memory, only the rows
   the terminal marks dirty, and block elements (half blocks, quadrants) as
@@ -28,6 +28,14 @@ sockets; no X11 forwarding). What's DOS-specific is in this folder:
   SDL's software renderer. Keys are turned into what `handle_key()` sends.
   `ssh_connect()` runs on the one thread there is; its host key and
   password questions are asked in the terminal.
+* `fonts-dos.py`: the fonts (`../DejaVuMono.h` and the rest) decoded from
+  their base64 at build time and linked in as TTF bytes, which FreeType reads
+  in place: no decoded copy of them (2 MB) on the heap. The text layer is
+  drawn straight into its SDL texture, for the same reason: DJGPP never
+  gives freed memory back to DOS, so what's allocated once stays. (The
+  scrollback is kept compact by `terminal.cpp` on every system: a few bytes
+  a line instead of the screen's width of cells, about 0.6 MB for 5000
+  lines.)
 * `include/GL/glew.h`: stand-ins for the OpenGL names in the sixel and kitty
   files. Their OpenGL code never runs on DOS (`g_use_sdl_renderer` is true).
 * `include/SDL2/SDL.h`: the SDL2 calls those files make, on SDL3.
@@ -84,10 +92,8 @@ Building
     make            # the libraries the first time (a while: OpenSSL), then FLT.EXE
     make dist       # build/dist/FLT: FLT.EXE and README.TXT
 
-It needs checkouts of [vmdos](https://github.com/jasonbrianhall/vmdos) and
-[SDLPoPDOS](https://github.com/jasonbrianhall/SDLPoPDOS) next to this one
-(`../../vmdos`, `../../SDLPoPDOS/msdos` from here; or `VMDOS=dir`,
-`SDLDOS=dir`), and either:
+It needs a checkout of [vmdos](https://github.com/jasonbrianhall/vmdos) next
+to this one (`../../vmdos` from here, or `VMDOS=dir`), and either:
 
 * a DJGPP cross compiler: `sh build-djgpp.sh` builds the one FLT.EXE is
   made and tested with (gcc 14.2.0, binutils 2.42, DJGPP's library from
@@ -98,16 +104,22 @@ It needs checkouts of [vmdos](https://github.com/jasonbrianhall/vmdos) and
 * Docker, used when there is no DJGPP compiler (`DOCKER=1` forces it,
   `DOCKER=0` forbids it): the `Dockerfile` here adds git, perl, python3, a
   host gcc and upx to the `djfdyuruiry/djgpp` image SDLPoPDOS builds with,
-  as `felixterminal-djgpp`, and the build runs in it with this tree, vmdos
-  and SDLPoPDOS mounted.
+  as `felixterminal-djgpp`, and the build runs in it with this tree and
+  vmdos mounted.
 
 `make deps` (which `make` runs the first time) is `build-deps.sh`: it builds,
 into `deps/`, at pinned versions: zlib, libpng,
 FreeType, OpenSSL (vmdos's `tools/build-openssl.sh`), libssh2 1.11.1
 (`libssh2-dos.py`: non-blocking sockets by vmdos's `ioctlsocket()`;
-`libssh2_config.h`), SDL3 (SDLPoPDOS's build of its DOS port) and vmdos's
-sockets (`third_party/openssh/dos-sock.c`, `third_party/openssl/ossl-dos.c`:
+`libssh2_config.h`) and vmdos's sockets (`third_party/openssh/dos-sock.c`, `third_party/openssl/ossl-dos.c`:
 TCP and DNS through vmdos, `send`/`recv`/`select`, `getentropy`, the clock).
 Watt-32's headers are used for the socket declarations; none of its code is
 linked. With `upx` there, the EXE is packed (8 MB to 4 MB). `make distclean`
 removes the libraries too.
+
+SDL3 with its DOS port (VESA, keyboard, mouse) is checked in, in `sdl3/`:
+exact copies of the files SDLPoPDOS's DOS build compiles, taken from
+[SDLPoPDOS](https://github.com/jasonbrianhall/SDLPoPDOS) (`sdl3/README.sdl3`
+says which commit and how to update them). `make` compiles them into
+`build/libSDL3.a` (`sdl3/sdl3.mk`, which CHIRP's build uses too); no
+SDLPoPDOS checkout is needed.

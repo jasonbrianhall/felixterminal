@@ -2,7 +2,7 @@
 # Build the libraries Felix Chirp for DOS (CHIRP.EXE) links with, for DJGPP,
 # into msdos/chirp/deps (or DEPS=dir): FreeType, libwebp (decoder), libxmp
 # (tracker music), and the single-file decoders dr_mp3, dr_flac, dr_wav
-# (dr_libs) and stb_vorbis. Run once (`make` does); SDL3 is in sdl3/ and the
+# (dr_libs) and stb_vorbis. Run once (`make` does); SDL3 is in ../sdl3/ and the
 # Makefile compiles it.
 #
 # Needs:

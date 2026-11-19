@@ -78,7 +78,7 @@ It is felixterminal's `felixchirp/`, compiled as it is (with
 with what it takes from the rest of Felix Terminal supplied here:
 
 * `chirp_dos.cpp`: the front end. A VESA mode through SDL3's DOS port
-  (`sdl3/`), SDL's software renderer; `draw_rect` and `draw_text`
+  (`../sdl3/`), SDL's software renderer; `draw_rect` and `draw_text`
   (FreeType, the embedded DejaVu Sans Mono and Noto Emoji); the text
   viewer's `glBegin`/`glEnd`; `mkstemps`/`mkstemp` for `%TEMP%`. DOS's
   threads are cooperative, so the main loop waits a little after every
@@ -88,8 +88,8 @@ with what it takes from the rest of Felix Terminal supplied here:
   felixterminal's `midi_render.cpp` (OPL3) and `aiff_render.cpp`.
 * `aes_dos.c`: AES decryption for encrypted .kfn files (OpenSSL's
   `AES_decrypt` interface), so no OpenSSL.
-* `sdl3/`, `cwsdpmi/`: SDL3 with its DOS port, and CWSDPMI's stub,
-  copied from SDLPoPDOS unchanged (`sdl3/README.chirp`).
+* `../sdl3/` (shared with FLT), `cwsdpmi/`: SDL3 with its DOS port, and
+  CWSDPMI's stub, copied from SDLPoPDOS unchanged (`../sdl3/README.sdl3`).
 * `include/`: SDL2 names on SDL3 (`SDL2/SDL.h`, `SDL2/SDL_mixer.h`), and
   stand-ins for OpenGL, libssh2 and `openssl/aes.h`.
 * `chirp_compat.h`: forced into every file; FLT's `dos_compat.h` and what
@@ -113,7 +113,7 @@ It needs make and git, and either:
 `make deps` is `build-deps.sh`: it
 builds, into `deps/`, FreeType 2.13.3, libwebp 1.5.0 (the decoder) and
 libxmp 4.6.3, and fetches dr_libs and stb at pinned commits. SDL3 with its
-DOS port is in `sdl3/` (exact copies of SDLPoPDOS's, with CWSDPMI's stub in
-`cwsdpmi/`: `sdl3/README.chirp`), and `make` compiles it. With
+DOS port is in `../sdl3/` (exact copies of SDLPoPDOS's, with CWSDPMI's stub
+in `cwsdpmi/`: `../sdl3/README.sdl3`), and `make` compiles it. With
 `upx` there, the EXE is packed (6 MB to 3 MB). Unlike FLT there's no
 OpenSSL, libssh2 or vmdos sockets, so no perl or host gcc is needed.

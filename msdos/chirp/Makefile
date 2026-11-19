@@ -13,8 +13,8 @@
 # /usr/local/djgpp; ../build-djgpp.sh builds one); or, when there is none,
 # Docker, with FLT's image (../Dockerfile: djfdyuruiry/djgpp plus git and
 # upx). Force either with DOCKER=1 / DOCKER=0. Plus make and git. SDL3 with
-# its DOS port is in sdl3/, CWSDPMI's stub in cwsdpmi/ (see
-# sdl3/README.chirp). With upx there, the EXE is packed; CWSDPMI's stub in
+# its DOS port is in ../sdl3/ (shared with FLT), CWSDPMI's stub in cwsdpmi/
+# (see ../sdl3/README.sdl3). With upx there, the EXE is packed; CWSDPMI's stub in
 # front gives it a DPMI host of its own on plain DOS (vmdos has one).
 #
 # CHIRP.EXE runs under vmdos (github.com/jasonbrianhall/vmdos) or any DOS
@@ -72,7 +72,7 @@ CXX      = $(CROSS)g++
 CC       = $(CROSS)gcc
 UPX     ?= $(shell PATH="$(PATH)" command -v upx 2>/dev/null)
 
-COMMON   = -O2 -march=i586 -Iinclude -I$(TOP) -I$(DEPS)/include -I$(DEPS)/include/freetype2 -Isdl3/SDL3/include
+COMMON   = -O2 -march=i586 -Iinclude -I$(TOP) -I$(DEPS)/include -I$(DEPS)/include/freetype2 $(SDL3_INCLUDE)
 CXXFLAGS = $(COMMON) -std=gnu++17 -Wno-write-strings -Wno-deprecated-declarations -Wno-format-truncation \
            -include chirp_compat.h -DUSESSH
 CFLAGS   = $(COMMON) -w
@@ -88,26 +88,12 @@ OBJS     = $(BUILD)/chirp_dos.o $(BUILD)/mixer_dos.o $(BUILD)/aes_dos.o $(BUILD)
 STAMP    = $(DEPS)/.built
 HDRS     = $(wildcard include/*.h include/*/*.h) $(TOP)/felixchirp/felixchirp.h
 
+# SDL3 with its DOS port: ../sdl3 (SDLPoPDOS's, see ../sdl3/README.sdl3)
+include ../sdl3/sdl3.mk
+
 $(STAMP):
 	DEPS=$(abspath $(DEPS)) sh build-deps.sh
 deps: $(STAMP) $(SDL3_LIB)
-
-# SDL3 with its DOS port (sdl3/: SDLPoPDOS's, see sdl3/README.chirp),
-# compiled as SDLPoPDOS compiles it
-SDL_SRCS   := $(shell cat sdl3/SOURCES)
-SDL_CFLAGS  = -O2 -DNDEBUG -fno-strict-aliasing -w \
-              -DSDL_BUILD_MAJOR_VERSION=3 -DSDL_BUILD_MINOR_VERSION=5 -DSDL_BUILD_MICRO_VERSION=0 \
-              -DSDL_STATIC_LIB -DUSING_GENERATED_CONFIG_H \
-              -Isdl3/sdl3-config/build_config -Isdl3/sdl3-config -Isdl3/SDL3/include -Isdl3/SDL3/src \
-              -idirafter sdl3/SDL3/src/video/khronos
-SDL_OBJS   := $(SDL_SRCS:src/%.c=$(BUILD)/sdl/%.o)
-SDL3_LIB   := $(BUILD)/libSDL3.a
-$(BUILD)/sdl/%.o: sdl3/SDL3/src/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(SDL_CFLAGS) -c $< -o $@
-$(SDL3_LIB): $(SDL_OBJS)
-	rm -f $@
-	$(CROSS)ar rcs $@ $(SDL_OBJS)
 
 CHIRP.EXE: $(OBJS) $(SDL3_LIB)
 	$(CXX) -s -Wl,--wrap=uclock $(OBJS) $(LIBS) -o $(BUILD)/chirp.exe

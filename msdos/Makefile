@@ -2,7 +2,9 @@
 #
 #   make            FLT.EXE, building the libraries first if they aren't
 #                   there yet (deps/: zlib, libpng, FreeType, OpenSSL,
-#                   libssh2, SDL3, vmdos's sockets; see build-deps.sh)
+#                   libssh2, vmdos's sockets; see build-deps.sh). SDL3 with
+#                   its DOS port is in sdl3/ (from SDLPoPDOS, checked in:
+#                   sdl3/README.sdl3) and is compiled with the program.
 #   make deps       just the libraries
 #   make dist       build/dist/FLT: FLT.EXE and README.TXT, for a DOS disk
 #   make clean      the program's objects and FLT.EXE
@@ -12,16 +14,14 @@
 # built and tested with comes from `sh build-djgpp.sh` (gcc 14.2.0; into
 # ~/djgpp, found there), or any on the PATH or DJGPP=dir; or Docker, which gets the djfdyuruiry/djgpp
 # image instead (with git, python3, perl, a host gcc and upx added on top:
-# Dockerfile). Force either with DOCKER=1 / DOCKER=0. Plus make, and
-# checkouts of vmdos and SDLPoPDOS next to this one (or VMDOS=dir,
-# SDLDOS=dir): vmdos's OpenSSL build and sockets, SDLPoPDOS's SDL3 with its
-# DOS port.
+# Dockerfile). Force either with DOCKER=1 / DOCKER=0. Plus make, and a
+# checkout of vmdos next to this one (or VMDOS=dir): its OpenSSL build and
+# sockets.
 #
 # FLT.EXE runs under vmdos (github.com/jasonbrianhall/vmdos), on its TCP/IP.
 # See README.md.
 
 VMDOS   ?= ../../vmdos
-SDLDOS  ?= ../../SDLPoPDOS/msdos
 DEPS    ?= deps
 BUILD   := build
 TOP     := ..
@@ -51,11 +51,11 @@ all: FLT.EXE
 
 ifeq ($(DOCKER),1)
 # ---------------------------------------------------------------- Docker
-# The felixterminal tree, vmdos and SDLPoPDOS are mounted; everything that
+# The felixterminal tree and vmdos are mounted; everything that
 # needs the compiler runs in the container, as make DOCKER=0 there. HOME is
 # somewhere writable for git.
 RUN = docker run --rm \
-        -v $(abspath $(TOP)):/src:z -v $(abspath $(VMDOS)):/vmdos:z -v $(abspath $(SDLDOS)):/sdldos:z \
+        -v $(abspath $(TOP)):/src:z -v $(abspath $(VMDOS)):/vmdos:z \
         -w /src/msdos -u $(USER_ID):$(GROUP_ID) -e HOME=/tmp \
         $(DJGPP_IMAGE) /bin/sh -c
 
@@ -64,10 +64,10 @@ docker-image:
 	docker build -t $(DJGPP_IMAGE) .
 
 deps: | docker-image
-	$(RUN) "make DOCKER=0 VMDOS=/vmdos SDLDOS=/sdldos DEPS=$(DEPS) deps"
+	$(RUN) "make DOCKER=0 VMDOS=/vmdos DEPS=$(DEPS) deps"
 
 FLT.EXE: FORCE | docker-image
-	$(RUN) "make DOCKER=0 VMDOS=/vmdos SDLDOS=/sdldos DEPS=$(DEPS) FLT.EXE"
+	$(RUN) "make DOCKER=0 VMDOS=/vmdos DEPS=$(DEPS) FLT.EXE"
 
 FORCE:
 .PHONY: docker-image FORCE
@@ -78,23 +78,29 @@ CXX      = $(CROSS)g++
 UPX     ?= $(shell PATH="$(PATH)" command -v upx 2>/dev/null)
 
 CXXFLAGS = -O2 -march=i586 -std=gnu++17 -Wno-write-strings -Wno-deprecated-declarations \
-           -include dos_compat.h -Iinclude -I$(TOP) -I$(DEPS)/include -I$(DEPS)/include/freetype2 -DUSESSH
+           -include dos_compat.h -Iinclude -I$(TOP) -I$(DEPS)/include -I$(DEPS)/include/freetype2 $(SDL3_INCLUDE) -DUSESSH
 # ssh_session.cpp: sockets by Watt-32's headers (vmdos's sockets underneath)
 SSH_CXXFLAGS = -DWATT32 -DWATT32_NO_OLDIES -I$(DEPS)/src/Watt-32/inc
-LIBS     = -L$(DEPS)/lib -lssh2 -lssl -lcrypto -lvmdosnet -lpng -lfreetype -lz -lSDL3 -lm
+LIBS     = -L$(DEPS)/lib -lssh2 -lssl -lcrypto -lvmdosnet -lpng -lfreetype -lz $(SDL3_LIB) -lm
 
 # felixterminal's own files, unchanged but for a few #ifdef __DJGPP__ in
 # ssh_session.cpp; flt_dos.cpp is the DOS front end.
 SHARED   = terminal term_color sixel_graphics kitty_graphics ssh_session
-OBJS     = $(BUILD)/flt_dos.o $(SHARED:%=$(BUILD)/%.o)
+OBJS     = $(BUILD)/flt_dos.o $(BUILD)/fonts.o $(SHARED:%=$(BUILD)/%.o)
+# The fonts flt_dos.cpp uses, from felixterminal's headers, decoded from
+# base64 and linked in as they are (fonts-dos.py)
+FONTS    = DejaVuMono DejaVuMonoBold DejaVuMonoOblique DejaVuMonoBoldOblique FreeMono
 STAMP    = $(DEPS)/.built
 
 # The libraries: once (build-deps.sh leaves $(STAMP) when it's done).
-$(STAMP):
-	VMDOS=$(abspath $(VMDOS)) SDLDOS=$(abspath $(SDLDOS)) DEPS=$(abspath $(DEPS)) sh build-deps.sh
-deps: $(STAMP)
+# SDL3 with its DOS port: sdl3/ (SDLPoPDOS's, see sdl3/README.sdl3)
+include sdl3/sdl3.mk
 
-FLT.EXE: $(OBJS)
+$(STAMP):
+	VMDOS=$(abspath $(VMDOS)) DEPS=$(abspath $(DEPS)) sh build-deps.sh
+deps: $(STAMP) $(SDL3_LIB)
+
+FLT.EXE: $(OBJS) $(SDL3_LIB)
 	$(CXX) -s $(OBJS) $(LIBS) -o $(BUILD)/flt.exe
 	rm -f $@
 	$(if $(UPX),$(UPX) -q --best -o $@ $(BUILD)/flt.exe > /dev/null,cp $(BUILD)/flt.exe $@)
@@ -103,6 +109,9 @@ FLT.EXE: $(OBJS)
 $(OBJS): $(STAMP) dos_compat.h include/GL/glew.h include/SDL2/SDL.h | $(BUILD)
 $(BUILD)/flt_dos.o: flt_dos.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/fonts.o: fonts-dos.py $(FONTS:%=$(TOP)/%.h) | $(BUILD)
+	python3 fonts-dos.py $(BUILD)/fonts $(FONTS:%=$(TOP)/%.h)
+	$(CXX) -c -Wa,-I$(BUILD)/fonts $(BUILD)/fonts/fonts.S -o $@
 $(BUILD)/ssh_session.o: $(TOP)/ssh_session.cpp
 	$(CXX) $(CXXFLAGS) $(SSH_CXXFLAGS) -c $< -o $@
 $(BUILD)/%.o: $(TOP)/%.cpp

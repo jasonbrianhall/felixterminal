@@ -45,35 +45,159 @@ static const uint32_t DEC_LINE_DRAWING[] = {
 // SCROLLBACK
 // ============================================================================
 
-static void sb_push(Terminal *t, int row) {
-    //SDL_Log("[Scroll] sb_push called: sb_buf=%p sb_cap=%d scroll_top=%d scroll_bot=%d rows=%d\n", (void*)t->sb_buf, t->sb_cap, t->scroll_top, t->scroll_bot, t->rows);
-    if (!t->sb_buf || t->sb_cap == 0) return;
-    if (t->scroll_top != 0 || t->scroll_bot != t->rows - 1) return;
-    int slot = (t->sb_head + t->sb_count) % t->sb_cap;
-    Cell *sb_row_ptr = t->sb_buf + slot * t->sb_cols;
-    
-    // Copy current row data (up to min of display width and scrollback width)
-    int copy_cols = (t->cols < t->sb_cols) ? t->cols : t->sb_cols;
-    memcpy(sb_row_ptr, &CELL(t, row, 0), sizeof(Cell) * copy_cols);
-    
-    // If scrollback is wider than display, pad the rest with blanks
-    if (t->sb_cols > t->cols) {
-        for (int c = t->cols; c < t->sb_cols; c++)
-            sb_row_ptr[c] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
+// Each line that scrolls off is kept as a few bytes rather than as cells
+// (20 bytes each, the screen's width of them: 2 KB a line at 100 columns,
+// mostly blanks). A line is runs of cells with the same colors and
+// attributes:
+//   varint  the run's length in cells
+//   byte    which of fg, bg, attrs, flags (_pad), ul_color differ from the
+//           run before (bits 0-4); at the start the "before" is the blank
+//   varint  each of those, in that order
+//   varint  each cell's code point
+// The blanks at the end aren't stored; sb_row() puts them back. Images
+// (sixel, kitty) aren't in the cells: they keep their own placements.
+
+static const Cell SB_BLANK = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
+
+static inline uint32_t sb_flags(const Cell &c) {
+    return (uint32_t)c._pad[0] | (uint32_t)c._pad[1] << 8 | (uint32_t)c._pad[2] << 16;
+}
+static inline bool sb_same_look(const Cell &a, const Cell &b) {
+    return a.fg == b.fg && a.bg == b.bg && a.attrs == b.attrs &&
+           sb_flags(a) == sb_flags(b) && a.ul_color == b.ul_color;
+}
+static inline bool sb_is_blank(const Cell &c) { return c.cp == ' ' && sb_same_look(c, SB_BLANK); }
+
+static inline uint8_t *sb_put(uint8_t *p, uint32_t v) {
+    while (v >= 0x80) { *p++ = (uint8_t)(v | 0x80); v >>= 7; }
+    *p++ = (uint8_t)v;
+    return p;
+}
+static inline uint32_t sb_get(const uint8_t *&p, const uint8_t *end) {
+    uint32_t v = 0;
+    for (int shift = 0; p < end && shift < 35; shift += 7) {
+        uint8_t b = *p++;
+        v |= (uint32_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
     }
-    
+    return v;
+}
+
+// Worst case: every cell a run of its own, every field changed.
+#define SB_MAX_CELL_BYTES (5 + 1 + 5 * 5 + 5)
+
+static uint32_t sb_encode(const Cell *cells, int n, uint8_t *out) {
+    while (n > 0 && sb_is_blank(cells[n - 1])) n--;
+    uint8_t *p = out;
+    Cell prev = SB_BLANK;
+    for (int i = 0; i < n; ) {
+        int j = i + 1;
+        while (j < n && sb_same_look(cells[j], cells[i])) j++;
+        const Cell &c = cells[i];
+        uint8_t mask = (c.fg != prev.fg ? 1 : 0) | (c.bg != prev.bg ? 2 : 0) |
+                       (c.attrs != prev.attrs ? 4 : 0) | (sb_flags(c) != sb_flags(prev) ? 8 : 0) |
+                       (c.ul_color != prev.ul_color ? 16 : 0);
+        p = sb_put(p, (uint32_t)(j - i));
+        *p++ = mask;
+        if (mask & 1)  p = sb_put(p, c.fg);
+        if (mask & 2)  p = sb_put(p, c.bg);
+        if (mask & 4)  p = sb_put(p, c.attrs);
+        if (mask & 8)  p = sb_put(p, sb_flags(c));
+        if (mask & 16) p = sb_put(p, c.ul_color);
+        for (int k = i; k < j; k++) p = sb_put(p, cells[k].cp);
+        prev = c;
+        i = j;
+    }
+    return (uint32_t)(p - out);
+}
+
+static void sb_decode(const SbLine &line, Cell *row, int cols) {
+    const uint8_t *p = line.data, *end = line.data + line.len;
+    Cell look = SB_BLANK;
+    int col = 0;
+    while (p && p < end && col < cols) {
+        uint32_t n = sb_get(p, end);
+        if (p >= end) break;
+        uint8_t mask = *p++;
+        if (mask & 1)  look.fg = sb_get(p, end);
+        if (mask & 2)  look.bg = sb_get(p, end);
+        if (mask & 4)  look.attrs = (uint8_t)sb_get(p, end);
+        if (mask & 8)  { uint32_t f = sb_get(p, end); look._pad[0] = (uint8_t)f; look._pad[1] = (uint8_t)(f >> 8); look._pad[2] = (uint8_t)(f >> 16); }
+        if (mask & 16) look.ul_color = sb_get(p, end);
+        for (uint32_t k = 0; k < n && p < end; k++) {
+            look.cp = sb_get(p, end);
+            if (col < cols) row[col++] = look;
+        }
+    }
+    while (col < cols) row[col++] = SB_BLANK;
+}
+
+static void sb_free_lines(Terminal *t) {
+    if (t->sb_lines)
+        for (int i = 0; i < t->sb_cap; i++) { free(t->sb_lines[i].data); t->sb_lines[i] = {nullptr, 0}; }
+}
+
+static void sb_push(Terminal *t, int row) {
+    if (t->sb_cap == 0) return;
+    if (t->scroll_top != 0 || t->scroll_bot != t->rows - 1) return;
+    if (!t->sb_lines) {
+        t->sb_lines = (SbLine*)calloc((size_t)t->sb_cap, sizeof(SbLine));
+        if (!t->sb_lines) return;
+    }
+    if (t->sb_cols < t->cols) t->sb_cols = t->cols;
+
+    uint8_t buf[TERM_MAX_COLS * SB_MAX_CELL_BYTES];   // (18 KB, on the stack: terminals may be fed from other threads)
+    int n = t->cols < TERM_MAX_COLS ? t->cols : TERM_MAX_COLS;
+    uint32_t len = sb_encode(&CELL(t, row, 0), n, buf);
+
+    int slot = (t->sb_head + t->sb_count) % t->sb_cap;
+    SbLine &line = t->sb_lines[slot];          // (when full: the oldest line, now dropped)
+    if (len == 0) {
+        free(line.data);
+        line = {nullptr, 0};
+    } else {
+        uint8_t *d = (uint8_t*)realloc(line.data, len);
+        if (!d) { free(line.data); line = {nullptr, 0}; }
+        else { memcpy(d, buf, len); line = {d, len}; }
+    }
+
     if (t->sb_count < t->sb_cap) {
         t->sb_count++;
     } else {
         t->sb_head = (t->sb_head + 1) % t->sb_cap;
     }
-    //if (t->sb_count <= 5 || t->sb_count % 50 == 0)
-        //SDL_Log("[Scroll] sb_push: sb_count now %d\n", t->sb_count);
+    t->sb_total++;
 }
 
+// Scrollback line idx (0 = the oldest) as cells, sb_cols of them. The row
+// is the cache's: good until about two screens' worth of other lines have
+// been asked for.
 Cell* sb_row(Terminal *t, int idx) {
-    int slot = (t->sb_head + idx) % t->sb_cap;
-    return t->sb_buf + slot * t->sb_cols;
+    int want_n = 2 * t->rows + 16;
+    if (!t->sb_cache || t->sb_cache_cols != t->sb_cols || t->sb_cache_n < want_n) {
+        free(t->sb_cache);
+        free(t->sb_cache_line);
+        t->sb_cache_n = want_n;
+        t->sb_cache_cols = t->sb_cols;
+        t->sb_cache = (Cell*)malloc(sizeof(Cell) * (size_t)t->sb_cache_n * t->sb_cache_cols);
+        t->sb_cache_line = (long long*)malloc(sizeof(long long) * t->sb_cache_n);
+        if (!t->sb_cache || !t->sb_cache_line) {
+            free(t->sb_cache); free(t->sb_cache_line);
+            t->sb_cache = nullptr; t->sb_cache_line = nullptr; t->sb_cache_n = 0;
+            static Cell blank_row[TERM_MAX_COLS];
+            for (int c = 0; c < TERM_MAX_COLS; c++) blank_row[c] = SB_BLANK;
+            return blank_row;
+        }
+        for (int i = 0; i < t->sb_cache_n; i++) t->sb_cache_line[i] = -1;
+    }
+    long long line = t->sb_total - t->sb_count + idx;
+    int c = (int)(line % t->sb_cache_n);
+    Cell *row = t->sb_cache + (size_t)c * t->sb_cache_cols;
+    if (t->sb_cache_line[c] != line) {
+        sb_decode(t->sb_lines[(t->sb_head + idx) % t->sb_cap], row, t->sb_cache_cols);
+        t->sb_cache_line[c] = line;
+    }
+    return row;
 }
 
 Cell* vcell(Terminal *t, int vrow, int col) {
@@ -517,6 +641,7 @@ static void dispatch_csi(Terminal *t) {
         if (n==3) {
             // ED 3 — erase the scrollback only (xterm). `clear` sends this
             // after ED 2 so old output can't be scrolled back to.
+            sb_free_lines(t);
             t->sb_count  = 0;
             t->sb_head   = 0;
             t->sb_offset = 0;
@@ -1183,7 +1308,12 @@ void term_init(Terminal *t) {
     t->rows   = TERM_ROWS_DEFAULT;
     t->sb_cols = t->cols;  // Initialize scrollback width to match display width
 
-    t->sb_buf = (Cell*)calloc(t->sb_cap * t->sb_cols, sizeof(Cell));
+    t->sb_lines = nullptr;   // sb_push() makes them, when a line first scrolls off
+    t->sb_total = 0;
+    t->sb_head = t->sb_count = 0;
+    t->sb_cache = nullptr;
+    t->sb_cache_line = nullptr;
+    t->sb_cache_n = t->sb_cache_cols = 0;
     t->cells  = (Cell*)malloc(sizeof(Cell) * t->cols * t->rows);
     for (int i = 0; i < t->cols * t->rows; i++)
         t->cells[i] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
@@ -1278,10 +1408,11 @@ void term_soft_reset(Terminal *t) {
 }
 
 void term_free(Terminal *t) {
-    if (t->sb_buf) {
-        free(t->sb_buf);
-        t->sb_buf = nullptr;
-    }
+    sb_free_lines(t);
+    free(t->sb_lines);  t->sb_lines = nullptr;
+    free(t->sb_cache);  t->sb_cache = nullptr;
+    free(t->sb_cache_line); t->sb_cache_line = nullptr;
+    t->sb_cache_n = 0;
     if (t->cells) {
         free(t->cells);
         t->cells = nullptr;
@@ -1336,28 +1467,10 @@ void term_resize(Terminal *t, int win_w, int win_h) {
         }
     }
 
-    // Scrollback buffer: width only increases, never decreases
-    // This preserves old data when shrinking the window; we just don't display
-    // the overflow. Only reallocate if the new width is larger than scrollback width.
-    if (new_cols > t->sb_cols && t->sb_buf) {
-        // Column count increased — expand scrollback to new width
-        Cell *new_sb_buf = (Cell*)calloc(t->sb_cap * new_cols, sizeof(Cell));
-        
-        // Copy existing scrollback data to new buffer, padding new columns with blanks
-        for (int i = 0; i < t->sb_count; i++) {
-            Cell *old_row = sb_row(t, i);
-            Cell *new_row = new_sb_buf + ((t->sb_head + i) % t->sb_cap) * new_cols;
-            memcpy(new_row, old_row, sizeof(Cell) * t->sb_cols);
-            // Pad the extra columns with blanks
-            for (int c = t->sb_cols; c < new_cols; c++)
-                new_row[c] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
-        }
-        
-        free(t->sb_buf);
-        t->sb_buf = new_sb_buf;
-        t->sb_cols = new_cols;
-    }
-    // If new_cols <= t->sb_cols, scrollback width stays at sb_cols; overflow is simply not displayed
+    // Scrollback rows are as wide as the widest screen yet (sb_cols only
+    // grows: a narrower screen just doesn't show the rest). The lines
+    // themselves don't have a width; sb_row's cache follows sb_cols.
+    if (new_cols > t->sb_cols) t->sb_cols = new_cols;
 
     t->cols = new_cols;
     t->rows = new_rows;

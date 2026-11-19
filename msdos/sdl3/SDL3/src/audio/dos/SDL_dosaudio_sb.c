@@ -214,6 +214,17 @@ static bool DOSSOUNDBLASTER_OpenDevice(SDL_AudioDevice *device)
     if (!is_sb16 && device->spec.freq > 22050) {
         device->spec.freq = 22050; // clamp to safe max for pre-SB16
     }
+    if (!is_sb16) {
+        // Pre-SB16 cards run at 1000000 / (256 - time constant) samples a
+        // second (both channels counted): only some rates exist. Use the one
+        // the card will really play (22050 stereo is 21739 Hz), so SDL
+        // resamples to it; otherwise the sound is up to 3% sharp.
+        const int ch = device->spec.channels;
+        int div = (1000000 + ch * device->spec.freq / 2) / (ch * device->spec.freq);
+        if (div < 1) div = 1;
+        if (div > 255) div = 255;
+        device->spec.freq = 1000000 / (div * ch);
+    }
     device->sample_frames = SDL_GetDefaultSampleFramesFromFreq(device->spec.freq);
 
     // Calculate the final parameters for this audio specification
@@ -388,7 +399,7 @@ static bool DOSSOUNDBLASTER_OpenDevice(SDL_AudioDevice *device)
         // In stereo mode the SB Pro interleaves L/R samples, so the effective
         // hardware rate is channels * freq.
         const int effective_rate = device->spec.channels * device->spec.freq;
-        const Uint8 time_constant = (Uint8)(256 - (1000000 / effective_rate));
+        const Uint8 time_constant = (Uint8)(256 - (1000000 + effective_rate / 2) / effective_rate);
         WriteSoundBlasterDSP(0x40); // set time constant
         WriteSoundBlasterDSP(time_constant);
 

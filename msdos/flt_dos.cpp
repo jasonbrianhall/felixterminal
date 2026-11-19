@@ -36,11 +36,12 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
-#include "../DejaVuMono.h"
-#include "../DejaVuMonoBold.h"
-#include "../DejaVuMonoOblique.h"
-#include "../DejaVuMonoBoldOblique.h"
-#include "../FreeMono.h"
+// The fonts, linked in as their bytes (build/fonts.o, from fonts-dos.py and
+// ../DejaVuMono.h, ...: the same TTFs, not base64), so FreeType reads them
+// where they are instead of from a decoded copy on the heap.
+#define FONT(n) extern "C" const unsigned char font_##n[]; extern "C" const unsigned long font_##n##_size;
+FONT(dejavumono) FONT(dejavumonobold) FONT(dejavumonooblique) FONT(dejavumonoboldoblique) FONT(freemono)
+#undef FONT
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -86,24 +87,18 @@ static FT_Library s_ft_lib;
 static FT_Face    s_face[4];        // regular, bold, oblique, bold oblique
 static FT_Face    s_face_fallback;  // FreeMono: symbols DejaVu doesn't have
 
-static FT_Face load_face(const char *b64, size_t b64_size) {
-    unsigned char *buf = nullptr;
-    size_t sz = 0;
+static FT_Face load_face(const unsigned char *ttf, unsigned long size) {
     FT_Face f = nullptr;
-    if (base64_decode(b64, b64_size, &buf, &sz) == 0 && buf &&
-        FT_New_Memory_Face(s_ft_lib, buf, (FT_Long)sz, 0, &f) == 0)
-        return f;
-    free(buf);
-    return nullptr;
+    return FT_New_Memory_Face(s_ft_lib, ttf, (FT_Long)size, 0, &f) == 0 ? f : nullptr;
 }
 
 static bool font_init(void) {
     if (FT_Init_FreeType(&s_ft_lib)) return false;
-    s_face[0] = load_face(DEJAVU_REGULAR_FONT_B64, DEJAVU_REGULAR_FONT_B64_SIZE);
-    s_face[1] = load_face(MONOSPACE_FONT_B64, MONOSPACE_FONT_B64_SIZE);          // DejaVu Sans Mono Bold
-    s_face[2] = load_face(DEJAVU_OBLIQUE_FONT_B64, DEJAVU_OBLIQUE_FONT_B64_SIZE);
-    s_face[3] = load_face(DEJAVU_BOLDOBLIQUE_FONT_B64, DEJAVU_BOLDOBLIQUE_FONT_B64_SIZE);
-    s_face_fallback = load_face(FREEMONO_FONT_B64, FREEMONO_FONT_B64_SIZE);
+    s_face[0] = load_face(font_dejavumono, font_dejavumono_size);
+    s_face[1] = load_face(font_dejavumonobold, font_dejavumonobold_size);
+    s_face[2] = load_face(font_dejavumonooblique, font_dejavumonooblique_size);
+    s_face[3] = load_face(font_dejavumonoboldoblique, font_dejavumonoboldoblique_size);
+    s_face_fallback = load_face(font_freemono, font_freemono_size);
     if (!s_face[0]) return false;
     for (int i = 1; i < 4; i++) if (!s_face[i]) s_face[i] = s_face[0];
     s_ft_face = s_face[0];
@@ -145,16 +140,31 @@ static const Glyph &glyph(uint32_t cp, int style) {
 // ============================================================================
 
 static Terminal     s_term;
+// The text layer, XRGB8888, s_w*s_h: drawn straight into the texture's own
+// pixels (text_lock()), with no copy of the screen beside it. SDL's software
+// renderer keeps a streaming texture's pixels between locks (its lock hands
+// out the surface it draws from), so only the dirty rows are redrawn.
 static SDL_Texture *s_text_tex;
-static std::vector<uint32_t> s_text;   // the text layer, XRGB8888, s_w*s_h
 static int          s_w, s_h;           // the screen
 static int          s_ox = 2, s_oy = 2; // the grid's top-left (2 px, as felixterminal)
 static int          s_cw, s_ch;         // the cell
 
 // Where fill() and draw_glyph() draw: the text layer, or the menu's buffer.
 static uint32_t *s_px;
-static int       s_pw, s_ph;
-static void draw_into(std::vector<uint32_t> &buf, int w, int h) { s_px = buf.data(); s_pw = w; s_ph = h; }
+static int       s_pw, s_ph, s_ps;      // width, height, pixels from one row to the next
+static void draw_into(std::vector<uint32_t> &buf, int w, int h) { s_px = buf.data(); s_pw = w; s_ph = h; s_ps = w; }
+static bool text_lock(void) {
+    void *p; int pitch;
+    if (!SDL_LockTexture(s_text_tex, nullptr, &p, &pitch)) return false;
+    s_px = (uint32_t *)p; s_pw = s_w; s_ph = s_h; s_ps = pitch / 4;
+    return true;
+}
+static void text_unlock(void) { SDL_UnlockTexture(s_text_tex); }
+static void text_clear(uint32_t c) {
+    if (!text_lock()) return;
+    for (int y = 0; y < s_h; y++) std::fill(s_px + (size_t)y * s_ps, s_px + (size_t)y * s_ps + s_w, c);
+    text_unlock();
+}
 
 static inline uint32_t rgb(TermColor c) {
     int r = (int)(c.r * 255.f + .5f), g = (int)(c.g * 255.f + .5f), b = (int)(c.b * 255.f + .5f);
@@ -179,7 +189,7 @@ static void fill(int x, int y, int w, int h, uint32_t c, unsigned a = 255) {
     if (x + w > s_pw) w = s_pw - x;
     if (y + h > s_ph) h = s_ph - y;
     for (int j = 0; j < h; j++) {
-        uint32_t *p = &s_px[(size_t)(y + j) * s_pw + x];
+        uint32_t *p = &s_px[(size_t)(y + j) * s_ps + x];
         if (a >= 255) for (int i = 0; i < w; i++) p[i] = c;
         else for (int i = 0; i < w; i++) p[i] = blend(p[i], c, a);
     }
@@ -229,7 +239,7 @@ static void draw_glyph(uint32_t cp, int style, int px, int py, uint32_t fc) {
     for (int y = 0; y < g.h; y++) {
         int sy = y0 + y;
         if (sy < py || sy >= py + s_ch || sy < 0 || sy >= s_ph) continue;   // stays in its row
-        uint32_t *row = &s_px[(size_t)sy * s_pw];
+        uint32_t *row = &s_px[(size_t)sy * s_ps];
         const uint8_t *a = &g.a[(size_t)y * g.w];
         for (int x = 0; x < g.w; x++) {
             int sx = x0 + x;
@@ -425,7 +435,6 @@ static void menu_draw(void) {
         for (size_t k = 0; k < it.label.size(); k++)
             if (it.label[k] != ' ') draw_glyph((unsigned char)it.label[k], 0, (int)(k + 2) * s_cw, y, c);
     }
-    draw_into(s_text, s_w, s_h);
     if (!s_menu.tex || s_menu.tex_w != w || s_menu.tex_h != h) {
         if (s_menu.tex) SDL_DestroyTexture(s_menu.tex);
         s_menu.tex = SDL_CreateTexture(g_sdl_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
@@ -439,18 +448,11 @@ static void menu_draw(void) {
 // The text layer's dirty rows into the texture, then the frame: text,
 // images, cursor, the menu.
 static void render(Terminal *t) {
-    int lo = -1, hi = -1;
-    for (int r = 0; r < t->rows; r++) {
-        if (!term_row_is_dirty(t, r)) continue;
-        draw_row(t, r);
-        if (lo < 0) lo = r;
-        hi = r;
-    }
-    term_clear_dirty(t);
-    if (lo >= 0) {
-        SDL_Rect band = { 0, s_oy + lo * s_ch, s_w, (hi - lo + 1) * s_ch };
-        if (band.y + band.h > s_h) band.h = s_h - band.y;
-        SDL_UpdateTexture(s_text_tex, &band, &s_text[(size_t)band.y * s_w], s_w * 4);
+    if (text_lock()) {
+        for (int r = 0; r < t->rows; r++)
+            if (term_row_is_dirty(t, r)) draw_row(t, r);
+        text_unlock();
+        term_clear_dirty(t);
     }
     SDL_RenderTexture(g_sdl_renderer, s_text_tex, nullptr, nullptr);
     kitty_render(t, s_ox, s_oy);
@@ -624,8 +626,7 @@ static bool key_down(Terminal *t, SDL_Keycode k, SDL_Keymod mod) {
 // ============================================================================
 
 static void repaint_all(Terminal *t) {               // after a theme change
-    std::fill(s_text.begin(), s_text.end(), rgb(tcolor_resolve(TCOLOR_PALETTE(0))));
-    SDL_UpdateTexture(s_text_tex, nullptr, s_text.data(), s_w * 4);
+    text_clear(rgb(tcolor_resolve(TCOLOR_PALETTE(0))));
     term_dirty_all(t);
 }
 
@@ -672,11 +673,9 @@ static void cfg_save(void) {
 // text layer and the grid follow, and the server is told the new size.
 static void new_text_layer(void) {
     SDL_GetCurrentRenderOutputSize(g_sdl_renderer, &s_w, &s_h);
-    s_text.assign((size_t)s_w * s_h, rgb(tcolor_resolve(TCOLOR_PALETTE(0))));
     if (s_text_tex) SDL_DestroyTexture(s_text_tex);
     s_text_tex = SDL_CreateTexture(g_sdl_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, s_w, s_h);
-    SDL_UpdateTexture(s_text_tex, nullptr, s_text.data(), s_w * 4);
-    draw_into(s_text, s_w, s_h);
+    text_clear(rgb(tcolor_resolve(TCOLOR_PALETTE(0))));
 }
 static void set_mode(Terminal *t, const SDL_DisplayMode &m) {
     if (m.w == s_mode.w && m.h == s_mode.h && m.format == s_mode.format) return;
@@ -930,8 +929,7 @@ int main(int argc, char **argv) {
     s_term.cell_h = (float)s_ch;
     term_resize(&s_term, s_w, s_h);
     uint32_t bg0 = rgb(tcolor_resolve(TCOLOR_PALETTE(0)));
-    std::fill(s_text.begin(), s_text.end(), bg0);
-    SDL_UpdateTexture(s_text_tex, nullptr, s_text.data(), s_w * 4);
+    text_clear(bg0);
     kitty_init();
     sixel_init();
 

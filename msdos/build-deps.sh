@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the libraries Felix Terminal for DOS links with, for DJGPP, into
-# msdos/deps (or DEPS=dir): zlib, libpng, FreeType, OpenSSL, libssh2, SDL3
-# (the DOS port in SDLPoPDOS) and vmdos's sockets. Run once; then `make`.
+# msdos/deps (or DEPS=dir): zlib, libpng, FreeType, OpenSSL, libssh2 and
+# vmdos's sockets. Run once; then `make`. (SDL3 isn't built here: its DOS
+# port is checked in, in sdl3/, and the Makefile compiles it.)
 #
 # Needs:
 #   a DJGPP cross compiler (i586-pc-msdosdjgpp-gcc/g++ on PATH, or DJGPP=dir)
@@ -9,8 +10,6 @@
 #               OpenSSL build (tools/build-openssl.sh) and its sockets
 #               (third_party/openssh/dos-sock.c, third_party/openssl/ossl-dos.c),
 #               which put TCP on vmdos's own network stack
-#   SDLDOS=dir  SDLPoPDOS's msdos/ (github.com/jasonbrianhall/SDLPoPDOS): SDL3
-#               with its DOS port (VESA, keyboard, mouse)
 #   git, make, perl, python3, a host gcc with -m32 (for OpenSSL's build)
 #
 # The sources are cloned at pinned versions into msdos/deps/src. `make deps`
@@ -21,10 +20,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 P=i586-pc-msdosdjgpp-   # (vmdos's build-openssl.sh wants this name too)
 command -v ${P}gcc > /dev/null || { echo "build-deps: no ${P}gcc (DJGPP=dir?)" >&2; exit 1; }
 : "${VMDOS:?VMDOS=dir: a vmdos checkout}"
-: "${SDLDOS:?SDLDOS=dir: SDLPoPDOS/msdos}"
 [ -d "$VMDOS" ] || { echo "build-deps: no vmdos checkout at $VMDOS (VMDOS=dir)" >&2; exit 1; }
-[ -d "$SDLDOS" ] || { echo "build-deps: no SDLPoPDOS msdos/ at $SDLDOS (SDLDOS=dir)" >&2; exit 1; }
-VMDOS=$(cd "$VMDOS" && pwd); SDLDOS=$(cd "$SDLDOS" && pwd)
+VMDOS=$(cd "$VMDOS" && pwd)
 DEPS=${DEPS:-$here/deps}
 mkdir -p "$DEPS" && DEPS=$(cd "$DEPS" && pwd)
 S=$DEPS/src
@@ -99,11 +96,6 @@ GF="$CF -I$V/wget/dos -I$V/openssh -I$W/inc -DWATT32 -DWATT32_NO_OLDIES"
 ${P}gcc $GF -c "$V/openssl/ossl-dos.c" -o "$S/ossl-dos.o"
 ${P}gcc $GF -c "$V/openssh/dos-sock.c" -o "$S/dos-sock.o"
 ${P}ar rcs "$DEPS/lib/libvmdosnet.a" "$S/ossl-dos.o" "$S/dos-sock.o"
-
-# SDL3 with its DOS port: SDLPoPDOS's build of it
-make -s -C "$SDLDOS" DOCKER=0 build/libSDL3.a
-cp "$SDLDOS/build/libSDL3.a" "$DEPS/lib/"
-cp -r "$SDLDOS/SDL3/include/SDL3" "$DEPS/include/"
 
 touch "$DEPS/.built"
 echo "build-deps: done ($DEPS)"
