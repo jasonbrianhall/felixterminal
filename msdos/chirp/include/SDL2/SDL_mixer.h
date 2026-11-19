@@ -19,6 +19,7 @@ typedef struct Mix_Chunk {
     Uint8  *abuf;          /* S16 stereo at the mixer's rate */
     Uint32  alen;          /* bytes */
     Uint8   volume;        /* 0..128 */
+    void   *stream;        /* (DOS: a long compressed sound read as it plays, not decoded first) */
 } Mix_Chunk;
 typedef struct Mix_Music Mix_Music;
 
