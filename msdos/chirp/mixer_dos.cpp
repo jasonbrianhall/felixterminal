@@ -5,7 +5,7 @@
 // Music (one at a time, streamed from the file):
 //   MP3 (dr_mp3), FLAC (dr_flac), WAV and AIFF (dr_wav), OGG Vorbis
 //   (stb_vorbis), MOD/XM/IT/S3M/669/MED/MTM and the rest (libxmp), MIDI
-//   (felixterminal's OPL3 renderer, midi_render.cpp, to a WAV in memory).
+//   (felixterminal's OPL3 player, midi_render.cpp, as it plays).
 // Chunks (VOC, AIFF, and kfn's backing track): decoded whole, to 16-bit
 //   stereo at the mixer's rate, on 8 channels.
 // Opus isn't there (no libopus in the DOS build).
@@ -39,10 +39,11 @@
 #define LIBXMP_STATIC
 #include "xmp.h"
 
-#include "../../midi_render.h"
+#include "../../midiplayer.h"       // midi_render.cpp's player state and parser
+#include "../../dbopl_wrapper.h"    // its OPL3 synth
 #include "../../aiff_render.h"
 
-enum MusicKind { MUS_NONE, MUS_MP3, MUS_FLAC, MUS_WAV, MUS_OGG, MUS_XMP };
+enum MusicKind { MUS_NONE, MUS_MP3, MUS_FLAC, MUS_WAV, MUS_OGG, MUS_XMP, MUS_MIDI };
 
 struct Mix_Music {
     MusicKind kind = MUS_NONE;
@@ -51,7 +52,8 @@ struct Mix_Music {
     drwav  wav;
     stb_vorbis *ogg = nullptr;
     xmp_context xmp = nullptr;
-    std::vector<uint8_t> mem;      // a file rendered in memory (MIDI -> WAV)
+    std::vector<uint8_t> mem;      // a file in memory (a VOC or AIFF chunk, as WAV)
+    std::string path;              // MIDI: the file, read as it plays
     int rate = 44100, channels = 2;
     double duration = -1.0;
     bool at_end = false;
@@ -79,6 +81,116 @@ static void unlock() { if (s_dev) SDL_UnlockAudioStream(s_dev); }
 
 // ---------------------------------------------------------------- decoding
 
+// ---------------------------------------------------------------- MIDI
+// MIDI plays as it goes, on felixterminal's OPL3 synth: midi_render.cpp's
+// parser and player (loadMidiFile, processEvents: one player, global state)
+// driven a block at a time, as its render_midi_to_wav does all at once. That
+// rendered the whole song into memory first (about 10 MB a minute, while
+// nothing else ran), so a long song took minutes, or more memory than DOS
+// had. Only one MIDI is open at a time (the player is global): opening
+// another ends the first.
+
+extern int TrackCount, DeltaTicks, globalVolume;
+extern double Tempo, playTime, playwait, loopwait;
+extern bool isPlaying, paused, loopStart, loopEnd;
+extern FILE *midiFile;
+extern int tkPtr[], tkStatus[], loPtr[], loStatus[], rbPtr[], rbStatus[];
+extern double tkDelay[], loDelay[], rbDelay[];
+extern int ChPatch[], ChVolume[], ChPanning[], ChVibrato[];
+extern double ChBend[];
+void processEvents();
+
+static Mix_Music *s_midi_owner = nullptr;
+static int16_t s_midi_blk[AUDIO_BUFFER * AUDIO_CHANNELS];
+static int s_midi_blk_left = 0;           // frames of s_midi_blk not handed out yet
+static const double MIDI_MAX_SECONDS = 600.0;   // (looping files)
+
+static void midi_stop(void) {
+    if (midiFile) { fclose(midiFile); midiFile = nullptr; }
+    OPL_Shutdown();
+    isPlaying = false;
+    s_midi_owner = nullptr;
+}
+
+// Load the file and reset the player and the synth: at 0:00.
+static bool midi_start(Mix_Music *m) {
+    if (s_midi_owner) {
+        if (s_midi_owner != m) s_midi_owner->at_end = true;   // another MIDI: that one ends
+        midi_stop();
+    }
+    memset(tkPtr, 0, sizeof(int) * MAX_TRACKS);     memset(tkDelay, 0, sizeof(double) * MAX_TRACKS);
+    memset(tkStatus, 0, sizeof(int) * MAX_TRACKS);  memset(loPtr, 0, sizeof(int) * MAX_TRACKS);
+    memset(loDelay, 0, sizeof(double) * MAX_TRACKS); memset(loStatus, 0, sizeof(int) * MAX_TRACKS);
+    memset(rbPtr, 0, sizeof(int) * MAX_TRACKS);     memset(rbDelay, 0, sizeof(double) * MAX_TRACKS);
+    memset(rbStatus, 0, sizeof(int) * MAX_TRACKS);
+    TrackCount = 0; DeltaTicks = 0; Tempo = 500000; playTime = 0;
+    loopStart = loopEnd = false; playwait = 0; loopwait = 0;
+    globalVolume = 100;
+    for (int i = 0; i < 16; i++) { ChPatch[i] = 0; ChBend[i] = 0; ChVolume[i] = 127; ChPanning[i] = 64; ChVibrato[i] = 0; }
+    OPL_Init(SAMPLE_RATE);
+    OPL_LoadInstruments();
+    OPL_Reset();
+    if (!loadMidiFile(m->path.c_str())) { OPL_Shutdown(); return false; }
+    isPlaying = true;
+    paused = false;
+    s_midi_owner = m;
+    s_midi_blk_left = 0;
+    processEvents();
+    return true;
+}
+
+// Skip to `pos` seconds without making the sound in between (events only:
+// notes already playing then go on).
+static void midi_skip_to(double pos) {
+    double t = 0;
+    while (isPlaying && t + playwait < pos && t < MIDI_MAX_SECONDS) {
+        if (playwait > 0) { t += playwait; playwait = 0; }
+        processEvents();
+    }
+    if (isPlaying) { playwait -= pos - t; playTime = pos; }
+    else playTime = t + (playwait > 0 ? playwait : 0);   // it ended there
+}
+
+static bool open_midi(Mix_Music *m, const char *file) {
+    FILE *f = fopen(file, "rb");
+    char hdr[4] = {0};
+    bool is_midi = f && fread(hdr, 1, 4, f) == 4 && !memcmp(hdr, "MThd", 4);
+    if (f) fclose(f);
+    if (!is_midi) return false;
+    m->path = file;
+    // Its length: the events, without the sound (quick)
+    if (!midi_start(m)) return false;
+    midi_skip_to(MIDI_MAX_SECONDS);
+    m->duration = playTime < MIDI_MAX_SECONDS ? playTime : -1.0;
+    if (!midi_start(m)) return false;
+    m->kind = MUS_MIDI;
+    m->rate = SAMPLE_RATE; m->channels = AUDIO_CHANNELS;
+    return true;
+}
+
+static int midi_decode(Mix_Music *m, int16_t *out, int frames) {
+    if (s_midi_owner != m) return 0;
+    int done = 0;
+    while (done < frames) {
+        if (!s_midi_blk_left) {
+            if (!isPlaying || playTime >= MIDI_MAX_SECONDS) break;
+            memset(s_midi_blk, 0, sizeof s_midi_blk);
+            OPL_Generate(s_midi_blk, AUDIO_BUFFER);
+            s_midi_blk_left = AUDIO_BUFFER;
+            const double dur = (double)AUDIO_BUFFER / SAMPLE_RATE;
+            playTime += dur;
+            playwait -= dur;
+            while (playwait <= 0 && isPlaying) processEvents();
+        }
+        int n = frames - done < s_midi_blk_left ? frames - done : s_midi_blk_left;
+        memcpy(out + done * AUDIO_CHANNELS, s_midi_blk + (AUDIO_BUFFER - s_midi_blk_left) * AUDIO_CHANNELS,
+               (size_t)n * AUDIO_CHANNELS * sizeof(int16_t));
+        s_midi_blk_left -= n;
+        done += n;
+    }
+    return done;
+}
+
 static bool music_rewind(Mix_Music *m) {
     m->at_end = false;
     switch (m->kind) {
@@ -86,6 +198,7 @@ static bool music_rewind(Mix_Music *m) {
     case MUS_FLAC: return drflac_seek_to_pcm_frame(m->flac, 0);
     case MUS_WAV:  return drwav_seek_to_pcm_frame(&m->wav, 0);
     case MUS_OGG:  return stb_vorbis_seek_start(m->ogg) != 0;
+    case MUS_MIDI: return midi_start(m);
     case MUS_XMP:                                  // (after -XMP_END: start it again)
         xmp_end_player(m->xmp);
         if (xmp_start_player(m->xmp, MIX_RATE, 0) != 0) return false;
@@ -102,6 +215,7 @@ static int music_decode(Mix_Music *m, int16_t *out, int frames) {
     case MUS_FLAC: return (int)drflac_read_pcm_frames_s16(m->flac, (drflac_uint64)frames, out);
     case MUS_WAV:  return (int)drwav_read_pcm_frames_s16(&m->wav, (drwav_uint64)frames, out);
     case MUS_OGG:  return stb_vorbis_get_samples_short_interleaved(m->ogg, m->channels, out, frames * m->channels);
+    case MUS_MIDI: return midi_decode(m, out, frames);
     case MUS_XMP: {
         // xmp_play_buffer pads the last buffer with silence; loop = 1 makes it
         // stop (-XMP_END) the first time the song comes back round.
@@ -119,6 +233,7 @@ static void music_close(Mix_Music *m) {
     case MUS_WAV:  drwav_uninit(&m->wav); break;
     case MUS_OGG:  stb_vorbis_close(m->ogg); break;
     case MUS_XMP:  xmp_end_player(m->xmp); xmp_release_module(m->xmp); xmp_free_context(m->xmp); break;
+    case MUS_MIDI: if (s_midi_owner == m) midi_stop(); break;
     default: break;
     }
     m->kind = MUS_NONE;
@@ -194,12 +309,6 @@ static bool open_xmp(Mix_Music *m, const char *file) {
     xmp_get_frame_info(m->xmp, &fi);
     if (fi.total_time > 0) m->duration = fi.total_time / 1000.0;
     return true;
-}
-static bool open_midi(Mix_Music *m, const char *file) {
-    std::vector<uint8_t> mid;
-    if (!read_file(file, mid) || mid.size() < 14 || memcmp(mid.data(), "MThd", 4)) return false;
-    if (!render_midi_to_wav(mid, m->mem) || m->mem.empty()) return false;
-    return open_wav_mem(m);
 }
 
 Mix_Music *Mix_LoadMUS(const char *file) {
@@ -403,6 +512,7 @@ int Mix_SetMusicPosition(double pos) {
     case MUS_WAV:  ok = drwav_seek_to_pcm_frame(&m->wav, frame); break;
     case MUS_OGG:  ok = stb_vorbis_seek(m->ogg, (unsigned)frame) != 0; break;
     case MUS_XMP:  ok = xmp_seek_time(m->xmp, (int)(pos * 1000)) >= 0; break;
+    case MUS_MIDI: ok = midi_start(m); if (ok) midi_skip_to(pos); break;
     default: break;
     }
     if (ok) { m->at_end = false; SDL_ClearAudioStream(s_conv); }

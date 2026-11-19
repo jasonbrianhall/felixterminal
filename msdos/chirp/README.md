@@ -1,7 +1,7 @@
 Felix Chirp for MS-DOS
 ======================
 
-Felix Chirp, Felix Terminal's F5 viewer, as a DOS program of its own:
+Felix Chirp, the viewer Felix Terminal opens with F5, as a DOS program of its own:
 `CHIRP.EXE`, a 32-bit DPMI program made with DJGPP. It shows pictures,
 plays music, CD+G and .kfn karaoke, shows text and Markdown, and looks
 inside zip files, with a file browser down the left. It runs on vmdos (or
@@ -50,6 +50,7 @@ Keys
     a letter                       the next file starting with it
     double-click the picture       fullscreen
     Esc                            back (fullscreen, a text file), then quit
+    F2 / Shift+F2                  next / previous screen mode
     F10, Ctrl+Q                    quit
 
 Options

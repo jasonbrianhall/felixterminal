@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 
 // ============================================================================
 // WHAT FELIXCHIRP/ EXPECTS FROM FELIXTERMINAL
@@ -285,6 +286,39 @@ static bool pick_mode(int want_w, int want_h, int want_bpp, SDL_DisplayMode *out
     return best != nullptr;
 }
 
+// The modes F2 / Shift+F2 step through: each size once (its deepest
+// colours), 640x480 and up, smallest first.
+static std::vector<SDL_DisplayMode> usable_modes(void) {
+    std::vector<SDL_DisplayMode> out;
+    int n = 0;
+    SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetPrimaryDisplay(), &n);
+    for (int i = 0; modes && i < n; i++) {
+        const SDL_DisplayMode *m = modes[i];
+        if (SDL_ISPIXELFORMAT_INDEXED(m->format) || SDL_BITSPERPIXEL(m->format) < 15 || m->w < 640 || m->h < 400) continue;
+        bool merged = false;
+        for (SDL_DisplayMode &o : out)
+            if (o.w == m->w && o.h == m->h) {
+                if (SDL_BITSPERPIXEL(m->format) > SDL_BITSPERPIXEL(o.format)) o = *m;
+                merged = true;
+            }
+        if (!merged) out.push_back(*m);
+    }
+    SDL_free(modes);
+    std::sort(out.begin(), out.end(), [](const SDL_DisplayMode &a, const SDL_DisplayMode &b) {
+        return a.w * a.h != b.w * b.h ? a.w * a.h < b.w * b.h : a.w < b.w;
+    });
+    return out;
+}
+
+static bool set_mode(const SDL_DisplayMode &m, int *w, int *h) {
+    if (!SDL_SetWindowFullscreenMode(g_sdl_window, &m)) return false;
+    SDL_SyncWindow(g_sdl_window);
+    int ow = 0, oh = 0;
+    if (!SDL_GetCurrentRenderOutputSize(g_sdl_renderer, &ow, &oh) || ow <= 0) { ow = m.w; oh = m.h; }
+    *w = ow; *h = oh;
+    return true;
+}
+
 static void list_modes(void) {
     int n = 0;
     SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetPrimaryDisplay(), &n);
@@ -306,7 +340,8 @@ static void usage(void) {
            "  CHIRP [-g WxH[xBITS]] [-f size] [-l] [folder | file]\n\n"
            "  folder   where to start (default: the current one)\n"
            "  file     open it at once (a picture, song, .cdg, .kfn, .zip, text)\n"
-           "  -g       the VESA mode (default 1024x768; also SET CHIRP_VIDEO=)\n"
+           "  -g       the VESA mode (default 1024x768; also SET CHIRP_VIDEO=;\n"
+           "           F2 / Shift+F2 change it while running)\n"
            "  -f       font size in pixels (default 16)\n"
            "  -l       list the VESA modes\n\n"
            "Sound: a Sound Blaster, with BLASTER set (SET BLASTER=A220 I5 D1 T4).\n"
@@ -424,6 +459,20 @@ int main(int argc, char **argv) {
                 // Ctrl+Q / F10 quit from anywhere; Esc closes Chirp
                 // (after leaving fullscreen or a text file) as in Felix Terminal.
                 if ((e.key.key == SDLK_Q && (e.key.mod & SDL_KMOD_CTRL)) || e.key.key == SDLK_F10) { quit = true; break; }
+                // F2 / Shift+F2: the next / previous screen mode
+                if (e.key.key == SDLK_F2) {
+                    std::vector<SDL_DisplayMode> ms = usable_modes();
+                    if (!ms.empty()) {
+                        int cur = -1;
+                        for (size_t i = 0; i < ms.size(); i++) if (ms[i].w == win_w && ms[i].h == win_h) cur = (int)i;
+                        int k = (int)ms.size();
+                        int next = (e.key.mod & SDL_KMOD_SHIFT) ? (cur < 0 ? k - 1 : (cur + k - 1) % k) : (cur + 1) % k;
+                        if (!set_mode(ms[(size_t)next], &win_w, &win_h))
+                            snprintf(g_iv.error, sizeof g_iv.error, "Can't set %dx%d: %s", ms[(size_t)next].w, ms[(size_t)next].h, SDL_GetError());
+                    }
+                    need = true;
+                    break;
+                }
                 // Alt+letter: that drive's root (the root's listing has the drives too)
                 if ((e.key.mod & SDL_KMOD_ALT) && e.key.key >= SDLK_A && e.key.key <= SDLK_Z) {
                     char root[4] = { (char)('A' + (e.key.key - SDLK_A)), ':', '\\', 0 };
@@ -479,20 +528,28 @@ int main(int argc, char **argv) {
         iv_tick((now - last) / 1000.0);
         last = now;
         bool animating = (g_iv.audio_playing && !g_iv.audio_paused) || g_iv.cdg_display || g_iv.slideshow_active;
-        // Animations at 25 frames a second, input at once. DOS's threads
-        // are cooperative: SDL's audio thread (the Sound Blaster's mixing)
-        // runs only while this one waits, so it always waits a little, and
-        // longer the longer a frame took to draw.
-        if (need || (animating && now - last_frame >= 40)) {
+        // Animations at up to 60 frames a second, input at once. DOS's
+        // threads are cooperative: SDL's audio thread (the Sound Blaster's
+        // mixing) runs only while this one waits, so it always waits a
+        // little, and longer the longer a frame took to draw.
+        if (need || (animating && now - last_frame >= 16)) {
             iv_render(win_w, win_h);
+            uint64_t drawn = SDL_GetTicks();
             SDL_RenderPresent(g_sdl_renderer);
             uint64_t took = SDL_GetTicks() - now;
-            if (g_chirp_log) { static int n; if (++n % 25 == 0) { fprintf(g_chirp_log, "frame %llu ms\n", (unsigned long long)took); fflush(g_chirp_log); } }
+            if (g_chirp_log) {
+                static int n;
+                if (++n % 25 == 0) {
+                    fprintf(g_chirp_log, "frame %llu ms (drawing %llu, showing %llu)\n", (unsigned long long)took,
+                            (unsigned long long)(drawn - now), (unsigned long long)(now + took - drawn));
+                    fflush(g_chirp_log);
+                }
+            }
             last_frame = now;
             need = false;
-            SDL_Delay(took > 40 ? 10 : 2);
+            SDL_Delay(took > 40 ? 10 : 1);
         } else {
-            SDL_Delay(5);
+            SDL_Delay(animating ? 1 : 5);
         }
     }
     if (g_iv.visible) iv_close();
