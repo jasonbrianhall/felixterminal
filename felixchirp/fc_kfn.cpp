@@ -15,6 +15,7 @@
 #include "../gl_renderer.h"
 #include "../sdl_renderer.h"
 #include "../ft_font.h"
+float measure_text(const char *text, int font_px);   // (ft_font.cpp)
 
 #include "miniz.h"
 #include "miniz_zip.h"
@@ -154,35 +155,39 @@ static void iv_kfn_parse_ini(const std::string &content) {
     for (int i = 0; textMap.count(i); i++) {
         const std::string &line = textMap[i];
 
-        // Split on '/' into syllables, then each syllable on whitespace
-        // into words — same two-pass split as the JS version.
+        // KaraFun's syllables: '/' and ' ' each end one, and each takes the
+        // next sync time, an empty one too: "/Whose" and "home/ of" have an
+        // empty syllable, the end of the held note before. '_' is a timed
+        // pause. Those take a time but aren't words. (Splitting on '/' and
+        // then on spaces lost the empty ones, and from there every word had
+        // the time of the one before.)
         std::vector<std::string> words;
+        std::vector<double> times;
         {
             size_t pos = 0;
             while (pos <= line.size()) {
-                size_t slash = line.find('/', pos);
-                std::string syl = (slash == std::string::npos) ? line.substr(pos) : line.substr(pos, slash - pos);
-                if (!syl.empty()) {
-                    std::istringstream iss(syl);
-                    std::string w;
-                    while (iss >> w) words.push_back(w);
-                }
-                if (slash == std::string::npos) break;
-                pos = slash + 1;
+                size_t end = line.find_first_of("/ ", pos);
+                std::string syl = (end == std::string::npos) ? line.substr(pos) : line.substr(pos, end - pos);
+                double t = (timingIdx < allTimings.size()) ? (allTimings[timingIdx] / 1000.0) : 0.0;
+                timingIdx++;
+                if (!syl.empty() && syl != "_") { words.push_back(syl); times.push_back(t); }
+                // A word ends at a space (or the line's end): its last
+                // syllable keeps the space, so "prou/dly" shows as one word
+                bool word_end = end == std::string::npos || line[end] == ' ';
+                if (word_end && !words.empty() && words.back().back() != ' ') words.back() += ' ';
+                if (end == std::string::npos) break;
+                pos = end + 1;
             }
         }
 
         if (!words.empty()) {
             g_iv.kfn_line_indices.push_back((int)g_iv.kfn_lyrics.size());
-            std::string displayLine = line;
-            displayLine.erase(std::remove(displayLine.begin(), displayLine.end(), '/'), displayLine.end());
-            g_iv.kfn_lyrics_lines.push_back(displayLine);
-
-            for (auto &w : words) {
-                g_iv.kfn_lyrics.push_back(w);
-                double t = (timingIdx < allTimings.size()) ? (allTimings[timingIdx] / 1000.0) : 0.0;
-                g_iv.kfn_sync_times.push_back(t);
-                timingIdx++;
+            std::string displayLine;
+            for (char c : line) if (c != '/' && c != '_') displayLine += c;
+            g_iv.kfn_lyrics_lines.push_back(kfn_trim(displayLine));
+            for (size_t w = 0; w < words.size(); w++) {
+                g_iv.kfn_lyrics.push_back(words[w]);
+                g_iv.kfn_sync_times.push_back(times[w]);
             }
         }
     }
@@ -466,11 +471,13 @@ void iv_kfn_render(float ix, float iy, float iw, float ih) {
     char header[600];
     snprintf(header, sizeof(header), "%s \xe2\x80\x94 %s", g_iv.kfn_artist.c_str(), g_iv.kfn_title.c_str());
     float lbl_y = iy + ih * 0.10f;
-    iv_draw_text(header, ix + iw * 0.5f - strlen(header) * g_font_size * 0.3f,
+    if (measure_text(header, g_font_size) > iw - 8.f)          // (narrow: the title alone)
+        snprintf(header, sizeof(header), "%s", g_iv.kfn_title.c_str());
+    iv_draw_text(header, ix + (iw - measure_text(header, g_font_size)) * 0.5f,
                  lbl_y, 0.90f, 0.95f, 1.00f, alpha_mul);
     if (g_iv.audio_paused) {
         const char *ps = "\xe2\x80\x96 PAUSED";
-        iv_draw_text(ps, ix + iw * 0.5f - strlen(ps) * g_font_size * 0.3f,
+        iv_draw_text(ps, ix + (iw - measure_text(ps, g_font_size)) * 0.5f,
                      lbl_y + rh, 1.00f, 0.75f, 0.30f, 1.f);
     }
 
@@ -502,30 +509,35 @@ void iv_kfn_render(float ix, float iy, float iw, float ih) {
 
     float line_y = iy + ih * 0.42f;
     if (!g_iv.kfn_lyrics.empty()) {
-        // Rough centering: estimate line width from character count first.
-        int totalChars = 0;
-        for (int w = lineStart; w < lineEnd; w++) totalChars += (int)g_iv.kfn_lyrics[w].size() + 1;
-        float x = ix + iw * 0.5f - totalChars * cur_font * 0.3f;
-
+        // The line's syllables as they're drawn (each ends with its space,
+        // if any), at the largest size that fits the panel
+        float line_w = 0;
+        for (;;) {
+            line_w = 0;
+            for (int w = lineStart; w < lineEnd; w++) line_w += measure_text(g_iv.kfn_lyrics[w].c_str(), cur_font);
+            if (line_w <= iw * 0.94f || cur_font <= 10) break;
+            cur_font -= 2;
+        }
+        float x = ix + (iw - line_w) * 0.5f;
         for (int w = lineStart; w < lineEnd; w++) {
             float r, g, b;
             if (w == g_iv.kfn_current_word)      { r = 1.00f; g = 0.85f; b = 0.20f; } // singing now
             else if (w < g_iv.kfn_current_word)  { r = 0.55f; g = 0.85f; b = 1.00f; } // already sung
             else                                  { r = 0.75f; g = 0.75f; b = 0.85f; } // upcoming
-            std::string word = g_iv.kfn_lyrics[w] + " ";
-            draw_text(word.c_str(), x, line_y, cur_font, cur_font, r, g, b, alpha_mul);
-            x += word.size() * cur_font * 0.6f;
+            x = draw_text(g_iv.kfn_lyrics[w].c_str(), x, line_y, cur_font, cur_font, r, g, b, alpha_mul);
         }
     } else {
         const char *msg = "(no synced lyrics in this file)";
-        draw_text(msg, ix + iw * 0.5f - strlen(msg) * cur_font * 0.3f,
+        draw_text(msg, ix + (iw - measure_text(msg, cur_font)) * 0.5f,
                   line_y, cur_font, cur_font, 0.6f, 0.6f, 0.7f, alpha_mul);
     }
 
     if (lineIdx + 1 < (int)g_iv.kfn_lyrics_lines.size()) {
         const std::string &next = g_iv.kfn_lyrics_lines[lineIdx + 1];
         float ny = line_y + rh * 2.0f;
-        draw_text(next.c_str(), ix + iw * 0.5f - next.size() * next_font * 0.28f,
+        float nw;
+        while ((nw = measure_text(next.c_str(), next_font)) > iw * 0.94f && next_font > 10) next_font -= 2;
+        draw_text(next.c_str(), ix + (iw - nw) * 0.5f,
                   ny, next_font, next_font, 0.45f, 0.50f, 0.60f, alpha_mul * 0.85f);
     }
 
@@ -542,19 +554,34 @@ void iv_kfn_render(float ix, float iy, float iw, float ih) {
     int cur_s = (int)g_iv.audio_position, tot_s = (int)total;
     char timebuf[32];
     snprintf(timebuf, sizeof(timebuf), "%d:%02d / %d:%02d", cur_s / 60, cur_s % 60, tot_s / 60, tot_s % 60);
-    iv_draw_text(timebuf, bar_x + bar_w * 0.5f - strlen(timebuf) * g_font_size * 0.3f,
-                 bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
+    float time_w = measure_text(timebuf, g_font_size);
+    iv_draw_text(timebuf, bar_x + bar_w - time_w, bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
 
+    // The tracks and volume at the left; shorter where they'd meet the time
     char status[128];
-    snprintf(status, sizeof(status), "Vocal: %s   Backing: %s   Vol: %d%%",
-             g_iv.kfn_vocal_muted ? "muted" : "on",
-             (g_iv.kfn_channel_backing < 0) ? "n/a" : (g_iv.kfn_backing_muted ? "muted" : "on"),
-             (int)(g_iv.volume * 100.f));
+    const char *vocal   = g_iv.kfn_vocal_muted ? "muted" : "on";
+    const char *backing = (g_iv.kfn_channel_backing < 0) ? "n/a" : (g_iv.kfn_backing_muted ? "muted" : "on");
+    int vol = (int)(g_iv.volume * 100.f);
+    float room = bar_w - time_w - 16.f;
+    snprintf(status, sizeof(status), "Vocal: %s   Backing: %s   Vol: %d%%", vocal, backing, vol);
+    if (measure_text(status, g_font_size) > room)
+        snprintf(status, sizeof(status), "V: %s  B: %s  %d%%", vocal, backing, vol);
+    if (measure_text(status, g_font_size) > room)
+        snprintf(status, sizeof(status), "%d%%", vol);
     iv_draw_text(status, bar_x, bar_y + 14.f, 0.50f, 0.70f, 0.85f, 1.f);
 
-    const char *ctrl = "Space: pause/resume   S: stop   K: mute vocal   B: mute backing   +/-: vol   .: repeat";
-    iv_draw_text(ctrl, ix + iw * 0.5f - strlen(ctrl) * g_font_size * 0.3f,
-                 bar_y + (float)rh + 4.f, 0.40f, 0.45f, 0.55f, 1.f);
+    const char *ctrls[] = {
+        "Space: pause/resume   S: stop   K: mute vocal   B: mute backing   +/-: vol   .: repeat",
+        "Space: pause   S: stop   K: vocal   B: backing   +/-: vol",
+        "Space: pause   K: vocal   B: backing",
+    };
+    for (const char *ctrl : ctrls) {
+        float cw = measure_text(ctrl, g_font_size);
+        if (cw <= iw - 8.f) {
+            iv_draw_text(ctrl, ix + (iw - cw) * 0.5f, bar_y + (float)rh + 4.f, 0.40f, 0.45f, 0.55f, 1.f);
+            break;
+        }
+    }
 }
 
 // ============================================================================
