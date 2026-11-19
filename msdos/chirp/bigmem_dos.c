@@ -104,36 +104,83 @@ static void big_free(struct big_header *h) {
     __dpmi_free_memory(handle);
 }
 
+/* Every block from DJGPP's malloc carries a small header too, with its size:
+   realloc can then move one that grows to BIG or more out to a DPMI block
+   of its own. (Without its size it had to stay in DJGPP's heap, which never
+   shrinks: stb_image gathers a PNG's compressed data in a buffer that grows
+   from 4 KB, so the largest PNG's few megabytes, and the holes its moves
+   left, stayed taken until Chirp exited. Pictures of every size went that
+   way, a step down in free memory at each one larger than any before.) */
+#define SMAGIC 0x534D4C4Cu                 /* 'SMLL' */
+struct small_header { uint32_t magic, size, check, pad; };
+unsigned long g_heap_live, g_heap_peak;    /* (CHIRP_LOG: bytes in DJGPP's heap now, at most) */
+
+static struct small_header *small_of(void *p) {
+    if (!p) return 0;
+    struct small_header *h = (struct small_header *)p - 1;
+    if (h->magic != SMAGIC || h->check != (SMAGIC ^ h->size ^ (uint32_t)(uintptr_t)h)) return 0;
+    return h;
+}
+static void *small_done(struct small_header *h, size_t n) {
+    if (!h) return 0;
+    h->magic = SMAGIC; h->size = (uint32_t)n; h->check = SMAGIC ^ h->size ^ (uint32_t)(uintptr_t)h; h->pad = 0;
+    g_heap_live += n;
+    if (g_heap_live > g_heap_peak) g_heap_peak = g_heap_live;
+    return h + 1;
+}
+static void *small_alloc(size_t n) {
+    if (n > (size_t)-1 - sizeof(struct small_header)) return 0;
+    return small_done((struct small_header *)__real_malloc(n + sizeof(struct small_header)), n);
+}
+static void small_free(struct small_header *h) {
+    g_heap_live -= h->size;
+    h->magic = 0;
+    __real_free(h);
+}
+
 void *__wrap_malloc(size_t n) {
     void *p = big_alloc(n);
-    return p ? p : __real_malloc(n);
+    return p ? p : small_alloc(n);
 }
 
 void *__wrap_calloc(size_t k, size_t n) {
     if (n && k > (size_t)-1 / n) return 0;
     size_t t = k * n;
-    void *p = big_alloc(t);
-    if (p) { memset(p, 0, t); return p; }   /* (a DPMI block isn't always zeroed) */
-    return __real_calloc(k, n);
+    void *p = __wrap_malloc(t);
+    if (p) memset(p, 0, t);
+    return p;
 }
 
 void __wrap_free(void *p) {
-    struct big_header *h = header_of(p);
-    if (h) big_free(h);
-    else __real_free(p);
+    struct big_header *h;
+    struct small_header *sh;
+    if (!p) return;
+    if ((h = header_of(p))) big_free(h);
+    else if ((sh = small_of(p))) small_free(sh);
+    else __real_free(p);                   /* (one of DJGPP's own, as memalign's) */
 }
 
 void *__wrap_realloc(void *p, size_t n) {
-    struct big_header *h = header_of(p);
     if (!p) return __wrap_malloc(n);
     if (!n) { __wrap_free(p); return 0; }
-    size_t old = h ? h->size : 0;
-    if (!h) return __real_realloc(p, n);   /* (DJGPP's malloc doesn't say how big its block is,
-                                               so one of its blocks stays one of its blocks) */
-    if (n <= old && n >= old / 2) { h->size = (uint32_t)n; h->check = MAGIC ^ h->handle ^ h->size ^ (uint32_t)(uintptr_t)h; return p; }
-    void *q = __wrap_malloc(n);
+    struct big_header *h = header_of(p);
+    struct small_header *sh = h ? 0 : small_of(p);
+    if (!h && !sh) return __real_realloc(p, n);
+    size_t old = h ? h->size : sh->size;
+    if (h && n <= old && n >= old / 2) {   /* a big one, a little smaller: as it is */
+        h->size = (uint32_t)n; h->check = MAGIC ^ h->handle ^ h->size ^ (uint32_t)(uintptr_t)h;
+        return p;
+    }
+    if (sh && (n < BIG || s_state < 0)) {  /* a small one staying small: DJGPP's realloc */
+        g_heap_live -= old;
+        sh->magic = 0;
+        struct small_header *q = (struct small_header *)__real_realloc(sh, n + sizeof *sh);
+        if (!q) { small_done(sh, old); return 0; }
+        return small_done(q, n);
+    }
+    void *q = __wrap_malloc(n);            /* (to a DPMI block when it's grown to BIG) */
     if (!q) return 0;
     memcpy(q, p, n < old ? n : old);
-    big_free(h);
+    __wrap_free(p);
     return q;
 }
