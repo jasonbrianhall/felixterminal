@@ -341,6 +341,8 @@ static int chirp_mkstemps(char *tmpl, int suffixlen, size_t room) {
 }
 
 extern FILE *g_chirp_log;        // mixer_dos.cpp
+double chirp_music_position(void);
+double chirp_audio_latency(void);
 
 // ---- DOS critical errors ------------------------------------------------------
 // A drive with no disk in it (A:), or one that can't be read, makes DOS ask
@@ -366,6 +368,31 @@ static void fail_critical_errors(void) {
     dosmemput(handler, sizeof handler, seg * 16);
     __dpmi_raddr a = { 0, (unsigned short)seg };
     __dpmi_set_real_mode_interrupt_vector(0x24, &a);
+}
+
+// ---- "Loading ..." ----------------------------------------------------------
+// felixchirp/ calls this before it opens a file; on DOS nothing else runs
+// while it does (a .kfn's tracks take a few seconds), so the screen as it was
+// gets a notice over it, shown at once.
+static int s_win_w, s_win_h;
+void iv_show_busy(const char *name) {
+    if (!g_sdl_renderer || !s_win_w) return;
+    if (g_chirp_log) { fprintf(g_chirp_log, "%llu ms: opening %s\n", (unsigned long long)SDL_GetTicks(), name); fflush(g_chirp_log); }
+    iv_render(s_win_w, s_win_h);
+    char msg[300];
+    snprintf(msg, sizeof msg, "Loading %s ...", name);
+    int px = g_font_size;
+    float tw = measure_text(msg, px);
+    if (tw > s_win_w - 40) { snprintf(msg, sizeof msg, "Loading ..."); tw = measure_text(msg, px); }
+    float bw = tw + 2.f * px, bh = 2.4f * px;
+    float bx = (s_win_w - bw) * 0.5f, by = (s_win_h - bh) * 0.5f;
+    draw_rect(bx, by, bw, bh, 0.10f, 0.12f, 0.20f, 0.95f);
+    draw_rect(bx, by, bw, 1, 0.35f, 0.50f, 0.85f, 1.f);
+    draw_rect(bx, by + bh - 1, bw, 1, 0.35f, 0.50f, 0.85f, 1.f);
+    draw_rect(bx, by, 1, bh, 0.35f, 0.50f, 0.85f, 1.f);
+    draw_rect(bx + bw - 1, by, 1, bh, 0.35f, 0.50f, 0.85f, 1.f);
+    draw_text(msg, bx + px, by + bh * 0.5f + px * 0.35f, px, px, 0.90f, 0.95f, 1.f, 1.f, 0, 0);
+    SDL_RenderPresent(g_sdl_renderer);
 }
 
 // ============================================================================
@@ -555,6 +582,7 @@ int main(int argc, char **argv) {
 
     log_memory("with the screen and sound open");
     int win_w = mode.w, win_h = mode.h;
+    s_win_w = win_w; s_win_h = win_h;
     iv_open(false, win_w, win_h);
     strncpy(g_iv.path, dir.c_str(), sizeof(g_iv.path) - 1);
     iv_refresh();
@@ -582,7 +610,8 @@ int main(int argc, char **argv) {
                         for (size_t i = 0; i < ms.size(); i++) if (ms[i].w == win_w && ms[i].h == win_h) cur = (int)i;
                         int k = (int)ms.size();
                         int next = (e.key.mod & SDL_KMOD_SHIFT) ? (cur < 0 ? k - 1 : (cur + k - 1) % k) : (cur + 1) % k;
-                        if (!set_mode(ms[(size_t)next], &win_w, &win_h))
+                        if (set_mode(ms[(size_t)next], &win_w, &win_h)) { s_win_w = win_w; s_win_h = win_h; }
+                        else
                             snprintf(g_iv.error, sizeof g_iv.error, "Can't set %dx%d: %s", ms[(size_t)next].w, ms[(size_t)next].h, SDL_GetError());
                     }
                     need = true;
@@ -645,6 +674,28 @@ int main(int argc, char **argv) {
         }
 
         uint64_t now = SDL_GetTicks();
+        // Chirp times a song (the lyrics, the visualizer, the clock shown)
+        // from when it started. Here that's steered to the sound as heard
+        // (chirp_music_position): a little each frame so it stays smooth, at
+        // once when far out (a seek, the main loop busy for a while).
+        if (g_iv.audio_playing && !g_iv.audio_paused && g_iv.music) {
+            double heard = chirp_music_position();
+            if (heard >= 0) {
+                double ours = (now - g_iv.audio_start_ticks) / 1000.0;
+                double err = ours - heard;
+                if (err > 0.25 || err < -0.25) g_iv.audio_start_ticks = now - heard * 1000.0;
+                else g_iv.audio_start_ticks += err * 1000.0 * 0.05;
+                if (g_chirp_log) {
+                    static uint64_t le;
+                    if (now - le >= 2000) {
+                        le = now;
+                        fprintf(g_chirp_log, "song at %.2f s heard, %.3f s by Chirp's clock (latency %.3f)\n", heard, ours,
+                                chirp_audio_latency());
+                        fflush(g_chirp_log);
+                    }
+                }
+            }
+        }
         { static uint64_t lm; if (g_chirp_log && now - lm >= 5000) { lm = now; log_memory("now"); } }
         iv_tick((now - last) / 1000.0);
         last = now;

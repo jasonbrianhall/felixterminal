@@ -67,6 +67,15 @@ static int  s_music_loops = 0;               // plays left after this one (-1: f
 static bool s_music_paused = false;
 static int  s_music_volume = MIX_MAX_VOLUME;
 
+// Where the song really is (chirp_music_position): its frames taken by the
+// device since it started or was moved to s_music_base seconds, when the
+// last callback ran, and how far behind the speaker the device is (SDL's
+// Sound Blaster driver keeps a ring of 4 chunks and 2 DMA halves).
+static double   s_music_base;
+static uint64_t s_music_frames;
+static uint64_t s_cb_ns;
+static double   s_dev_latency;
+
 struct Channel {
     Mix_Chunk *chunk = nullptr;
     Uint32 pos = 0;
@@ -343,6 +352,16 @@ void Mix_FreeMusic(Mix_Music *m) {
     delete m;
 }
 
+// A long MP3, OGG, FLAC or WAV as a chunk (kfn's backing track): read as it
+// plays, as music is, so it starts at once. Decoding it all first took
+// seconds on DOS (the main loop, and so the sound, stood still meanwhile)
+// and the whole song in memory.
+struct ChunkStream {
+    Mix_Music *src;
+    SDL_AudioStream *conv;         // its format -> S16 stereo MIX_RATE
+    bool ended;
+};
+
 // ---------------------------------------------------------------- mixing
 
 static inline int16_t clip16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
@@ -380,6 +399,7 @@ static void SDLCALL audio_cb(void *, SDL_AudioStream *stream, int additional, in
     }
     static std::vector<int32_t> acc;
     static std::vector<int16_t> tmp;
+    s_cb_ns = SDL_GetTicksNS();
     while (additional > 0) {
         int frames = additional / 4;
         if (frames > 2048) frames = 2048;
@@ -392,9 +412,26 @@ static void SDLCALL audio_cb(void *, SDL_AudioStream *stream, int additional, in
             feed_music(bytes);
             int got = SDL_GetAudioStreamData(s_conv, tmp.data(), bytes);
             for (int i = 0; i < got / 2; i++) acc[i] += tmp[i] * s_music_volume / MIX_MAX_VOLUME;
+            if (got > 0) s_music_frames += (uint64_t)(got / 4);
         }
         for (Channel &c : s_chan) {
             if (!c.chunk || c.paused) continue;
+            if (c.chunk->stream) {
+                ChunkStream *cs = (ChunkStream *)c.chunk->stream;
+                static int16_t dec[4096 * 8];
+                while (!cs->ended && SDL_GetAudioStreamAvailable(cs->conv) < bytes) {
+                    int n = music_decode(cs->src, dec, 4096);
+                    if (n > 0) { SDL_PutAudioStreamData(cs->conv, dec, n * cs->src->channels * 2); continue; }
+                    if (c.loops != 0 && music_rewind(cs->src)) { if (c.loops > 0) c.loops--; continue; }
+                    cs->ended = true;
+                    SDL_FlushAudioStream(cs->conv);
+                }
+                int got = SDL_GetAudioStreamData(cs->conv, tmp.data(), bytes);
+                int vol = c.volume * c.chunk->volume / MIX_MAX_VOLUME;
+                for (int i = 0; i < got / 2; i++) acc[i] += tmp[i] * vol / MIX_MAX_VOLUME;
+                if (cs->ended && got < bytes && SDL_GetAudioStreamAvailable(cs->conv) == 0) c.chunk = nullptr;
+                continue;
+            }
             const int16_t *src = (const int16_t *)c.chunk->abuf;
             Uint32 total = c.chunk->alen / 2;
             int vol = c.volume * c.chunk->volume / MIX_MAX_VOLUME;
@@ -421,14 +458,20 @@ int Mix_OpenAudio(int, SDL_AudioFormat, int, int) {
     if (s_dev) return 0;
     if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) return -1;
     SDL_AudioSpec spec = { SDL_AUDIO_S16, 2, MIX_RATE };
-    // A DMA half-buffer of 2048 frames (46 ms at 44.1 kHz; SDL's ring holds
-    // four): on DOS the mixer runs only when the main loop yields, and a
-    // frame of the visualizer can take a while on a slow machine.
-    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "2048");
+    // A DMA half-buffer of 1024 frames (46 ms at SB Pro's 22050 Hz; SDL's
+    // ring holds four more): on DOS the mixer runs only when the main loop
+    // yields, so it needs some, and what's queued is how far the sound is
+    // behind (chirp_music_position allows for it).
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "1024");
     s_dev = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, audio_cb, nullptr);
     if (!s_dev) return -1;
     s_conv = SDL_CreateAudioStream(&spec, &spec);
     SDL_ResumeAudioStreamDevice(s_dev);
+    {
+        SDL_AudioSpec dev; int frames = 0;
+        if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s_dev), &dev, &frames) && dev.freq > 0 && frames > 0)
+            s_dev_latency = 5.0 * frames / dev.freq;   // (the ring kept about full, and half the DMA buffer)
+    }
     if (s_log) {
         SDL_AudioSpec dev; int frames = 0;
         SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s_dev), &dev, &frames);
@@ -461,6 +504,7 @@ int Mix_AllocateChannels(int n) {
 
 int Mix_PlayMusic(Mix_Music *m, int loops) {
     if (!m || !s_dev) return -1;
+    if (s_log) { fprintf(s_log, "%llu ms: song starts\n", (unsigned long long)SDL_GetTicks()); fflush(s_log); }
     lock();
     s_music = m;
     SDL_AudioSpec src = { SDL_AUDIO_S16, m->channels, m->rate };
@@ -468,6 +512,8 @@ int Mix_PlayMusic(Mix_Music *m, int loops) {
     SDL_ClearAudioStream(s_conv);
     music_rewind(m);
     s_music_loops = loops < 0 ? -1 : loops > 1 ? loops - 1 : 0;   // SDL_mixer: 0 and 1 both play once
+    s_music_base = 0;
+    s_music_frames = 0;
     s_music_paused = false;
     unlock();
     return 0;
@@ -515,7 +561,7 @@ int Mix_SetMusicPosition(double pos) {
     case MUS_MIDI: ok = midi_start(m); if (ok) midi_skip_to(pos); break;
     default: break;
     }
-    if (ok) { m->at_end = false; SDL_ClearAudioStream(s_conv); }
+    if (ok) { m->at_end = false; SDL_ClearAudioStream(s_conv); s_music_base = pos; s_music_frames = 0; }
     unlock();
     if (!ok) SDL_SetError("can't seek");
     return ok ? 0 : -1;
@@ -588,10 +634,29 @@ static Mix_Chunk *chunk_from_pcm(const int16_t *pcm, size_t samples, int rate, i
     SDL_AudioSpec in = { SDL_AUDIO_S16, channels, rate }, out = { SDL_AUDIO_S16, 2, MIX_RATE };
     Uint8 *dst = nullptr; int dlen = 0;
     if (!SDL_ConvertAudioSamples(&in, (const Uint8 *)pcm, (int)(samples * 2), &out, &dst, &dlen)) return nullptr;
-    return new Mix_Chunk{1, dst, (Uint32)dlen, MIX_MAX_VOLUME};
+    return new Mix_Chunk{1, dst, (Uint32)dlen, MIX_MAX_VOLUME, nullptr};
 }
 
 Mix_Chunk *Mix_LoadWAV(const char *file) {
+    // A long compressed (or WAV) file, not MIDI: read as it plays
+    {
+        FILE *f = fopen(file, "rb");
+        long size = 0;
+        char magic[4] = {0};
+        if (f) { size_t n = fread(magic, 1, 4, f); (void)n; fseek(f, 0, SEEK_END); size = ftell(f); fclose(f); }
+        bool voc = !memcmp(magic, "Crea", 4), aiff = !memcmp(magic, "FORM", 4), midi = !memcmp(magic, "MThd", 4);
+        if (size > 256 * 1024 && !voc && !aiff && !midi && s_dev) {
+            Mix_Music *m = new Mix_Music;
+            if (open_ogg(m, file) || open_mp3(m, file) || open_flac(m, file) || open_wav(m, file)) {
+                SDL_AudioSpec in = { SDL_AUDIO_S16, m->channels, m->rate }, out = { SDL_AUDIO_S16, 2, MIX_RATE };
+                ChunkStream *cs = new ChunkStream{ m, SDL_CreateAudioStream(&in, &out), false };
+                if (cs->conv) return new Mix_Chunk{0, nullptr, 0, MIX_MAX_VOLUME, cs};
+                delete cs;
+                music_close(m);
+            }
+            delete m;
+        }
+    }
     std::vector<uint8_t> data, wav;
     if (!read_file(file, data)) { SDL_SetError("can't read %s", file); return nullptr; }
     const char *e = ext_of(file);
@@ -639,6 +704,13 @@ void Mix_FreeChunk(Mix_Chunk *c) {
     lock();
     for (Channel &ch : s_chan) if (ch.chunk == c) ch.chunk = nullptr;
     unlock();
+    if (c->stream) {
+        ChunkStream *cs = (ChunkStream *)c->stream;
+        SDL_DestroyAudioStream(cs->conv);
+        music_close(cs->src);
+        delete cs->src;
+        delete cs;
+    }
     if (c->allocated) SDL_free(c->abuf);
     delete c;
 }
@@ -652,6 +724,12 @@ int Mix_PlayChannel(int ch, Mix_Chunk *c, int loops) {
     if (ch < 0 || ch >= (int)s_chan.size()) { unlock(); SDL_SetError("no free channels"); return -1; }
     Channel &k = s_chan[(size_t)ch];
     k.chunk = c; k.pos = 0; k.loops = loops; k.paused = false;
+    if (c->stream) {
+        ChunkStream *cs = (ChunkStream *)c->stream;
+        music_rewind(cs->src);
+        SDL_ClearAudioStream(cs->conv);
+        cs->ended = false;
+    }
     unlock();
     return ch;
 }
@@ -693,3 +771,25 @@ int Mix_Volume(int ch, int v) {
     unlock();
     return old;
 }
+
+// Where the song is, in seconds, as heard: what the device has taken of it,
+// less what's still queued ahead of the speaker, plus the time since then.
+// -1 when nothing plays. (Chirp's own clock is the time since the song
+// started; on DOS that runs ahead of the sound: the Sound Blaster's buffers,
+// an SB Pro's rate, the mixer stopped while the main loop is busy.)
+double chirp_music_position(void) {
+    if (!s_dev) return -1;
+    lock();
+    double pos = -1;
+    if (s_music && !s_music_paused && s_cb_ns) {
+        double queued = SDL_GetAudioStreamQueued(s_dev) / 4.0;            // (S16 stereo at MIX_RATE)
+        double since = (SDL_GetTicksNS() - s_cb_ns) / 1e9;
+        if (since > 0.25) since = 0.25;
+        pos = s_music_base + (s_music_frames - queued) / MIX_RATE - s_dev_latency + since;
+        if (pos < s_music_base - s_dev_latency) pos = s_music_base - s_dev_latency;
+    }
+    unlock();
+    return pos;
+}
+
+double chirp_audio_latency(void) { return s_dev_latency; }
