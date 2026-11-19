@@ -100,6 +100,22 @@ static void iv_kfn_parse_ini(const std::string &content) {
     std::map<int, std::vector<int>> syncMap;
     std::string currentSection;
 
+    // The lyrics are in one [effN] section, the first with textN lines (its
+    // number varies from file to file); text and sync from any other (a
+    // second singer's track) would be mixed in.
+    std::string lyricsSection;
+    {
+        std::string sec;
+        for (auto &raw : lines) {
+            std::string line = kfn_trim(raw);
+            if (line.size() > 1 && line.front() == '[' && line.back() == ']') { sec = kfn_lower(line.substr(1, line.size() - 2)); continue; }
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || sec.rfind("eff", 0) != 0) continue;
+            std::string k = kfn_lower(kfn_trim(line.substr(0, eq)));
+            if (k.rfind("text", 0) == 0 && kfn_all_digits(k, 4)) { lyricsSection = sec; break; }
+        }
+    }
+
     for (auto &raw : lines) {
         std::string line = kfn_trim(raw);
         if (line.empty()) continue;
@@ -120,11 +136,12 @@ static void iv_kfn_parse_ini(const std::string &content) {
             if (keyLower == "artist") artist = value;
         }
 
-        if (keyLower.rfind("text", 0) == 0 && kfn_all_digits(keyLower, 4)) {
+        bool inLyrics = !lyricsSection.empty() && currentSection == lyricsSection;
+        if (inLyrics && keyLower.rfind("text", 0) == 0 && kfn_all_digits(keyLower, 4)) {
             int idx = atoi(keyLower.c_str() + 4);
             textMap[idx] = value;
         }
-        if (keyLower.rfind("sync", 0) == 0 && kfn_all_digits(keyLower, 4)) {
+        if (inLyrics && keyLower.rfind("sync", 0) == 0 && kfn_all_digits(keyLower, 4)) {
             int idx = atoi(keyLower.c_str() + 4);
             std::vector<int> times;
             size_t pos = 0;
@@ -155,18 +172,19 @@ static void iv_kfn_parse_ini(const std::string &content) {
     for (int i = 0; textMap.count(i); i++) {
         const std::string &line = textMap[i];
 
-        // KaraFun's syllables: '/' and ' ' each end one, and each takes the
-        // next sync time, an empty one too: "/Whose" and "home/ of" have an
-        // empty syllable, the end of the held note before. '_' is a timed
-        // pause. Those take a time but aren't words. (Splitting on '/' and
-        // then on spaces lost the empty ones, and from there every word had
-        // the time of the one before.)
+        // KaraFun's syllables: '/' and ' ' each end one (a run of spaces
+        // counts once), and each takes the next sync time, an empty one
+        // too: "/Whose" and "home/ of" have an empty syllable, the end of
+        // the held note before. '_' is a timed pause. Those take a time but
+        // aren't words. (Splitting on '/' and then on spaces lost the empty
+        // ones, and from there every word had the time of the one before.)
         std::vector<std::string> words;
         std::vector<double> times;
         {
             size_t pos = 0;
             while (pos <= line.size()) {
                 size_t end = line.find_first_of("/ ", pos);
+                if (end == pos && line[end] == ' ' && pos > 0 && line[pos - 1] == ' ') { pos++; continue; }
                 std::string syl = (end == std::string::npos) ? line.substr(pos) : line.substr(pos, end - pos);
                 double t = (timingIdx < allTimings.size()) ? (allTimings[timingIdx] / 1000.0) : 0.0;
                 timingIdx++;
