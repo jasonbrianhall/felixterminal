@@ -2085,17 +2085,22 @@ void iv_render(int win_w, int win_h) {
                      g_iv.img_label, g_iv.tex_w, g_iv.tex_h);
         } else {
             int n = (int)g_iv.entries.size();
-            int imgs = 0, audio = 0, cdgs = 0, kfns = 0;
+            int imgs = 0, audio = 0, cdgs = 0, kfns = 0, texts = 0;
             for (auto &e : g_iv.entries) {
                 if (!e.is_dir && !e.is_zip) {
                     if (e.is_audio) audio++;
                     else if (e.is_cdg) cdgs++;
                     else if (e.is_kfn) kfns++;
+                    else if (is_text_ext(e.name)) texts++;     // (text files aren't pictures)
                     else imgs++;
                 }
             }
-            snprintf(status, sizeof(status), "  %d items  (%d images, %d audio, %d cdg, %d kfn)",
-                     n, imgs, audio, cdgs, kfns);
+            if (texts)
+                snprintf(status, sizeof(status), "  %d items  (%d images, %d audio, %d text, %d cdg, %d kfn)",
+                         n, imgs, audio, texts, cdgs, kfns);
+            else
+                snprintf(status, sizeof(status), "  %d items  (%d images, %d audio, %d cdg, %d kfn)",
+                         n, imgs, audio, cdgs, kfns);
         }
         iv_draw_text(status, (float)IV_PAD, st_y + status_h * 0.72f,
                      0.60f, 0.70f, 0.85f, 1.f);

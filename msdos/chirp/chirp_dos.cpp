@@ -192,29 +192,71 @@ struct TextImage {
     int x0 = 0, top = 0, w = 0, h = 0;   // the texture's place from the pen and the baseline
     float adv = 0;
     unsigned long used = 0;        // the frame it was last drawn in
+    bool drawable = false;         // made to be drawn (false: only measured, no texture)
 };
 static std::unordered_map<std::string, TextImage> s_texts;
 static unsigned long s_frame;      // (counted by main)
-static size_t s_text_pixels;
+static size_t s_text_pixels;       // in all of them
+// The most the kept texts may take, in pixels (4 bytes each): an eighth of
+// the memory free at the start (main sets it), at least 192K pixels (two
+// screens of text at 640x480), at most 1M (4 MB). They're also let go when
+// a file is opened (forget_unseen_texts). DOSBox gives DOS 16 MB by default,
+// about 6 of them free once Chirp's screen is open; scrolling through a few
+// source files kept a texture per line seen, and the DPMI host then paged to
+// disk: Chirp seemed to freeze.
+static size_t s_text_budget = 1u << 20;
+static int s_win_w, s_win_h;       // (the screen: no text texture is wider)
 
-static void forget_old_texts(void) {
-    if (s_texts.size() < 400 && s_text_pixels < 4000000) return;
-    for (auto it = s_texts.begin(); it != s_texts.end();) {
-        if (s_frame - it->second.used > 60) {
-            if (it->second.tex) SDL_DestroyTexture(it->second.tex);
-            s_text_pixels -= (size_t)it->second.w * it->second.h;
-            it = s_texts.erase(it);
-        } else ++it;
+static void forget_text(std::unordered_map<std::string, TextImage>::iterator it) {
+    if (it->second.tex) SDL_DestroyTexture(it->second.tex);
+    s_text_pixels -= (size_t)it->second.w * it->second.h;
+    s_texts.erase(it);
+}
+
+// Room for `need` more pixels: the texts drawn longest ago go first (none
+// drawn this frame).
+static void make_room_for_text(size_t need) {
+    while (s_text_pixels + need > s_text_budget) {
+        auto oldest = s_texts.end();
+        for (auto it = s_texts.begin(); it != s_texts.end(); ++it)
+            if (it->second.used != s_frame && (oldest == s_texts.end() || it->second.used < oldest->second.used))
+                oldest = it;
+        if (oldest == s_texts.end()) break;          // (all on screen now: over the budget for a frame)
+        forget_text(oldest);
     }
 }
 
-static const TextImage &text_image(const char *text, int px, int bold) {
+// All but what the last frame drew: a file is being opened, and the text of
+// the one before (a page of a source file, say) won't be drawn again.
+static void forget_unseen_texts(void) {
+    for (auto it = s_texts.begin(); it != s_texts.end();) {
+        auto next = std::next(it);
+        if (it->second.used + 1 < s_frame) forget_text(it);
+        it = next;
+    }
+}
+
+static void forget_old_texts(void) {
+    if (s_texts.size() > 2000) {                      // (many blank ones: drop those unused a while)
+        for (auto it = s_texts.begin(); it != s_texts.end();) {
+            auto next = std::next(it);
+            if (s_frame - it->second.used > 120) forget_text(it);
+            it = next;
+        }
+    }
+}
+
+static const TextImage &text_image(const char *text, int px, int bold, bool make_texture = true) {
     std::string key(text);
     key += '\0'; key += (char)px; key += (char)bold;
     auto it = s_texts.find(key);
-    if (it != s_texts.end()) return it->second;
+    if (it != s_texts.end() && (it->second.drawable || !make_texture)) return it->second;
+    if (it != s_texts.end()) s_texts.erase(it);       // (measured before; now it's drawn)
 
-    // Where the glyphs go: their box, from the pen at 0 on the baseline
+    // Where the glyphs go: their box, from the pen at 0 on the baseline.
+    // Glyphs past the screen's width aren't kept (nor drawn): only the
+    // advance counts them.
+    const int max_w = s_win_w > 0 ? s_win_w : 4096;
     struct Placed { const Glyph *g; int x; };
     std::vector<Placed> pl;
     float cx = 0;
@@ -226,7 +268,7 @@ static const TextImage &text_image(const char *text, int px, int bold) {
         if (cp == 0xFE0F || cp == '\n' || cp == '\r') continue;
         if (cp == '\t') cp = ' ';
         const Glyph &g = glyph(cp, px, bold);
-        if (!g.cov.empty()) {
+        if (!g.cov.empty() && make_texture && (int)(cx + g.left) + g.w <= max_w) {
             int gx = (int)(cx + g.left + 0.5f);
             if (!any) { x0 = gx; x1 = gx + g.w; top = g.top; bot = g.h - g.top; any = true; }
             x0 = std::min(x0, gx); x1 = std::max(x1, gx + g.w);
@@ -237,8 +279,10 @@ static const TextImage &text_image(const char *text, int px, int bold) {
     }
     TextImage ti;
     ti.adv = cx;
+    ti.drawable = make_texture;
     if (any && x1 > x0 && top + bot > 0) {
         ti.x0 = x0; ti.top = top; ti.w = x1 - x0; ti.h = top + bot;
+        make_room_for_text((size_t)ti.w * ti.h);
         std::vector<uint32_t> px32((size_t)ti.w * ti.h, 0x00FFFFFF);
         for (const Placed &q : pl) {
             const Glyph &g = *q.g;
@@ -281,7 +325,7 @@ float draw_text(const char *text, float x, float y, int font_px, int, float r, f
 
 float measure_text(const char *text, int font_px) {
     if (!text || !*text) return 0;
-    return text_image(text, font_px, 0).adv;
+    return text_image(text, font_px, 0, false).adv;   // (no texture: just how wide)
 }
 
 // ---- temp files (DJGPP has no mkstemps) -------------------------------------
@@ -374,10 +418,17 @@ static void fail_critical_errors(void) {
 // felixchirp/ calls this (g_iv_busy_hook) before it opens a file; on DOS nothing else runs
 // while it does (a .kfn's tracks take a few seconds), so the screen as it was
 // gets a notice over it, shown at once.
-static int s_win_w, s_win_h;
 static void show_busy(const char *name) {
     if (!g_sdl_renderer || !s_win_w) return;
-    if (g_chirp_log) { fprintf(g_chirp_log, "%llu ms: opening %s\n", (unsigned long long)SDL_GetTicks(), name); fflush(g_chirp_log); }
+    forget_unseen_texts();
+    if (g_chirp_log) {
+        __dpmi_free_mem_info fi;
+        unsigned long freekb = __dpmi_get_free_memory_information(&fi) == 0 ? fi.total_number_of_free_pages * 4 : 0;
+        fprintf(g_chirp_log, "%llu ms: opening %s (%lu KB free; %u texts, %u KB of them, budget %u KB; %u glyphs)\n",
+                (unsigned long long)SDL_GetTicks(), name, freekb, (unsigned)s_texts.size(), (unsigned)(s_text_pixels * 4 / 1024),
+                (unsigned)(s_text_budget * 4 / 1024), (unsigned)s_glyphs.size());
+        fflush(g_chirp_log);
+    }
     iv_render(s_win_w, s_win_h);
     char msg[300];
     snprintf(msg, sizeof msg, "Loading %s ...", name);
@@ -507,6 +558,15 @@ static std::string dos_path(std::string p) {
 int main(int argc, char **argv) {
     if (getenv("CHIRP_LOG")) g_chirp_log = fopen(getenv("CHIRP_LOG"), "w");
     fail_critical_errors();
+    {
+        __dpmi_free_mem_info fi;
+        if (__dpmi_get_free_memory_information(&fi) == 0 && fi.total_number_of_free_pages != 0xFFFFFFFFul) {
+            size_t free_bytes = (size_t)fi.total_number_of_free_pages * 4096;
+            s_text_budget = free_bytes / 8 / 4;          // an eighth of it, 4 bytes a pixel
+        }
+        if (s_text_budget < (192u << 10)) s_text_budget = 192u << 10;   // (two screens' text at 640x480)
+        if (s_text_budget > (1u << 20)) s_text_budget = 1u << 20;       // (4 MB)
+    }
     g_iv_busy_hook = show_busy;      // "Loading ..." while felixchirp/ opens a file
     log_memory("at start");
     int want_w = 0, want_h = 0, want_bpp = 0;
