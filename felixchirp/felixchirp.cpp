@@ -1609,9 +1609,17 @@ void iv_render(int win_w, int win_h) {
         draw_rect(0, (float)(title_h-1), (float)win_w, 1, 0.25f, 0.35f, 0.60f, 1.f);
         const char *mode_str = g_iv.remote ? "Felix Chirp — Remote" : "Felix Chirp";
         char title[256];
+#ifdef __DJGPP__
+        // DOS: Chirp is a program of its own (CHIRP.EXE), not Felix
+        // Terminal's F5; F2 changes the screen mode, Alt+letter the drive.
+        snprintf(title, sizeof(title),
+                 "%s   %dx%d (F2: mode)   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Alt+letter: drive   Esc: quit",
+                 mode_str, win_w, win_h);
+#else
         snprintf(title, sizeof(title),
                  "%s (F5)   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Esc: close",
                  mode_str);
+#endif
         iv_draw_text(title, (float)IV_PAD, (float)title_h * 0.72f, 0.75f, 0.88f, 1.0f, 1.f);
     }
 

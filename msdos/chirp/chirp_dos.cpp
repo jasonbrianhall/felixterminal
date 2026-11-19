@@ -34,6 +34,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <dpmi.h>
+#include <go32.h>
+#include <sys/movedata.h>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -259,6 +262,22 @@ static int chirp_mkstemps(char *tmpl, int suffixlen, size_t room) {
     return -1;
 }
 
+// ---- DOS critical errors ------------------------------------------------------
+// A drive with no disk in it (A:), or one that can't be read, makes DOS ask
+// "Abort, Retry, Fail?" through INT 24h: on the text screen, unseen in a
+// VESA mode, and Abort ends Chirp there and then. This handler answers Fail
+// at once, so the call just fails (an empty folder, "No drive A:"). DOS puts
+// the old vector back when Chirp exits.
+static void fail_critical_errors(void) {
+    static const unsigned char handler[] = { 0xB0, 0x03, 0xCF };   // mov al,3 (Fail); iret
+    int sel = 0;
+    int seg = __dpmi_allocate_dos_memory(1, &sel);                  // (16 bytes)
+    if (seg == -1) return;
+    dosmemput(handler, sizeof handler, seg * 16);
+    __dpmi_raddr a = { 0, (unsigned short)seg };
+    __dpmi_set_real_mode_interrupt_vector(0x24, &a);
+}
+
 // ============================================================================
 // THE SCREEN
 // ============================================================================
@@ -371,6 +390,7 @@ extern FILE *g_chirp_log;        // mixer_dos.cpp
 
 int main(int argc, char **argv) {
     if (getenv("CHIRP_LOG")) g_chirp_log = fopen(getenv("CHIRP_LOG"), "w");
+    fail_critical_errors();
     int want_w = 0, want_h = 0, want_bpp = 0;
     const char *start = nullptr;
     bool show_modes = false;
@@ -486,7 +506,7 @@ int main(int argc, char **argv) {
                         g_iv.scroll_top = 0;
                         iv_refresh();
                     } else {
-                        snprintf(g_iv.error, sizeof g_iv.error, "No drive %c:", root[0]);
+                        snprintf(g_iv.error, sizeof g_iv.error, "Can't read %c: (no disk?)", root[0]);
                     }
                     need = true;
                     break;
