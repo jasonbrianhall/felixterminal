@@ -11,6 +11,7 @@
 #endif
 
 #include <string>
+#include <vector>
 #include <cstring>
 #include <algorithm>
 #include <sys/stat.h>
@@ -243,15 +244,67 @@ void iv_close() {
     g_iv.visible = false;
 }
 
+// The most a picture is kept at, on its long side, in pixels: one larger is
+// made smaller as soon as it's decoded (the texture is 4 bytes a pixel, and
+// on DOS the memory a picture took is kept by Chirp until it exits; a
+// 12-megapixel photo took over 150 MB). 2048 still zooms to 3x on a
+// 640x480 screen with every pixel there. Elsewhere, the picture as it is.
+#ifdef __DJGPP__
+static const int IV_MAX_PICTURE_SIDE = 2048;
+#else
+static const int IV_MAX_PICTURE_SIDE = 0;
+#endif
+
+// Average `src` (sw x sh, `comp` bytes a pixel) down to dw x dh RGBA.
+static unsigned char *iv_shrink_to_rgba(const unsigned char *src, int sw, int sh, int comp, int dw, int dh) {
+    unsigned char *dst = (unsigned char *)malloc((size_t)dw * dh * 4);
+    if (!dst) return nullptr;
+    std::vector<uint32_t> acc((size_t)dw * 4);
+    std::vector<int> x0(dw + 1);
+    for (int x = 0; x <= dw; x++) x0[x] = (int)((long long)x * sw / dw);
+    for (int y = 0; y < dh; y++) {
+        int ya = (int)((long long)y * sh / dh), yb = (int)((long long)(y + 1) * sh / dh);
+        if (yb <= ya) yb = ya + 1;
+        std::fill(acc.begin(), acc.end(), 0);
+        for (int sy = ya; sy < yb; sy++) {
+            const unsigned char *row = src + (size_t)sy * sw * comp;
+            for (int x = 0; x < dw; x++) {
+                uint32_t *a = &acc[(size_t)x * 4];
+                int xb = x0[x + 1] > x0[x] ? x0[x + 1] : x0[x] + 1;
+                for (int sx = x0[x]; sx < xb; sx++) {
+                    const unsigned char *p = row + (size_t)sx * comp;
+                    if (comp >= 3) { a[0] += p[0]; a[1] += p[1]; a[2] += p[2]; a[3] += comp == 4 ? p[3] : 255; }
+                    else           { a[0] += p[0]; a[1] += p[0]; a[2] += p[0]; a[3] += comp == 2 ? p[1] : 255; }
+                }
+            }
+        }
+        unsigned char *out = dst + (size_t)y * dw * 4;
+        for (int x = 0; x < dw; x++) {
+            int xb = x0[x + 1] > x0[x] ? x0[x + 1] : x0[x] + 1;
+            uint32_t n = (uint32_t)(xb - x0[x]) * (uint32_t)(yb - ya);
+            for (int k = 0; k < 4; k++) out[x * 4 + k] = (unsigned char)((acc[(size_t)x * 4 + k] + n / 2) / n);
+        }
+    }
+    return dst;
+}
+
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label) {
-    int w, h, ch;
-    unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &ch, 4);
+    int w = 0, h = 0, ch = 0;
+    iv_free_tex();                     // (the last picture's memory before this one's is taken)
+    // As few bytes a pixel as the picture has (a JPEG: 3, not 4), when it
+    // will be made smaller anyway: less to hold while it's decoded.
+    int want = 4;
+    if (IV_MAX_PICTURE_SIDE && stbi_info_from_memory(data, (int)len, &w, &h, &ch) &&
+        (w > IV_MAX_PICTURE_SIDE || h > IV_MAX_PICTURE_SIDE))
+        want = ch == 2 || ch == 4 ? 4 : 3;
+    unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &ch, want);
     bool webp = false;
 
     // If stbi fails, try WebP decoder
     if (!px) {
         px = WebPDecodeRGBA(data, len, &w, &h);
         webp = px != nullptr;
+        want = 4;
     }
 
     if (!px) {
@@ -259,14 +312,32 @@ void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *l
         iv_free_tex();
         return;
     }
-    g_iv.error[0] = '\0';
-    iv_upload_texture(px, w, h);
+    auto free_px = [&](unsigned char *p) { if (webp) WebPFree(p); else stbi_image_free(p); };
 
-    // Freed by the decoder that made it. (This used to decode the picture a
-    // second time to find out which that was, and never freed the second
-    // one: every picture opened leaked a whole RGBA copy of itself.)
-    if (webp) WebPFree(px);
-    else stbi_image_free(px);
+    // Too big: made smaller (and RGBA) before anything else is allocated.
+    if (IV_MAX_PICTURE_SIDE && (w > IV_MAX_PICTURE_SIDE || h > IV_MAX_PICTURE_SIDE)) {
+        double sc = (double)IV_MAX_PICTURE_SIDE / (w > h ? w : h);
+        int dw = (int)(w * sc + 0.5), dh = (int)(h * sc + 0.5);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        unsigned char *small = iv_shrink_to_rgba(px, w, h, want, dw, dh);
+        free_px(px);
+        if (!small) {
+            snprintf(g_iv.error, sizeof(g_iv.error), "Out of memory: %s", label);
+            iv_free_tex();
+            return;
+        }
+        g_iv.error[0] = '\0';
+        iv_upload_texture(small, dw, dh);
+        free(small);
+    } else {
+        g_iv.error[0] = '\0';
+        iv_upload_texture(px, w, h);
+        // Freed by the decoder that made it. (This used to decode the picture a
+        // second time to find out which that was, and never freed the second
+        // one: every picture opened leaked a whole RGBA copy of itself.)
+        free_px(px);
+    }
 
     strncpy(g_iv.img_label, label, sizeof(g_iv.img_label)-1);
     // Reset view for every new image
