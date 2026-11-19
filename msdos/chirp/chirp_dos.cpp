@@ -653,7 +653,7 @@ int main(int argc, char **argv) {
     }
 
     uint64_t last = SDL_GetTicks(), last_frame = 0, started = last;
-    bool need = true, quit = false;
+    bool need = true, quit = false, pointer_moved = false;
     while (!quit && g_iv.visible) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -709,6 +709,9 @@ int main(int argc, char **argv) {
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 if (iv_mousemotion((int)e.motion.x, (int)e.motion.y, win_w, win_h)) need = true;
+                // SDL draws the pointer itself, as a frame is shown: it only
+                // moves when one is (below, up to 60 a second)
+                pointer_moved = true;
                 break;
             case SDL_EVENT_WINDOW_SHOWN: case SDL_EVENT_WINDOW_EXPOSED: case SDL_EVENT_WINDOW_RESIZED:
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
@@ -768,7 +771,8 @@ int main(int argc, char **argv) {
         // threads are cooperative: SDL's audio thread (the Sound Blaster's
         // mixing) runs only while this one waits, so it always waits a
         // little, and longer the longer a frame took to draw.
-        if (need || (animating && now - last_frame >= 16)) {
+        if (need || ((animating || pointer_moved) && now - last_frame >= 16)) {
+            pointer_moved = false;
             s_t_rect = s_t_text = 0; s_n_rect = s_n_text = s_n_glyph = 0;
             s_frame++;
             forget_old_texts();
