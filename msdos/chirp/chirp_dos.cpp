@@ -419,16 +419,17 @@ static void fail_critical_errors(void) {
 // while it does (a .kfn's tracks take a few seconds), so the screen as it was
 // gets a notice over it, shown at once.
 extern "C" unsigned long g_bigmem_blocks, g_bigmem_bytes;
-extern "C" int g_bigmem_state;   // (bigmem_dos.c: big blocks held now)
+extern "C" int g_bigmem_state;
+extern "C" unsigned long g_heap_live, g_heap_peak;   // (bigmem_dos.c: DJGPP's heap)   // (bigmem_dos.c: big blocks held now)
 static void show_busy(const char *name) {
     if (!g_sdl_renderer || !s_win_w) return;
     forget_unseen_texts();
     if (g_chirp_log) {
         __dpmi_free_mem_info fi;
         unsigned long freekb = __dpmi_get_free_memory_information(&fi) == 0 ? fi.total_number_of_free_pages * 4 : 0;
-        fprintf(g_chirp_log, "%llu ms: opening %s (%lu KB free; big blocks %s: %lu, %lu KB; %u texts, %u KB of them, budget %u KB; %u glyphs)\n",
+        fprintf(g_chirp_log, "%llu ms: opening %s (%lu KB free; big blocks %s: %lu, %lu KB; heap %lu KB (most %lu); %u texts, %u KB of them, budget %u KB; %u glyphs)\n",
                 (unsigned long long)SDL_GetTicks(), name, freekb,
-                g_bigmem_state > 0 ? "to DPMI" : g_bigmem_state < 0 ? "off (malloc)" : "untried", g_bigmem_blocks, g_bigmem_bytes / 1024,
+                g_bigmem_state > 0 ? "to DPMI" : g_bigmem_state < 0 ? "off (malloc)" : "untried", g_bigmem_blocks, g_bigmem_bytes / 1024, g_heap_live / 1024, g_heap_peak / 1024,
                 (unsigned)s_texts.size(), (unsigned)(s_text_pixels * 4 / 1024),
                 (unsigned)(s_text_budget * 4 / 1024), (unsigned)s_glyphs.size());
         fflush(g_chirp_log);
