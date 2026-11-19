@@ -83,7 +83,7 @@ CHIRP    = felixchirp cdg fc_file fc_text fc_input fc_zip fc_kfn kfn
 MINIZ    = miniz miniz_tdef miniz_tinfl miniz_zip
 # felixterminal's own MIDI (OPL3) and AIFF renderers, for the mixer
 AUDIO    = midi_render dbopl dbopl_wrapper instruments aiff_render
-OBJS     = $(BUILD)/chirp_dos.o $(BUILD)/mixer_dos.o $(BUILD)/aes_dos.o \
+OBJS     = $(BUILD)/chirp_dos.o $(BUILD)/mixer_dos.o $(BUILD)/aes_dos.o $(BUILD)/clock_dos.o \
            $(CHIRP:%=$(BUILD)/fc/%.o) $(MINIZ:%=$(BUILD)/fc/%.o) $(AUDIO:%=$(BUILD)/%.o)
 STAMP    = $(DEPS)/.built
 HDRS     = $(wildcard include/*.h include/*/*.h) $(TOP)/felixchirp/felixchirp.h
@@ -110,7 +110,7 @@ $(SDL3_LIB): $(SDL_OBJS)
 	$(CROSS)ar rcs $@ $(SDL_OBJS)
 
 CHIRP.EXE: $(OBJS) $(SDL3_LIB)
-	$(CXX) -s $(OBJS) $(LIBS) -o $(BUILD)/chirp.exe
+	$(CXX) -s -Wl,--wrap=uclock $(OBJS) $(LIBS) -o $(BUILD)/chirp.exe
 	rm -f $@ $(BUILD)/packed.exe
 	$(if $(UPX),$(UPX) -q --best -o $(BUILD)/packed.exe $(BUILD)/chirp.exe > /dev/null,cp $(BUILD)/chirp.exe $(BUILD)/packed.exe)
 	@# CWSDPMI's stub in front (cwsdpmi/), as vmdos's Felix BASIC: the
@@ -134,6 +134,8 @@ $(BUILD)/chirp_dos.o: chirp_dos.cpp
 $(BUILD)/mixer_dos.o: mixer_dos.cpp
 	$(CXX) $(CXXFLAGS) -w -c $< -o $@
 $(BUILD)/aes_dos.o: aes_dos.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/clock_dos.o: clock_dos.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD)/fc/%.o: $(TOP)/felixchirp/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@

@@ -336,6 +336,11 @@ void iv_list_local(const char *path, std::vector<IVEntry> &out) {
 #endif
     std::stable_sort(out.begin(), out.end(), [](const IVEntry &a, const IVEntry &b){
         if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
+#ifdef __DJGPP__
+        // DOS: the drives (A: B: ...) first, after ".."
+        bool ad = iv_is_drive_name(a.name), bd = iv_is_drive_name(b.name);
+        if (ad != bd) return strcmp(a.name, "..") != 0 && (ad || strcmp(b.name, "..") == 0);
+#endif
         return strcmp(a.name, b.name) < 0;
     });
 }
