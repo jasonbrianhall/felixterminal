@@ -68,6 +68,16 @@ const char *term_link_uri(uint16_t id);   // nullptr if unknown
 
 typedef enum { PS_NORMAL, PS_ESC, PS_CSI, PS_OSC, PS_CHARSET, PS_APC, PS_DCS, PS_PM, PS_SOS } ParseState;
 
+// One line of the scrollback, kept compact (see sb_encode in terminal.cpp):
+// runs of cells that share colors and attributes, each run with only the
+// fields that differ from the one before, its characters as varints (ASCII
+// is a byte), the blanks at the end left out. sb_row() turns a line back into
+// cells when it's needed.
+struct SbLine {
+    uint8_t      *data;        // nullptr for a blank line
+    uint32_t      len;
+};
+
 struct Terminal {
     Cell         *cells;
     int           cols, rows;
@@ -144,12 +154,19 @@ struct Terminal {
     TermColorVal  saved_cur_fg, saved_cur_bg;
     uint8_t       saved_cur_attrs;
     bool          in_alt_screen;
-    // Scrollback ring buffer
-    Cell         *sb_buf;
+    // Scrollback: a ring of compact lines (SbLine), and the few of them
+    // turned back into cells lately (sb_row): about two screens' worth, each
+    // sb_cols wide, keyed by line number, so a row handed out stays good
+    // while a screen is drawn.
+    SbLine       *sb_lines;    // sb_cap of them
     int           sb_cap;
-    int           sb_cols;     // Width of scrollback buffer (never shrinks, only grows)
+    int           sb_cols;     // Width of scrollback rows as sb_row gives them (never shrinks, only grows)
     int           sb_head;
     int           sb_count;
+    long long     sb_total;    // lines ever pushed: numbers them for the cache
+    Cell         *sb_cache;    // sb_cache_n rows of sb_cache_cols
+    long long    *sb_cache_line;   // the line in each (-1: none)
+    int           sb_cache_n, sb_cache_cols;
     int           sb_offset;   // 0=live, N=N rows back
     // Selection
     int           sel_start_row, sel_start_col;
