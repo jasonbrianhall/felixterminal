@@ -42,8 +42,39 @@ struct big_header {                        /* 16 bytes: the block's pointer stay
 static int s_state;                        /* 0: not tried yet, 1: near pointers on, -1: refused */
 unsigned long g_bigmem_blocks, g_bigmem_bytes;   /* (now held: CHIRP_LOG shows them) */
 
+// Does the host split a freed block? Some keep a freed block for reuse and
+// hand all of it to the next request it can hold (vmdos before its DPMI
+// gave large freed blocks back): a freed 36 MB picture then went to a 1 MB
+// texture, the next picture needed 36 MB more, and memory ran out browsing
+// pictures. Asked: 1 MB taken and freed, then 256 KB taken; a host that
+// charges the whole 1 MB for it (INT 31h 0500h's free pages) keeps freed
+// blocks whole, and DJGPP's malloc (memory kept, but no more than the most
+// needed at once) is better there.
+static int host_frees_well(void) {
+    __dpmi_free_mem_info fi;
+    __dpmi_meminfo a, b;
+    unsigned long f1, f2;
+    a.size = 1024ul * 1024ul;
+    if (__dpmi_allocate_memory(&a) != 0) return 0;
+    __dpmi_free_memory(a.handle);
+    if (__dpmi_get_free_memory_information(&fi) != 0) return 0;
+    f1 = fi.total_number_of_free_pages;
+    b.size = 256ul * 1024ul;
+    if (__dpmi_allocate_memory(&b) != 0) return 0;
+    int ok = __dpmi_get_free_memory_information(&fi) == 0;
+    f2 = fi.total_number_of_free_pages;
+    __dpmi_free_memory(b.handle);
+    if (!ok || f1 == 0xFFFFFFFFul || f2 == 0xFFFFFFFFul) return 0;
+    return f1 - f2 < 128;                          /* (256 KB is 64 pages; the whole 1 MB, 256) */
+}
+
+int g_bigmem_state;                                /* (CHIRP_LOG: 1 on, -1 off) */
 static int big_ready(void) {
-    if (!s_state) s_state = __djgpp_nearptr_enable() ? 1 : -1;
+    if (!s_state) {
+        const char *e = getenv("CHIRP_BIGMEM");      /* SET CHIRP_BIGMEM=0: DJGPP's malloc for everything */
+        s_state = !(e && *e == '0') && host_frees_well() && __djgpp_nearptr_enable() ? 1 : -1;
+    }
+    g_bigmem_state = s_state;
     return s_state > 0;
 }
 
