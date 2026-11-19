@@ -755,8 +755,12 @@ int main(int argc, char **argv) {
                     static uint64_t le;
                     if (now - le >= 2000) {
                         le = now;
-                        fprintf(g_chirp_log, "song at %.2f s heard, %.3f s by Chirp's clock (latency %.3f)\n", heard, ours,
-                                chirp_audio_latency());
+                        static uint64_t t0; static double h0;
+                        if (!t0 || heard < h0) { t0 = now; h0 = heard; }
+                        double wall = (now - t0) / 1000.0;
+                        fprintf(g_chirp_log, "%llu ms: song at %.2f s heard, %.3f s by Chirp's clock (latency %.3f); "
+                                "heard ran %.4f x the clock over %.0f s\n", (unsigned long long)now, heard, ours,
+                                chirp_audio_latency(), wall > 1 ? (heard - h0) / wall : 1.0, wall);
                         fflush(g_chirp_log);
                     }
                 }
