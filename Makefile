@@ -342,6 +342,8 @@ flt-linux: index.hpp $(BUILD_DIR_LINUX)/$(EXECUTABLE_LINUX) frontend-linux
 $(BUILD_DIR_LINUX)/$(EXECUTABLE_LINUX): index.hpp $(OBJECTS_LINUX)
 	@echo "Linking Linux: $@"
 	$(CXX_LINUX) $(CXXFLAGS_LINUX) $^ -o $@ $(LDFLAGS_LINUX)
+	@# felixchirp: the same program, starting as Felix Chirp (felixchirp [file|folder])
+	ln -sf linux/$(EXECUTABLE_LINUX) $(BUILD_DIR)/felixchirp
 	@echo "✓ $@"
 
 $(BUILD_DIR_LINUX)/%.o: %.cpp

@@ -90,6 +90,7 @@ To make this the default, add `set term sixelgd truecolor scroll` to `~/.gnuplot
 - **F3** — Download: right panel browses remote files, left panel selects local destination
 - **F4** — SFTP Console (interactive command-line SFTP; type `help` for commands)
 - **F5** — Felix Chirp (view remote and local images and listen to audio, including Karaoke CD+G files)
+  - On its own: `flt --chirp [file|folder]`, or `felixchirp [file|folder]` (the build makes `build/felixchirp`, a link to `flt`). It opens in its own window with no shell; a folder starts there, a file opens at once, and Esc closes it. On DOS: `CHIRP [file|folder]` (`msdos/chirp`).
 - **F6** — Port forwarding console: add local (`L`), remote (`R`) and SOCKS5 dynamic (`D`) forwards
 - **F8** — SSH Key Manager: generate, copy and delete local keys, and manage the remote `authorized_keys`
 - Tab switches focus between panels; Enter opens directories; Backspace navigates up; Space transfers

@@ -216,6 +216,8 @@ void iv_refresh();
 void iv_load_local(const char *filepath, const char *label);
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label);
 void iv_list_local(const char *path, std::vector<IVEntry> &out);
+bool iv_open_path(const char *path);   // start in a folder, or open a file (after iv_open)
+extern bool g_iv_standalone;   // Chirp on its own (felixchirp, --chirp): no "(F5)" in the title
 extern void (*g_iv_busy_hook)(const char *name);   // called before a file is opened, when set (the front end may show it)
 #ifdef __DJGPP__
 bool iv_is_drive_name(const char *name);   // "D:" (DOS: drives in a root's listing)

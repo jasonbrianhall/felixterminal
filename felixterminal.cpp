@@ -157,6 +157,16 @@ int main(int argc, char **argv) {
     TelnetConfig telnet_cfg;
     SerialConfig serial_cfg;
 
+    // Felix Chirp on its own: --chirp [file|folder], or run as "felixchirp"
+    // (a link to this program). Its own window, no shell, closed with Chirp.
+    bool        chirp_mode = false;
+    const char *chirp_path = nullptr;
+    {
+        const char *base = argv[0] ? argv[0] : "";
+        for (const char *p = base; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+        if (SDL_strncasecmp(base, "felixchirp", 10) == 0) chirp_mode = true;
+    }
+
     bool        start_webserver = false;
     int         webserver_port = 53716;
     std::string webserver_bind_addr = "127.0.0.1";
@@ -345,6 +355,17 @@ int main(int argc, char **argv) {
             continue;
         }*/
 
+        if (strcmp(arg, "--chirp") == 0 || strcmp(arg, "-chirp") == 0) {
+            chirp_mode = true;
+            if (i + 1 < argc && argv[i+1][0] != '-') chirp_path = argv[++i];
+            continue;
+        }
+
+        if (arg[0] != '-' && chirp_mode) {          // felixchirp FILE
+            chirp_path = arg;
+            continue;
+        }
+
         if (arg[0] != '-' && !use_ssh) {
             shell = arg;
             continue;
@@ -365,6 +386,12 @@ int main(int argc, char **argv) {
             SDL_Log("\nSerial options:\n");
             SDL_Log("  --serial [port]             Connect via serial port (prompts if omitted)\n");
             SDL_Log("  --serial-baud <baud>        Serial baud rate\n");
+            SDL_Log("\nFelix Chirp:\n");
+            SDL_Log("  --chirp [file|folder]       Felix Chirp in its own window: pictures, music,\n"
+                    "                              karaoke, text (no shell; closes with Chirp).\n"
+                    "                              A folder starts there; a file opens at once.\n"
+                    "                              Run as felixchirp (a link to this program), the\n"
+                    "                              same: felixchirp [file|folder]\n");
             SDL_Log("\nGeneral options:\n");
             SDL_Log("  --term <type>               TERM env var for local shell (default: xterm-256color)\n");
 #ifdef USESSH
@@ -434,8 +461,9 @@ int main(int argc, char **argv) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     int win_w = 800, win_h = 480;
+    if (chirp_mode) { win_w = 1024; win_h = 720; }   // (Chirp likes room)
     SDL_Window *window = SDL_CreateWindow(
-        WIN_TITLE,
+        chirp_mode ? "Felix Chirp" : WIN_TITLE,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         win_w, win_h,
         SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
@@ -730,7 +758,7 @@ int main(int argc, char **argv) {
 #ifdef USESSH
     if (!use_ssh)
 #endif
-    if (!use_telnet && !use_serial)
+    if (!use_telnet && !use_serial && !chirp_mode)
     {
         if (!term_spawn(&term, shell)) {
             char msg[256];
@@ -838,9 +866,17 @@ int main(int argc, char **argv) {
     };
 #endif
 
+    // Felix Chirp on its own: open it now, at the path given if any
+    if (chirp_mode) {
+        SDL_GetWindowSize(window, &win_w, &win_h);
+        g_iv_standalone = true;
+        iv_open(false, win_w, win_h);
+        if (chirp_path) iv_open_path(chirp_path);
+    }
+
     uint32_t last_ticks = SDL_GetTicks();
     bool running = true;
-    bool local_dead = false;  // set when the local child process has exited
+    bool local_dead = chirp_mode;  // set when the local child process has exited (none for Chirp)
     // Tracks whether the term FBO needs a full clear before the next draw.
     // Only set on layout changes (resize, theme, font) — NOT on PTY scroll.
     bool fbo_needs_clear = true;
@@ -850,6 +886,7 @@ int main(int argc, char **argv) {
     double autoscroll_accum = 0.0;
 
     while (running) {
+        if (chirp_mode && !g_iv.visible) break;    // Chirp closed (Esc): so is the program
         uint32_t now = SDL_GetTicks();
         double dt = (now - last_ticks) / 1000.0;
         last_ticks = now;
