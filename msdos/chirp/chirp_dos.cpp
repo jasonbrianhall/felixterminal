@@ -34,9 +34,13 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <dpmi.h>
+#include <go32.h>
+#include <sys/movedata.h>
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 
 // ============================================================================
 // WHAT FELIXCHIRP/ EXPECTS FROM FELIXTERMINAL
@@ -54,10 +58,22 @@ LIBSSH2_SESSION *ssh_get_session() { return nullptr; }
 void ssh_session_lock() {}
 void ssh_session_unlock() {}
 
+// ---- for CHIRP_LOG: where a frame's drawing time goes ----
+#include <time.h>
+static uclock_t s_t_rect, s_t_text, s_t_geo; static long s_n_rect, s_n_text, s_n_glyph;
 // ---- draw_rect --------------------------------------------------------------
 
 void draw_rect(float x, float y, float w, float h, float r, float g, float b, float a) {
     if (w <= 0 || h <= 0 || a <= 0) return;
+    uclock_t t0 = uclock(); s_n_rect++;
+    // Whole pixels, at least one each way: the visualizer's 128 bars are
+    // under a pixel wide at 640x480, and SDL fills those with nothing.
+    float x0 = SDL_floorf(x + 0.5f), y0 = SDL_floorf(y + 0.5f);
+    float x1 = SDL_floorf(x + w + 0.5f), y1 = SDL_floorf(y + h + 0.5f);
+    if (x1 <= x0) x1 = x0 + 1;
+    if (y1 <= y0) y1 = y0 + 1;
+    x = x0; y = y0; w = x1 - x0; h = y1 - y0;
+    struct P { uclock_t t0; ~P() { s_t_rect += uclock() - t0; } } prof{t0};
     SDL_SetRenderDrawBlendMode(g_sdl_renderer, a >= 1.f ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColorFloat(g_sdl_renderer, r, g, b, a > 1.f ? 1.f : a);
     SDL_FRect rc = { x, y, w, h };
@@ -120,8 +136,14 @@ static bool font_init(void) {
     return true;
 }
 
+// Glyphs: FreeType's coverage, kept as bytes. Text is drawn a string at a
+// time: each (text, size, bold) made into one white texture with the
+// coverage in alpha, kept and coloured as it's drawn. Nearly all of the
+// screen's text is the same from frame to frame, and one textured draw
+// a string, not one a glyph, is what makes SDL's software renderer fast
+// enough for the visualizer.
 struct Glyph {
-    SDL_Texture *tex = nullptr;    // white, coverage in alpha (nullptr: blank)
+    std::vector<uint8_t> cov;      // w x h coverage (empty: blank)
     int left = 0, top = 0, w = 0, h = 0;
     float adv = 0;
 };
@@ -146,25 +168,18 @@ static const Glyph &glyph(uint32_t cp, int px, int bold) {
     if (!FT_Get_Char_Index(f, cp) && s_emoji && FT_Get_Char_Index(s_emoji, cp)) f = s_emoji;
     FT_Set_Pixel_Sizes(f, 0, (FT_UInt)px);
     if (FT_Load_Char(f, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) == 0) {
-        FT_GlyphSlot s = f->glyph;
-        g.left = s->bitmap_left; g.top = s->bitmap_top;
-        g.w = (int)s->bitmap.width; g.h = (int)s->bitmap.rows;
-        g.adv = s->advance.x / 64.f;
-        if (f == s_emoji) {                      // emoji are wider than a cell: scale to one and a half
+        FT_GlyphSlot sl = f->glyph;
+        g.left = sl->bitmap_left; g.top = sl->bitmap_top;
+        g.w = (int)sl->bitmap.width; g.h = (int)sl->bitmap.rows;
+        g.adv = sl->advance.x / 64.f;
+        if (f == s_emoji) {                      // emoji are wider than a cell: one and a half
             float cell = px * 0.6f * 1.5f;
             if (g.adv > cell) g.adv = cell;
         }
         if (g.w > 0 && g.h > 0) {
-            std::vector<uint32_t> px32((size_t)g.w * g.h);
+            g.cov.resize((size_t)g.w * g.h);
             for (int y = 0; y < g.h; y++)
-                for (int x = 0; x < g.w; x++)
-                    px32[(size_t)y * g.w + x] = (uint32_t)s->bitmap.buffer[y * s->bitmap.pitch + x] << 24 | 0xFFFFFF;
-            g.tex = SDL_CreateTexture(g_sdl_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, g.w, g.h);
-            if (g.tex) {
-                SDL_UpdateTexture(g.tex, nullptr, px32.data(), g.w * 4);
-                SDL_SetTextureBlendMode(g.tex, SDL_BLENDMODE_BLEND);
-                SDL_SetTextureScaleMode(g.tex, SDL_SCALEMODE_NEAREST);
-            }
+                memcpy(&g.cov[(size_t)y * g.w], sl->bitmap.buffer + y * sl->bitmap.pitch, (size_t)g.w);
         }
     } else {
         g.adv = px * 0.6f;
@@ -172,34 +187,101 @@ static const Glyph &glyph(uint32_t cp, int px, int bold) {
     return s_glyphs.emplace(key, g).first->second;
 }
 
-// y is the baseline. Returns the x after the text.
-float draw_text(const char *text, float x, float y, int font_px, int, float r, float g, float b, float a,
-                uint8_t attrs, float) {
-    if (!text || font_px <= 0) return x;
-    int bold = (attrs & 1) ? 1 : 0;       // ATTR_BOLD
-    float cx = x;
+struct TextImage {
+    SDL_Texture *tex = nullptr;    // nullptr: nothing to draw (spaces)
+    int x0 = 0, top = 0, w = 0, h = 0;   // the texture's place from the pen and the baseline
+    float adv = 0;
+    unsigned long used = 0;        // the frame it was last drawn in
+};
+static std::unordered_map<std::string, TextImage> s_texts;
+static unsigned long s_frame;      // (counted by main)
+static size_t s_text_pixels;
+
+static void forget_old_texts(void) {
+    if (s_texts.size() < 400 && s_text_pixels < 4000000) return;
+    for (auto it = s_texts.begin(); it != s_texts.end();) {
+        if (s_frame - it->second.used > 60) {
+            if (it->second.tex) SDL_DestroyTexture(it->second.tex);
+            s_text_pixels -= (size_t)it->second.w * it->second.h;
+            it = s_texts.erase(it);
+        } else ++it;
+    }
+}
+
+static const TextImage &text_image(const char *text, int px, int bold) {
+    std::string key(text);
+    key += '\0'; key += (char)px; key += (char)bold;
+    auto it = s_texts.find(key);
+    if (it != s_texts.end()) return it->second;
+
+    // Where the glyphs go: their box, from the pen at 0 on the baseline
+    struct Placed { const Glyph *g; int x; };
+    std::vector<Placed> pl;
+    float cx = 0;
+    int x0 = 0, x1 = 0, top = 0, bot = 0;
+    bool any = false;
     const unsigned char *p = (const unsigned char *)text;
     while (*p) {
         uint32_t cp = next_cp(&p);
         if (cp == 0xFE0F || cp == '\n' || cp == '\r') continue;
         if (cp == '\t') cp = ' ';
-        const Glyph &gl = glyph(cp, font_px, bold);
-        if (gl.tex) {
-            SDL_SetTextureColorModFloat(gl.tex, r, g, b);
-            SDL_SetTextureAlphaModFloat(gl.tex, a > 1.f ? 1.f : a);
-            SDL_FRect d = { (float)(int)(cx + gl.left + 0.5f), (float)(int)(y - gl.top + 0.5f), (float)gl.w, (float)gl.h };
-            SDL_RenderTexture(g_sdl_renderer, gl.tex, nullptr, &d);
+        const Glyph &g = glyph(cp, px, bold);
+        if (!g.cov.empty()) {
+            int gx = (int)(cx + g.left + 0.5f);
+            if (!any) { x0 = gx; x1 = gx + g.w; top = g.top; bot = g.h - g.top; any = true; }
+            x0 = std::min(x0, gx); x1 = std::max(x1, gx + g.w);
+            top = std::max(top, g.top); bot = std::max(bot, g.h - g.top);
+            pl.push_back({ &g, gx });
         }
-        cx += gl.adv;
+        cx += g.adv;
     }
-    return cx;
+    TextImage ti;
+    ti.adv = cx;
+    if (any && x1 > x0 && top + bot > 0) {
+        ti.x0 = x0; ti.top = top; ti.w = x1 - x0; ti.h = top + bot;
+        std::vector<uint32_t> px32((size_t)ti.w * ti.h, 0x00FFFFFF);
+        for (const Placed &q : pl) {
+            const Glyph &g = *q.g;
+            for (int y = 0; y < g.h; y++) {
+                uint32_t *row = &px32[(size_t)(top - g.top + y) * ti.w + (q.x - x0)];
+                const uint8_t *c = &g.cov[(size_t)y * g.w];
+                for (int x = 0; x < g.w; x++) {
+                    uint32_t a = row[x] >> 24;
+                    if (c[x] > a) row[x] = (uint32_t)c[x] << 24 | 0xFFFFFF;
+                }
+            }
+        }
+        ti.tex = SDL_CreateTexture(g_sdl_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, ti.w, ti.h);
+        if (ti.tex) {
+            SDL_UpdateTexture(ti.tex, nullptr, px32.data(), ti.w * 4);
+            SDL_SetTextureBlendMode(ti.tex, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(ti.tex, SDL_SCALEMODE_NEAREST);
+            s_text_pixels += (size_t)ti.w * ti.h;
+        }
+    }
+    return s_texts.emplace(std::move(key), ti).first->second;
+}
+
+// y is the baseline. Returns the x after the text.
+float draw_text(const char *text, float x, float y, int font_px, int, float r, float g, float b, float a,
+                uint8_t attrs, float) {
+    if (!text || !*text || font_px <= 0) return x;
+    struct P { uclock_t t0; ~P() { s_t_text += uclock() - t0; } } prof{uclock()}; s_n_text++;
+    TextImage &ti = const_cast<TextImage &>(text_image(text, font_px, (attrs & 1) ? 1 : 0));   // ATTR_BOLD
+    ti.used = s_frame;
+    if (ti.tex) {
+        s_n_glyph++;
+        SDL_SetTextureColorModFloat(ti.tex, r, g, b);
+        SDL_SetTextureAlphaModFloat(ti.tex, a > 1.f ? 1.f : a);
+        SDL_FRect d = { (float)(int)(x + 0.5f) + ti.x0, (float)(int)(y + 0.5f) - ti.top, (float)ti.w, (float)ti.h };
+        SDL_RenderTexture(g_sdl_renderer, ti.tex, nullptr, &d);
+    }
+    return x + ti.adv;
 }
 
 float measure_text(const char *text, int font_px) {
-    float w = 0;
-    const unsigned char *p = (const unsigned char *)text;
-    while (p && *p) w += glyph(next_cp(&p), font_px, 0).adv;
-    return w;
+    if (!text || !*text) return 0;
+    return text_image(text, font_px, 0).adv;
 }
 
 // ---- temp files (DJGPP has no mkstemps) -------------------------------------
@@ -258,6 +340,34 @@ static int chirp_mkstemps(char *tmpl, int suffixlen, size_t room) {
     return -1;
 }
 
+extern FILE *g_chirp_log;        // mixer_dos.cpp
+
+// ---- DOS critical errors ------------------------------------------------------
+// A drive with no disk in it (A:), or one that can't be read, makes DOS ask
+// "Abort, Retry, Fail?" through INT 24h: on the text screen, unseen in a
+// VESA mode, and Abort ends Chirp there and then. This handler answers Fail
+// at once, so the call just fails (an empty folder, "No drive A:"). DOS puts
+// the old vector back when Chirp exits.
+// For CHIRP_LOG: how much DPMI memory is free, in KB
+static void log_memory(const char *when) {
+    if (!g_chirp_log) return;
+    __dpmi_free_mem_info fi;
+    if (__dpmi_get_free_memory_information(&fi) == 0)
+        fprintf(g_chirp_log, "memory %s: %lu KB free (largest block %lu KB)\n", when,
+                fi.total_number_of_free_pages * 4, fi.largest_available_free_block_in_bytes / 1024);
+    fflush(g_chirp_log);
+}
+
+static void fail_critical_errors(void) {
+    static const unsigned char handler[] = { 0xB0, 0x03, 0xCF };   // mov al,3 (Fail); iret
+    int sel = 0;
+    int seg = __dpmi_allocate_dos_memory(1, &sel);                  // (16 bytes)
+    if (seg == -1) return;
+    dosmemput(handler, sizeof handler, seg * 16);
+    __dpmi_raddr a = { 0, (unsigned short)seg };
+    __dpmi_set_real_mode_interrupt_vector(0x24, &a);
+}
+
 // ============================================================================
 // THE SCREEN
 // ============================================================================
@@ -275,7 +385,7 @@ static bool pick_mode(int want_w, int want_h, int want_bpp, SDL_DisplayMode *out
         if (want_bpp && bpp != want_bpp && SDL_BYTESPERPIXEL(m->format) * 8 != want_bpp) continue;
         long score;
         if (want_w) score = (m->w == want_w && m->h == want_h) ? 1000000 : 0;
-        else score = (m->w == 1024 && m->h == 768) ? 1000000 : m->w * m->h / 4;
+        else score = (m->w == 640 && m->h == 480) ? 2000000 : 1000000 - (long)m->w * m->h / 64;   // 640x480, else the smallest
         int bytes = SDL_BYTESPERPIXEL(m->format);
         score = score * 4 + (bytes == 4 ? 3 : bpp == 16 ? 2 : bpp == 15 ? 1 : 0);
         if (score > best_score) { best_score = score; best = m; }
@@ -283,6 +393,39 @@ static bool pick_mode(int want_w, int want_h, int want_bpp, SDL_DisplayMode *out
     if (best) *out = *best;
     SDL_free(modes);
     return best != nullptr;
+}
+
+// The modes F2 / Shift+F2 step through: each size once (its deepest
+// colours), 640x480 and up, smallest first.
+static std::vector<SDL_DisplayMode> usable_modes(void) {
+    std::vector<SDL_DisplayMode> out;
+    int n = 0;
+    SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(SDL_GetPrimaryDisplay(), &n);
+    for (int i = 0; modes && i < n; i++) {
+        const SDL_DisplayMode *m = modes[i];
+        if (SDL_ISPIXELFORMAT_INDEXED(m->format) || SDL_BITSPERPIXEL(m->format) < 15 || m->w < 640 || m->h < 400) continue;
+        bool merged = false;
+        for (SDL_DisplayMode &o : out)
+            if (o.w == m->w && o.h == m->h) {
+                if (SDL_BITSPERPIXEL(m->format) > SDL_BITSPERPIXEL(o.format)) o = *m;
+                merged = true;
+            }
+        if (!merged) out.push_back(*m);
+    }
+    SDL_free(modes);
+    std::sort(out.begin(), out.end(), [](const SDL_DisplayMode &a, const SDL_DisplayMode &b) {
+        return a.w * a.h != b.w * b.h ? a.w * a.h < b.w * b.h : a.w < b.w;
+    });
+    return out;
+}
+
+static bool set_mode(const SDL_DisplayMode &m, int *w, int *h) {
+    if (!SDL_SetWindowFullscreenMode(g_sdl_window, &m)) return false;
+    SDL_SyncWindow(g_sdl_window);
+    int ow = 0, oh = 0;
+    if (!SDL_GetCurrentRenderOutputSize(g_sdl_renderer, &ow, &oh) || ow <= 0) { ow = m.w; oh = m.h; }
+    *w = ow; *h = oh;
+    return true;
 }
 
 static void list_modes(void) {
@@ -306,7 +449,8 @@ static void usage(void) {
            "  CHIRP [-g WxH[xBITS]] [-f size] [-l] [folder | file]\n\n"
            "  folder   where to start (default: the current one)\n"
            "  file     open it at once (a picture, song, .cdg, .kfn, .zip, text)\n"
-           "  -g       the VESA mode (default 1024x768; also SET CHIRP_VIDEO=)\n"
+           "  -g       the VESA mode (default 640x480; also SET CHIRP_VIDEO=;\n"
+           "           F2 / Shift+F2 change it while running)\n"
            "  -f       font size in pixels (default 16)\n"
            "  -l       list the VESA modes\n\n"
            "Sound: a Sound Blaster, with BLASTER set (SET BLASTER=A220 I5 D1 T4).\n"
@@ -332,10 +476,11 @@ static std::string dos_path(std::string p) {
     return p;
 }
 
-extern FILE *g_chirp_log;        // mixer_dos.cpp
 
 int main(int argc, char **argv) {
     if (getenv("CHIRP_LOG")) g_chirp_log = fopen(getenv("CHIRP_LOG"), "w");
+    fail_critical_errors();
+    log_memory("at start");
     int want_w = 0, want_h = 0, want_bpp = 0;
     const char *start = nullptr;
     bool show_modes = false;
@@ -392,9 +537,13 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
-    g_sdl_window = SDL_CreateWindow("Felix Chirp", mode.w, mode.h, SDL_WINDOW_FULLSCREEN);
+    // The mode is chosen before the window is shown, so it's set once: SDL's
+    // DOS driver clears the screen when it sets a mode, and a second mode set
+    // after the first frame left the screen black.
+    g_sdl_window = SDL_CreateWindow("Felix Chirp", mode.w, mode.h, SDL_WINDOW_FULLSCREEN | SDL_WINDOW_HIDDEN);
     if (!g_sdl_window) { fprintf(stderr, "CHIRP: %s\n", SDL_GetError()); SDL_Quit(); return 1; }
     SDL_SetWindowFullscreenMode(g_sdl_window, &mode);
+    SDL_ShowWindow(g_sdl_window);
     SDL_SyncWindow(g_sdl_window);
     g_sdl_renderer = SDL_CreateRenderer(g_sdl_window, nullptr);
     if (!g_sdl_renderer) { SDL_Quit(); fprintf(stderr, "CHIRP: renderer: %s\n", SDL_GetError()); return 1; }
@@ -404,6 +553,7 @@ int main(int argc, char **argv) {
     SDL_InitSubSystem(SDL_INIT_AUDIO);
     iv_ensure_mixer();
 
+    log_memory("with the screen and sound open");
     int win_w = mode.w, win_h = mode.h;
     iv_open(false, win_w, win_h);
     strncpy(g_iv.path, dir.c_str(), sizeof(g_iv.path) - 1);
@@ -413,7 +563,7 @@ int main(int argc, char **argv) {
             if (!strcasecmp(g_iv.entries[i].name, file.c_str())) { g_iv.selected = (int)i; iv_enter_selected(); break; }
     }
 
-    uint64_t last = SDL_GetTicks(), last_frame = 0;
+    uint64_t last = SDL_GetTicks(), last_frame = 0, started = last;
     bool need = true, quit = false;
     while (!quit && g_iv.visible) {
         SDL_Event e;
@@ -424,6 +574,20 @@ int main(int argc, char **argv) {
                 // Ctrl+Q / F10 quit from anywhere; Esc closes Chirp
                 // (after leaving fullscreen or a text file) as in Felix Terminal.
                 if ((e.key.key == SDLK_Q && (e.key.mod & SDL_KMOD_CTRL)) || e.key.key == SDLK_F10) { quit = true; break; }
+                // F2 / Shift+F2: the next / previous screen mode
+                if (e.key.key == SDLK_F2) {
+                    std::vector<SDL_DisplayMode> ms = usable_modes();
+                    if (!ms.empty()) {
+                        int cur = -1;
+                        for (size_t i = 0; i < ms.size(); i++) if (ms[i].w == win_w && ms[i].h == win_h) cur = (int)i;
+                        int k = (int)ms.size();
+                        int next = (e.key.mod & SDL_KMOD_SHIFT) ? (cur < 0 ? k - 1 : (cur + k - 1) % k) : (cur + 1) % k;
+                        if (!set_mode(ms[(size_t)next], &win_w, &win_h))
+                            snprintf(g_iv.error, sizeof g_iv.error, "Can't set %dx%d: %s", ms[(size_t)next].w, ms[(size_t)next].h, SDL_GetError());
+                    }
+                    need = true;
+                    break;
+                }
                 // Alt+letter: that drive's root (the root's listing has the drives too)
                 if ((e.key.mod & SDL_KMOD_ALT) && e.key.key >= SDLK_A && e.key.key <= SDLK_Z) {
                     char root[4] = { (char)('A' + (e.key.key - SDLK_A)), ':', '\\', 0 };
@@ -437,7 +601,7 @@ int main(int argc, char **argv) {
                         g_iv.scroll_top = 0;
                         iv_refresh();
                     } else {
-                        snprintf(g_iv.error, sizeof g_iv.error, "No drive %c:", root[0]);
+                        snprintf(g_iv.error, sizeof g_iv.error, "Can't read %c: (no disk?)", root[0]);
                     }
                     need = true;
                     break;
@@ -455,6 +619,11 @@ int main(int argc, char **argv) {
                 break;
             case SDL_EVENT_MOUSE_MOTION:
                 if (iv_mousemotion((int)e.motion.x, (int)e.motion.y, win_w, win_h)) need = true;
+                break;
+            case SDL_EVENT_WINDOW_SHOWN: case SDL_EVENT_WINDOW_EXPOSED: case SDL_EVENT_WINDOW_RESIZED:
+            case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED: case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+                need = true;                       // (the screen may have been cleared)
                 break;
             case SDL_EVENT_MOUSE_WHEEL:
                 iv_mousewheel((int)e.wheel.mouse_x, (int)e.wheel.mouse_y,
@@ -476,23 +645,39 @@ int main(int argc, char **argv) {
         }
 
         uint64_t now = SDL_GetTicks();
+        { static uint64_t lm; if (g_chirp_log && now - lm >= 5000) { lm = now; log_memory("now"); } }
         iv_tick((now - last) / 1000.0);
         last = now;
         bool animating = (g_iv.audio_playing && !g_iv.audio_paused) || g_iv.cdg_display || g_iv.slideshow_active;
-        // Animations at 25 frames a second, input at once. DOS's threads
-        // are cooperative: SDL's audio thread (the Sound Blaster's mixing)
-        // runs only while this one waits, so it always waits a little, and
-        // longer the longer a frame took to draw.
-        if (need || (animating && now - last_frame >= 40)) {
+        // The first two seconds always, then at least twice a second: a frame
+        // the video BIOS dropped (a mode set clears the screen) doesn't stay lost.
+        if (now - started < 2000 || now - last_frame >= 500) animating = true;
+        // Animations at up to 60 frames a second, input at once. DOS's
+        // threads are cooperative: SDL's audio thread (the Sound Blaster's
+        // mixing) runs only while this one waits, so it always waits a
+        // little, and longer the longer a frame took to draw.
+        if (need || (animating && now - last_frame >= 16)) {
+            s_t_rect = s_t_text = 0; s_n_rect = s_n_text = s_n_glyph = 0;
+            s_frame++;
+            forget_old_texts();
             iv_render(win_w, win_h);
+            uint64_t drawn = SDL_GetTicks();
             SDL_RenderPresent(g_sdl_renderer);
             uint64_t took = SDL_GetTicks() - now;
-            if (g_chirp_log) { static int n; if (++n % 25 == 0) { fprintf(g_chirp_log, "frame %llu ms\n", (unsigned long long)took); fflush(g_chirp_log); } }
+            if (g_chirp_log) {
+                static int n;
+                if (++n % 25 == 0) {
+                    fprintf(g_chirp_log, "frame %llu ms (drawing %llu, showing %llu): %ld rects %.1f ms, %ld texts (%ld drawn) %.1f ms\n",
+                            (unsigned long long)took, (unsigned long long)(drawn - now), (unsigned long long)(now + took - drawn),
+                            s_n_rect, s_t_rect * 1000.0 / UCLOCKS_PER_SEC, s_n_text, s_n_glyph, s_t_text * 1000.0 / UCLOCKS_PER_SEC);
+                    fflush(g_chirp_log);
+                }
+            }
             last_frame = now;
             need = false;
-            SDL_Delay(took > 40 ? 10 : 2);
+            SDL_Delay(took > 40 ? 10 : 1);
         } else {
-            SDL_Delay(5);
+            SDL_Delay(animating ? 1 : 5);
         }
     }
     if (g_iv.visible) iv_close();

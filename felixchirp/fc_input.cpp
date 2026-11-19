@@ -46,7 +46,11 @@ bool iv_keydown(SDL_Keycode sym) {
         
         iv_text_keyboard(s_text_doc, sym);
         // Also handle close/navigate keys
+#ifdef __DJGPP__
+        if (sym == SDLK_ESCAPE) {        // (DOS: no F5; Chirp isn't an overlay there)
+#else
         if (sym == SDLK_ESCAPE || sym == SDLK_F5) {
+#endif
             s_viewing_text = false;
             return true;
         }
@@ -56,7 +60,10 @@ bool iv_keydown(SDL_Keycode sym) {
     int n = (int)g_iv.entries.size();
 
     switch (sym) {
-    case SDLK_ESCAPE: case SDLK_F5:
+    case SDLK_ESCAPE:
+#ifndef __DJGPP__
+    case SDLK_F5:
+#endif
         // Exit fullscreen first if in fullscreen mode, otherwise close viewer
         if (g_iv.fullscreen) {
             g_iv.fullscreen = false;
