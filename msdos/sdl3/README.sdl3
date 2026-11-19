@@ -16,3 +16,10 @@ tests) is left out. To update: copy the same files from a newer SDLPoPDOS
 msdos/ over these (and its SDL_SRCS into SOURCES), and change the commit
 above. ../chirp/cwsdpmi has CWSDPMI r7's stub (CWSDSTUB.EXE), its
 documentation and license, from SDLPoPDOS's msdos/cwsdpmi.
+
+Changed here (marked "felixterminal:" in the source; keep them when
+updating, or send them to SDLPoPDOS):
+  SDL3/src/video/dos/SDL_dosmouse.c, SDL_dosevents.c: the mouse wheel,
+                 where the driver has CuteMouse's WheelAPI (INT 33h 11h);
+                 and clicks made between two polls (INT 33h 5's press
+                 counts), which were lost: a quick double-click was none.

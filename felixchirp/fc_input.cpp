@@ -57,6 +57,52 @@ bool iv_keydown(SDL_Keycode sym) {
         return true;
     }
 
+    // A picture on screen (no song playing): zoom and pan from the keyboard,
+    // as the wheel and a drag do. Not every mouse has a wheel, and under DOS
+    // (vmdos, most mouse drivers) none reaches the program at all.
+    //   + / -           zoom in / out (about the middle)
+    //   arrows          pan, while zoomed in (Left/Right go to the next file
+    //                   otherwise); Shift+arrows pan at any zoom
+    //   0, Esc          back to the whole picture (Esc: then as before)
+    //   F11             fullscreen on and off (as double-clicking it)
+    {
+        bool has_picture = g_use_sdl_renderer ? (bool)g_iv.sdl_tex : (bool)g_iv.tex;
+        bool sound = g_iv.audio_playing || g_iv.audio_paused;
+        if (sym == SDLK_F11 && (has_picture || sound)) {
+            g_iv.fullscreen = !g_iv.fullscreen;
+            return true;
+        }
+        if (has_picture && !sound && !g_iv.video_playing) {
+            SDL_Keymod mod = SDL_GetModState();
+            float zf = 0.f;
+            if (sym == SDLK_EQUALS || sym == SDLK_PLUS || sym == SDLK_KP_PLUS) zf = 1.25f;
+            if (sym == SDLK_MINUS || sym == SDLK_KP_MINUS)                     zf = 1.f / 1.25f;
+            if (zf != 0.f) {
+                float old_zoom = g_iv.zoom;
+                g_iv.zoom = std::max(0.1f, std::min(g_iv.zoom * zf, 16.0f));
+                if (g_iv.zoom > 0.97f && g_iv.zoom < 1.03f) g_iv.zoom = 1.0f;   // (back to a whole picture exactly)
+                float r = g_iv.zoom / old_zoom;
+                g_iv.pan_x *= r;
+                g_iv.pan_y *= r;
+                if (g_iv.zoom <= 1.0f) { g_iv.pan_x = 0.0f; g_iv.pan_y = 0.0f; }
+                return true;
+            }
+            bool arrow = sym == SDLK_LEFT || sym == SDLK_RIGHT || sym == SDLK_UP || sym == SDLK_DOWN;
+            if (arrow && (g_iv.zoom > 1.0f || (mod & KMOD_SHIFT))) {
+                const float step = 96.0f;            // pixels on screen, a press
+                if (sym == SDLK_LEFT)  g_iv.pan_x += step;
+                if (sym == SDLK_RIGHT) g_iv.pan_x -= step;
+                if (sym == SDLK_UP)    g_iv.pan_y += step;
+                if (sym == SDLK_DOWN)  g_iv.pan_y -= step;
+                return true;
+            }
+            if (sym == SDLK_ESCAPE && (g_iv.zoom != 1.0f || g_iv.pan_x != 0.0f || g_iv.pan_y != 0.0f)) {
+                g_iv.zoom = 1.0f; g_iv.pan_x = 0.0f; g_iv.pan_y = 0.0f;
+                return true;
+            }
+        }
+    }
+
     int n = (int)g_iv.entries.size();
 
     switch (sym) {

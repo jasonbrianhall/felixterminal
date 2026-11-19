@@ -15,8 +15,8 @@ any DOS with VESA and a DPMI host; CWSDPMI is built in for plain DOS).
 What it reads
 -------------
 
-* Pictures: JPEG, PNG, BMP, GIF, WebP (stb_image, libwebp). Zoom with the
-  wheel, drag to pan, R rotates, 0 resets, L runs a slideshow.
+* Pictures: JPEG, PNG, BMP, GIF, WebP (stb_image, libwebp). Zoom with + and - (or the
+  wheel, where the mouse driver has one), drag to pan, R rotates, 0 resets, L runs a slideshow.
 * Music: MP3, OGG Vorbis, FLAC, WAV, AIFF, VOC, MIDI (played on
   felixterminal's own OPL3 FM synth), and tracker modules: MOD, XM, IT,
   S3M, 669, MED, MTM and the rest libxmp knows. Opus isn't in the DOS build.
@@ -48,7 +48,10 @@ Keys
     .                              repeat: off, one, all
     K / B                          .kfn: vocal / backing track on and off
     a letter                       the next file starting with it
-    double-click the picture       fullscreen
+    + / -  (a picture shown)       zoom in / out (else: volume)
+    arrows (zoomed in)             pan; Shift+arrows pan at any zoom
+    0, Esc (zoomed in)             the whole picture again
+    double-click the picture, F11  fullscreen
     Esc                            back (fullscreen, a text file), then quit
     F2 / Shift+F2                  next / previous screen mode
     F10, Ctrl+Q                    quit
