@@ -276,7 +276,7 @@ static bool pick_mode(int want_w, int want_h, int want_bpp, SDL_DisplayMode *out
         if (want_bpp && bpp != want_bpp && SDL_BYTESPERPIXEL(m->format) * 8 != want_bpp) continue;
         long score;
         if (want_w) score = (m->w == want_w && m->h == want_h) ? 1000000 : 0;
-        else score = (m->w == 1024 && m->h == 768) ? 1000000 : m->w * m->h / 4;
+        else score = (m->w == 640 && m->h == 480) ? 2000000 : 1000000 - (long)m->w * m->h / 64;   // 640x480, else the smallest
         int bytes = SDL_BYTESPERPIXEL(m->format);
         score = score * 4 + (bytes == 4 ? 3 : bpp == 16 ? 2 : bpp == 15 ? 1 : 0);
         if (score > best_score) { best_score = score; best = m; }
@@ -340,7 +340,7 @@ static void usage(void) {
            "  CHIRP [-g WxH[xBITS]] [-f size] [-l] [folder | file]\n\n"
            "  folder   where to start (default: the current one)\n"
            "  file     open it at once (a picture, song, .cdg, .kfn, .zip, text)\n"
-           "  -g       the VESA mode (default 1024x768; also SET CHIRP_VIDEO=;\n"
+           "  -g       the VESA mode (default 640x480; also SET CHIRP_VIDEO=;\n"
            "           F2 / Shift+F2 change it while running)\n"
            "  -f       font size in pixels (default 16)\n"
            "  -l       list the VESA modes\n\n"

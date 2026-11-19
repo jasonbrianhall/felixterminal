@@ -10,7 +10,7 @@ any DOS with VESA and a DPMI host; CWSDPMI is built in for plain DOS).
     C:\> CHIRP                       (the current folder)
     C:\> CHIRP D:\MUSIC              (another one)
     C:\> CHIRP C:\PICS\CAT.JPG       (open a file at once)
-    C:\> CHIRP -g 1280x800 D:\       (another screen mode)
+    C:\> CHIRP -g 1024x768 D:\       (another screen mode)
 
 What it reads
 -------------
@@ -58,9 +58,9 @@ Options
 
     CHIRP [-g WxH[xBITS]] [-f size] [-l] [folder | file]
 
-* `-g` (or `SET CHIRP_VIDEO=WxH`): the VESA mode. The default is 1024x768,
-  32-bit if there is one, else 16-bit; otherwise the largest mode of
-  640x480 or more.
+* `-g` (or `SET CHIRP_VIDEO=WxH`): the VESA mode. The default is 640x480,
+  32-bit if there is one, else 16-bit; F2 / Shift+F2 change it while
+  Chirp runs.
 * `-f`: the font size in pixels (default 16).
 * `-l`: list the VESA modes.
 * `SET CHIRP_LOG=file`: a debug log (the sound card, frame times).
