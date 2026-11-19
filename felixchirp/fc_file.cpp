@@ -133,7 +133,12 @@ void iv_load_local(const char *filepath, const char *label) {
         return;
     }
     unsigned char *buf = (unsigned char *)malloc(sz);
-    fread(buf, 1, sz, f);
+    if (!buf || fread(buf, 1, sz, f) != (size_t)sz) {
+        snprintf(g_iv.error, sizeof(g_iv.error), buf ? "Cannot read: %s" : "Out of memory: %s", label);
+        free(buf);
+        fclose(f);
+        return;
+    }
     fclose(f);
     iv_load_image_from_mem(buf, (size_t)sz, label);
     free(buf);
@@ -241,16 +246,14 @@ void iv_close() {
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label) {
     int w, h, ch;
     unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &ch, 4);
-    
+    bool webp = false;
+
     // If stbi fails, try WebP decoder
     if (!px) {
         px = WebPDecodeRGBA(data, len, &w, &h);
-        if (px) {
-            // WebP decoder returns RGBA, which matches what we need
-            ch = 4;
-        }
+        webp = px != nullptr;
     }
-    
+
     if (!px) {
         snprintf(g_iv.error, sizeof(g_iv.error), "Decode failed: %s", stbi_failure_reason());
         iv_free_tex();
@@ -258,15 +261,13 @@ void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *l
     }
     g_iv.error[0] = '\0';
     iv_upload_texture(px, w, h);
-    
-    // Free with appropriate function based on source
-    // Check if this was decoded by WebP (simple heuristic: if stbi_load_from_memory failed above)
-    if (stbi_load_from_memory(data, (int)len, &w, &h, &ch, 4) == nullptr) {
-        WebPFree(px);
-    } else {
-        stbi_image_free(px);
-    }
-    
+
+    // Freed by the decoder that made it. (This used to decode the picture a
+    // second time to find out which that was, and never freed the second
+    // one: every picture opened leaked a whole RGBA copy of itself.)
+    if (webp) WebPFree(px);
+    else stbi_image_free(px);
+
     strncpy(g_iv.img_label, label, sizeof(g_iv.img_label)-1);
     // Reset view for every new image
     g_iv.zoom    = 1.0f;
