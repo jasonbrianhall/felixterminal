@@ -1,11 +1,13 @@
 /* aes_dos.c: AES decryption (FIPS-197) for kfn.cpp's encrypted .kfn files,
    with OpenSSL's AES_set_decrypt_key/AES_decrypt interface (see
-   include/openssl/aes.h). Byte-oriented and small; speed doesn't matter
-   here (a song is a few MB, decrypted once). */
+   include/openssl/aes.h). Byte-oriented, with tables for InvMixColumns'
+   products: a song is a few MB, decrypted as it's opened, and a slow DOS
+   machine (or an emulator) waits for it. */
 #include <string.h>
 #include "openssl/aes.h"
 
 static unsigned char sbox[256], inv_sbox[256];
+static unsigned char m9[256], m11[256], m13[256], m14[256];   /* InvMixColumns' products */
 
 static unsigned char xtime(unsigned char x) { return (unsigned char)((x << 1) ^ ((x & 0x80) ? 0x1b : 0)); }
 static unsigned char gmul(unsigned char a, unsigned char b)
@@ -28,6 +30,10 @@ static void make_tables(void)
     } while (p != 1);
     sbox[0] = 0x63;
     for (int i = 0; i < 256; i++) inv_sbox[sbox[i]] = (unsigned char)i;
+    for (int i = 0; i < 256; i++) {
+        m9[i] = gmul((unsigned char)i, 9);   m11[i] = gmul((unsigned char)i, 11);
+        m13[i] = gmul((unsigned char)i, 13); m14[i] = gmul((unsigned char)i, 14);
+    }
 }
 
 int AES_set_decrypt_key(const unsigned char *userKey, const int bits, AES_KEY *key)
@@ -72,10 +78,10 @@ void AES_decrypt(const unsigned char *in, unsigned char *out, const AES_KEY *key
             for (int c = 0; c < 4; c++) {          /* InvMixColumns */
                 unsigned char *a = t + c * 4;
                 unsigned char a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
-                s[c * 4 + 0] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
-                s[c * 4 + 1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
-                s[c * 4 + 2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
-                s[c * 4 + 3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+                s[c * 4 + 0] = m14[a0] ^ m11[a1] ^ m13[a2] ^ m9[a3];
+                s[c * 4 + 1] = m9[a0] ^ m14[a1] ^ m11[a2] ^ m13[a3];
+                s[c * 4 + 2] = m13[a0] ^ m9[a1] ^ m14[a2] ^ m11[a3];
+                s[c * 4 + 3] = m11[a0] ^ m13[a1] ^ m9[a2] ^ m14[a3];
             }
         } else {
             memcpy(s, t, 16);
