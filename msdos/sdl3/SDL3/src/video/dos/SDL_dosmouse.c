@@ -129,6 +129,8 @@ static bool DOSVESA_MoveCursor(SDL_Cursor *cursor)
     return true; // we handle this elsewhere.
 }
 
+bool DOSVESA_mouse_has_wheel = false;
+
 void DOSVESA_InitMouse(SDL_VideoDevice *_this)
 {
     SDL_Mouse *mouse = SDL_GetMouse();
@@ -142,6 +144,14 @@ void DOSVESA_InitMouse(SDL_VideoDevice *_this)
     }
 
     mouse->internal = SDL_calloc(1, 1); // just something non-NULL (and safely freeable) to say "there's a mouse available."
+
+    // felixterminal: the wheel, where the driver has CuteMouse's WheelAPI
+    // (INT 33h AX=11h answers 574Dh 'WM', CX bit 0 set): it's switched on
+    // by asking, and function 3 then gives its clicks in BH.
+    regs.x.ax = 0x11;
+    regs.x.cx = 0;
+    __dpmi_int(0x33, &regs);
+    DOSVESA_mouse_has_wheel = (regs.x.ax == 0x574D) && (regs.x.cx & 1);
 
     // Query mouse sensitivity (mickeys per pixel) via INT 33h function 0x1B
     SDL_VideoData *data = _this->internal;

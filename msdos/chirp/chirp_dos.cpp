@@ -418,14 +418,16 @@ static void fail_critical_errors(void) {
 // felixchirp/ calls this (g_iv_busy_hook) before it opens a file; on DOS nothing else runs
 // while it does (a .kfn's tracks take a few seconds), so the screen as it was
 // gets a notice over it, shown at once.
+extern "C" unsigned long g_bigmem_blocks, g_bigmem_bytes;   // (bigmem_dos.c: big blocks held now)
 static void show_busy(const char *name) {
     if (!g_sdl_renderer || !s_win_w) return;
     forget_unseen_texts();
     if (g_chirp_log) {
         __dpmi_free_mem_info fi;
         unsigned long freekb = __dpmi_get_free_memory_information(&fi) == 0 ? fi.total_number_of_free_pages * 4 : 0;
-        fprintf(g_chirp_log, "%llu ms: opening %s (%lu KB free; %u texts, %u KB of them, budget %u KB; %u glyphs)\n",
-                (unsigned long long)SDL_GetTicks(), name, freekb, (unsigned)s_texts.size(), (unsigned)(s_text_pixels * 4 / 1024),
+        fprintf(g_chirp_log, "%llu ms: opening %s (%lu KB free; %lu big blocks, %lu KB; %u texts, %u KB of them, budget %u KB; %u glyphs)\n",
+                (unsigned long long)SDL_GetTicks(), name, freekb, g_bigmem_blocks, g_bigmem_bytes / 1024,
+                (unsigned)s_texts.size(), (unsigned)(s_text_pixels * 4 / 1024),
                 (unsigned)(s_text_budget * 4 / 1024), (unsigned)s_glyphs.size());
         fflush(g_chirp_log);
     }

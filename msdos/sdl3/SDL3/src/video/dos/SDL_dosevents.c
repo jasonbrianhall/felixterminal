@@ -31,6 +31,7 @@
 
 #include "../../core/dos/SDL_dos_scheduler.h"
 #include "SDL_dosevents_c.h"
+extern bool DOSVESA_mouse_has_wheel;   // SDL_dosmouse.c
 
 // PS/2 keyboard controller port
 #define KBD_DATA_PORT 0x60
@@ -359,16 +360,47 @@ void DOSVESA_PumpEvents(SDL_VideoDevice *device)
 
         regs.x.ax = 0x3; // read mouse buttons and position.
         __dpmi_int(0x33, &regs);
-        const Uint16 buttons = (int)(Sint16)regs.x.bx;
+        const Uint16 buttons = (Uint16)(regs.x.bx & 0xFF);
+        const int wheel = DOSVESA_mouse_has_wheel ? (int)(Sint8)regs.h.bh : 0;   // (+: towards the user)
+        const int px = (int)(Sint16)regs.x.cx, py = (int)(Sint16)regs.x.dx;
+
+        // felixterminal: a click made and let go between two polls (a quick
+        // one, or the program busy drawing a frame) was lost: only the
+        // buttons' state now was seen. The driver counts presses (function
+        // 5): one that's up now but was pressed since is sent as down and
+        // up, at the place it was pressed, so a double-click is two clicks.
+        static const Uint8 sdl_button[3] = { SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE };
+        const SDL_MouseButtonFlags held = SDL_GetMouseState(NULL, NULL);
+        for (int b = 0; b < 3; b++) {
+            __dpmi_regs r;
+            r.x.ax = 0x5; // button press data: presses since the last call, and where the last one was
+            r.x.bx = (Uint16)b;
+            __dpmi_int(0x33, &r);
+            const int presses = r.x.bx;
+            const bool down_now = (buttons & (1 << b)) != 0;
+            const bool was_down = (held & SDL_BUTTON_MASK(sdl_button[b])) != 0;
+            // Of the presses since the last poll, those let go already (the
+            // last one is the button held now, if it is).
+            int quick = down_now ? (presses > 0 ? presses - 1 : 0) : presses;
+            if (quick > 2) quick = 2;
+            if (presses > 0 && was_down)   // (the press seen before was let go first)
+                SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, sdl_button[b], false);
+            for (int k = 0; k < quick; k++) {
+                if (!mouse->relative_mode)
+                    SDL_SendMouseMotion(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, false, (int)(Sint16)r.x.cx, (int)(Sint16)r.x.dx);
+                SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, sdl_button[b], true);
+                SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, sdl_button[b], false);
+            }
+        }
 
         SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, SDL_BUTTON_LEFT, (buttons & (1 << 0)) != 0);
         SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, SDL_BUTTON_RIGHT, (buttons & (1 << 1)) != 0);
         SDL_SendMouseButton(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, SDL_BUTTON_MIDDLE, (buttons & (1 << 2)) != 0);
+        if (wheel)
+            SDL_SendMouseWheel(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, 0.0f, (float)-wheel, SDL_MOUSEWHEEL_NORMAL);
 
         if (!mouse->relative_mode) {
-            const int x = (int)(Sint16)regs.x.cx; // part of function 0x3's return value.
-            const int y = (int)(Sint16)regs.x.dx;
-            SDL_SendMouseMotion(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, false, x, y);
+            SDL_SendMouseMotion(0, mouse->focus, SDL_DEFAULT_MOUSE_ID, false, px, py);
         } else {
             regs.x.ax = 0xB; // read motion counters
             __dpmi_int(0x33, &regs);

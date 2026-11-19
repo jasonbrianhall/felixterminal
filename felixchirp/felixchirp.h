@@ -224,6 +224,13 @@ bool iv_is_drive_name(const char *name);   // "D:" (DOS: drives in a root's list
 #endif
 void iv_list_remote(const char *path, std::vector<IVEntry> &out);
 void iv_free_tex();
+void iv_detail_release(bool forget_picture);   // (fc_file.cpp: a large picture's full detail, when zoomed in)
+void iv_detail_draw(float img_cx, float img_cy, float effective, float vx, float vy, float vw, float vh);
+int  iv_picture_full_w();
+int  iv_picture_full_h();
+float iv_max_zoom();
+void iv_draw_texture_in_view(SDL_Texture *t, float tw, float th, float ccx, float ccy, float sc, int angle,
+                             float vx, float vy, float vw, float vh);
 void iv_upload_texture(const unsigned char *rgba, int w, int h);
 bool has_paired_cdg(const char *dir, const char *audio_name);
 unsigned char *iv_extract_zip_entry(const char *zip_filepath, const char *entry_name, size_t &out_size);

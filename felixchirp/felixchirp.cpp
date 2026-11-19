@@ -227,6 +227,7 @@ unsigned char *iv_download_remote(const char *path, size_t &out_size) {
 // ============================================================================
 
 void iv_free_tex() {
+    iv_detail_release(false);
     if (g_use_sdl_renderer) {
         if (g_iv.sdl_tex) { SDL_DestroyTexture(g_iv.sdl_tex); g_iv.sdl_tex = nullptr; }
     } else {
@@ -2046,7 +2047,12 @@ void iv_render(int win_w, int win_h) {
             // function rotates the quad, so we pass raw tex size * scale.
             float raw_w = (float)g_iv.tex_w * effective;
             float raw_h = (float)g_iv.tex_h * effective;
-            iv_draw_image_rotated(img_cx, img_cy, raw_w, raw_h, g_iv.img_rot);
+            if (g_use_sdl_renderer)      // (only what's on screen: see iv_draw_texture_in_view)
+                iv_draw_texture_in_view(g_iv.sdl_tex, (float)g_iv.tex_w, (float)g_iv.tex_h, img_cx, img_cy,
+                                        effective, g_iv.img_rot, ix, iy, iw, ih);
+            else
+                iv_draw_image_rotated(img_cx, img_cy, raw_w, raw_h, g_iv.img_rot);
+            iv_detail_draw(img_cx, img_cy, effective, ix, iy, iw, ih);   // (a large picture zoomed in: every pixel)
 
             // Zoom level hint (fade out quickly — only show when != 1.0)
             if (g_iv.zoom != 1.0f) {
@@ -2108,7 +2114,7 @@ void iv_render(int win_w, int win_h) {
                      g_iv.audio_paused ? "  [PAUSED]" : "");
         } else if (g_use_sdl_renderer ? (bool)g_iv.sdl_tex : (bool)g_iv.tex) {
             snprintf(status, sizeof(status), "  %s   %dx%d px",
-                     g_iv.img_label, g_iv.tex_w, g_iv.tex_h);
+                     g_iv.img_label, iv_picture_full_w(), iv_picture_full_h());
         } else {
             int n = (int)g_iv.entries.size();
             int imgs = 0, audio = 0, cdgs = 0, kfns = 0, texts = 0;

@@ -11,12 +11,16 @@
 #endif
 
 #include <string>
+#include <vector>
+#include <math.h>
 #include <cstring>
 #include <algorithm>
 #include <sys/stat.h>
 #include <stdlib.h>
 
 #include "felixchirp.h"
+extern bool g_use_sdl_renderer;          // (sdl_renderer.h)
+extern SDL_Renderer *g_sdl_renderer;
 
 #  include "../ssh_session.h"
 #  include "../sftp_overlay.h"
@@ -243,15 +247,216 @@ void iv_close() {
     g_iv.visible = false;
 }
 
+// The most a picture is kept at, on its long side, in pixels: one larger is
+// made smaller as soon as it's decoded (the texture is 4 bytes a pixel, and
+// on DOS the memory a picture took is kept by Chirp until it exits; a
+// 12-megapixel photo took over 150 MB). 2048 still zooms to 3x on a
+// 640x480 screen with every pixel there. Elsewhere, the picture as it is.
+#ifdef __DJGPP__
+static const int IV_MAX_PICTURE_SIDE = 2048;
+#else
+static const int IV_MAX_PICTURE_SIDE = 0;
+#endif
+
+// Average `src` (sw x sh, `comp` bytes a pixel) down to dw x dh RGBA.
+static unsigned char *iv_shrink_to_rgba(const unsigned char *src, int sw, int sh, int comp, int dw, int dh,
+                                        size_t stride = 0) {
+    if (!stride) stride = (size_t)sw * comp;
+    unsigned char *dst = (unsigned char *)malloc((size_t)dw * dh * 4);
+    if (!dst) return nullptr;
+    std::vector<uint32_t> acc((size_t)dw * 4);
+    std::vector<int> x0(dw + 1);
+    for (int x = 0; x <= dw; x++) x0[x] = (int)((long long)x * sw / dw);
+    for (int y = 0; y < dh; y++) {
+        int ya = (int)((long long)y * sh / dh), yb = (int)((long long)(y + 1) * sh / dh);
+        if (yb <= ya) yb = ya + 1;
+        std::fill(acc.begin(), acc.end(), 0);
+        for (int sy = ya; sy < yb; sy++) {
+            const unsigned char *row = src + (size_t)sy * stride;
+            for (int x = 0; x < dw; x++) {
+                uint32_t *a = &acc[(size_t)x * 4];
+                int xb = x0[x + 1] > x0[x] ? x0[x + 1] : x0[x] + 1;
+                for (int sx = x0[x]; sx < xb; sx++) {
+                    const unsigned char *p = row + (size_t)sx * comp;
+                    if (comp >= 3) { a[0] += p[0]; a[1] += p[1]; a[2] += p[2]; a[3] += comp == 4 ? p[3] : 255; }
+                    else           { a[0] += p[0]; a[1] += p[0]; a[2] += p[0]; a[3] += comp == 2 ? p[1] : 255; }
+                }
+            }
+        }
+        unsigned char *out = dst + (size_t)y * dw * 4;
+        for (int x = 0; x < dw; x++) {
+            int xb = x0[x + 1] > x0[x] ? x0[x + 1] : x0[x] + 1;
+            uint32_t n = (uint32_t)(xb - x0[x]) * (uint32_t)(yb - ya);
+            for (int k = 0; k < 4; k++) out[x * 4 + k] = (unsigned char)((acc[(size_t)x * 4 + k] + n / 2) / n);
+        }
+    }
+    return dst;
+}
+
+// Draw texture `t` (tw x th), its centre at (ccx, ccy), `sc` screen pixels
+// a texture pixel, turned `angle` degrees, only where it's inside the view:
+// just the part of it on screen is drawn. (SDL's software renderer draws a
+// turned texture as triangles, and draws nothing when they are far larger
+// than the screen: a turned picture, zoomed in, disappeared.)
+void iv_draw_texture_in_view(SDL_Texture *t, float tw, float th, float ccx, float ccy, float sc, int angle,
+                             float vx, float vy, float vw, float vh) {
+    if (!t || sc <= 0.f) return;
+    float rad = (float)(angle * M_PI / 180.0), c = cosf(rad), sn = sinf(rad);
+    float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+    const float xs[4] = { vx, vx + vw, vx + vw, vx }, ys[4] = { vy, vy, vy + vh, vy + vh };
+    for (int i = 0; i < 4; i++) {
+        float dx = xs[i] - ccx, dy = ys[i] - ccy;
+        float lx = ( dx * c + dy * sn) / sc + tw * 0.5f;
+        float ly = (-dx * sn + dy * c) / sc + th * 0.5f;
+        minx = std::min(minx, lx); maxx = std::max(maxx, lx);
+        miny = std::min(miny, ly); maxy = std::max(maxy, ly);
+    }
+    // (a texel's worth more each way, so the edges of the view are covered)
+    float x0 = std::max(0.f, floorf(minx) - 1.f), y0 = std::max(0.f, floorf(miny) - 1.f);
+    float x1 = std::min(tw, ceilf(maxx) + 1.f),  y1 = std::min(th, ceilf(maxy) + 1.f);
+    if (x1 <= x0 || y1 <= y0) return;
+    SDL_FRect src = { x0, y0, x1 - x0, y1 - y0 };
+    float lx = x0 + src.w * 0.5f - tw * 0.5f, ly = y0 + src.h * 0.5f - th * 0.5f;
+    float scx = ccx + (lx * c - ly * sn) * sc, scy = ccy + (lx * sn + ly * c) * sc;
+    SDL_FRect dst = { scx - src.w * sc * 0.5f, scy - src.h * sc * 0.5f, src.w * sc, src.h * sc };
+    SDL_Rect clip = { (int)vx, (int)vy, (int)vw, (int)vh };
+    SDL_SetRenderClipRect(g_sdl_renderer, &clip);
+    SDL_RenderTextureRotated(g_sdl_renderer, t, &src, &dst, (double)angle, nullptr, SDL_FLIP_NONE);
+    SDL_SetRenderClipRect(g_sdl_renderer, nullptr);
+}
+
+// ---- full detail when zoomed in (pictures made smaller above) -------------
+// The picture shown is the smaller one; its file is kept (compressed: small).
+// Zoomed in past what the smaller one holds, the whole picture is decoded
+// once and kept while it stays zoomed in, and the part on screen is drawn
+// from it at full detail, over the smaller one. Back to the whole picture
+// (or another picture), that memory goes back.
+static std::vector<unsigned char> s_pic_file;     // the picture's file, when it was made smaller
+static int  s_full_w, s_full_h;                   // its size
+static unsigned char *s_full_px;                  // decoded, while zoomed in (s_full_comp bytes a pixel)
+static int  s_full_comp;
+static bool s_full_failed;                        // (no memory for it: don't try again for this picture)
+static SDL_Texture *s_detail_tex;                 // the part shown, at full detail (or the screen's, if less)
+static int  s_det_x, s_det_y, s_det_w, s_det_h;   // that part, in the picture's pixels
+static float s_det_scale;                         // texture pixels per picture pixel (<= 1)
+
+void iv_detail_release(bool forget_picture) {
+    if (s_detail_tex) { SDL_DestroyTexture(s_detail_tex); s_detail_tex = nullptr; }
+    if (s_full_px) { stbi_image_free(s_full_px); s_full_px = nullptr; }
+    if (forget_picture) {
+        std::vector<unsigned char>().swap(s_pic_file);
+        s_full_w = s_full_h = 0;
+        s_full_failed = false;
+    }
+}
+
+int iv_picture_full_w() { return s_full_w ? s_full_w : g_iv.tex_w; }
+int iv_picture_full_h() { return s_full_h ? s_full_h : g_iv.tex_h; }
+
+// How far in a picture may be zoomed: 16 times, or more for a large one
+// made smaller, so its every pixel can still be seen 4 screen pixels wide.
+float iv_max_zoom() {
+    float z = (float)iv_picture_full_w() / 64.f;
+    return z > 16.f ? z : 16.f;
+}
+
+// Called by iv_render after the picture is drawn: img_cx/img_cy its centre on
+// screen, `effective` screen pixels per texture pixel, the view's rectangle.
+void iv_detail_draw(float img_cx, float img_cy, float effective, float vx, float vy, float vw, float vh) {
+    if (!g_use_sdl_renderer || s_pic_file.empty() || !g_iv.sdl_tex || !g_iv.tex_w) return;
+    float fs = effective * (float)g_iv.tex_w / (float)s_full_w;    // screen pixels per picture pixel
+    // Back to the whole picture: the full one goes. Zoomed in but not past
+    // what the smaller one holds (as a turn can make it): kept, not drawn.
+    if (g_iv.zoom <= 1.0f) { iv_detail_release(false); return; }
+    if (effective <= 1.02f) return;
+    if (!s_full_px) {
+        static bool decoding;                         // ("Loading" draws the screen, and so comes here)
+        if (s_full_failed || decoding) return;
+        decoding = true;
+        if (g_iv_busy_hook) g_iv_busy_hook("full detail");
+        decoding = false;
+        int w, h, ch;
+        stbi_info_from_memory(s_pic_file.data(), (int)s_pic_file.size(), &w, &h, &ch);
+        s_full_comp = ch == 2 || ch == 4 ? 4 : 3;
+        s_full_px = stbi_load_from_memory(s_pic_file.data(), (int)s_pic_file.size(), &w, &h, &ch, s_full_comp);
+        if (!s_full_px || w != s_full_w || h != s_full_h) {
+            if (s_full_px) { stbi_image_free(s_full_px); s_full_px = nullptr; }
+            s_full_failed = true;
+            return;
+        }
+    }
+
+    // What's on screen, in the picture's pixels: the view's corners taken
+    // back through the rotation and the scale.
+    float rad = (float)(g_iv.img_rot * M_PI / 180.0), c = cosf(rad), sn = sinf(rad);
+    float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+    const float cxs[4] = { vx, vx + vw, vx + vw, vx }, cys[4] = { vy, vy, vy + vh, vy + vh };
+    for (int i = 0; i < 4; i++) {
+        float dx = cxs[i] - img_cx, dy = cys[i] - img_cy;
+        float lx = ( dx * c + dy * sn) / fs + s_full_w * 0.5f;
+        float ly = (-dx * sn + dy * c) / fs + s_full_h * 0.5f;
+        minx = std::min(minx, lx); maxx = std::max(maxx, lx);
+        miny = std::min(miny, ly); maxy = std::max(maxy, ly);
+    }
+    int x0 = std::max(0, (int)floorf(minx)), y0 = std::max(0, (int)floorf(miny));
+    int x1 = std::min(s_full_w, (int)ceilf(maxx)), y1 = std::min(s_full_h, (int)ceilf(maxy));
+    if (x1 <= x0 || y1 <= y0) return;
+    float want_scale = fs < 1.f ? fs : 1.f;    // (no more texture pixels than screen pixels)
+
+    // The part made before still covers it, at about this scale: drawn as it is.
+    bool covers = s_detail_tex && x0 >= s_det_x && y0 >= s_det_y &&
+                  x1 <= s_det_x + s_det_w && y1 <= s_det_y + s_det_h &&
+                  s_det_scale > want_scale * 0.8f && s_det_scale < want_scale * 1.25f;
+    if (!covers) {
+        // A quarter of the view more each way: panning a little needs no new one.
+        int mx = (x1 - x0) / 4, my = (y1 - y0) / 4;
+        x0 = std::max(0, x0 - mx); y0 = std::max(0, y0 - my);
+        x1 = std::min(s_full_w, x1 + mx); y1 = std::min(s_full_h, y1 + my);
+        int rw = x1 - x0, rh = y1 - y0;
+        int tw = std::max(1, (int)(rw * want_scale + 0.5f)), th = std::max(1, (int)(rh * want_scale + 0.5f));
+        size_t stride = (size_t)s_full_w * s_full_comp;
+        const unsigned char *src = s_full_px + (size_t)y0 * stride + (size_t)x0 * s_full_comp;
+        unsigned char *part = iv_shrink_to_rgba(src, rw, rh, s_full_comp, tw, th, stride);
+        if (!part) return;
+        if (s_detail_tex) { SDL_DestroyTexture(s_detail_tex); s_detail_tex = nullptr; }
+        s_detail_tex = SDL_CreateTexture(g_sdl_renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, tw, th);
+        if (s_detail_tex) {
+            SDL_SetTextureBlendMode(s_detail_tex, SDL_BLENDMODE_BLEND);
+            SDL_UpdateTexture(s_detail_tex, nullptr, part, tw * 4);
+        }
+        free(part);
+        if (!s_detail_tex) return;
+        s_det_x = x0; s_det_y = y0; s_det_w = rw; s_det_h = rh;
+        s_det_scale = (float)tw / rw;
+    }
+
+    // That part, where it is on screen (its centre through the scale and the
+    // rotation), turned as the picture is.
+    float lx = s_det_x + s_det_w * 0.5f - s_full_w * 0.5f, ly = s_det_y + s_det_h * 0.5f - s_full_h * 0.5f;
+    float scx = img_cx + (lx * c - ly * sn) * fs, scy = img_cy + (lx * sn + ly * c) * fs;
+    float tw = 0, th = 0;
+    SDL_GetTextureSize(s_detail_tex, &tw, &th);
+    iv_draw_texture_in_view(s_detail_tex, tw, th, scx, scy, fs / s_det_scale, g_iv.img_rot, vx, vy, vw, vh);
+}
+
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label) {
-    int w, h, ch;
-    unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &ch, 4);
+    int w = 0, h = 0, ch = 0;
+    iv_free_tex();                     // (the last picture's memory before this one's is taken)
+    iv_detail_release(true);
+    // As few bytes a pixel as the picture has (a JPEG: 3, not 4), when it
+    // will be made smaller anyway: less to hold while it's decoded.
+    int want = 4;
+    if (IV_MAX_PICTURE_SIDE && stbi_info_from_memory(data, (int)len, &w, &h, &ch) &&
+        (w > IV_MAX_PICTURE_SIDE || h > IV_MAX_PICTURE_SIDE))
+        want = ch == 2 || ch == 4 ? 4 : 3;
+    unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &ch, want);
     bool webp = false;
 
     // If stbi fails, try WebP decoder
     if (!px) {
         px = WebPDecodeRGBA(data, len, &w, &h);
         webp = px != nullptr;
+        want = 4;
     }
 
     if (!px) {
@@ -259,14 +464,36 @@ void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *l
         iv_free_tex();
         return;
     }
-    g_iv.error[0] = '\0';
-    iv_upload_texture(px, w, h);
+    auto free_px = [&](unsigned char *p) { if (webp) WebPFree(p); else stbi_image_free(p); };
 
-    // Freed by the decoder that made it. (This used to decode the picture a
-    // second time to find out which that was, and never freed the second
-    // one: every picture opened leaked a whole RGBA copy of itself.)
-    if (webp) WebPFree(px);
-    else stbi_image_free(px);
+    // Too big: made smaller (and RGBA) before anything else is allocated.
+    if (IV_MAX_PICTURE_SIDE && (w > IV_MAX_PICTURE_SIDE || h > IV_MAX_PICTURE_SIDE)) {
+        if (!webp) {                   // (kept, to zoom in with every pixel: iv_detail_draw)
+            s_pic_file.assign(data, data + len);
+            s_full_w = w; s_full_h = h;
+        }
+        double sc = (double)IV_MAX_PICTURE_SIDE / (w > h ? w : h);
+        int dw = (int)(w * sc + 0.5), dh = (int)(h * sc + 0.5);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        unsigned char *small = iv_shrink_to_rgba(px, w, h, want, dw, dh);
+        free_px(px);
+        if (!small) {
+            snprintf(g_iv.error, sizeof(g_iv.error), "Out of memory: %s", label);
+            iv_free_tex();
+            return;
+        }
+        g_iv.error[0] = '\0';
+        iv_upload_texture(small, dw, dh);
+        free(small);
+    } else {
+        g_iv.error[0] = '\0';
+        iv_upload_texture(px, w, h);
+        // Freed by the decoder that made it. (This used to decode the picture a
+        // second time to find out which that was, and never freed the second
+        // one: every picture opened leaked a whole RGBA copy of itself.)
+        free_px(px);
+    }
 
     strncpy(g_iv.img_label, label, sizeof(g_iv.img_label)-1);
     // Reset view for every new image
