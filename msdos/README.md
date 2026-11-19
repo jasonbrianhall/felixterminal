@@ -32,7 +32,12 @@ sockets; no X11 forwarding). What's DOS-specific is in this folder:
   their base64 at build time and linked in as TTF bytes, which FreeType reads
   in place: no decoded copy of them (2 MB) on the heap. The text layer is
   drawn straight into its SDL texture, for the same reason: DJGPP never
-  gives freed memory back to DOS, so what's allocated once stays. (The
+  gives freed memory back to DOS, so what's allocated once stays.
+* `bigmem_dos.c` (CHIRP.EXE links it too): malloc and the rest wrapped, so
+  a block of 256 KB or more (a sixel or kitty image, its canvas, its
+  texture) is a DPMI block of its own, given back to DOS when it's freed: a
+  large image's memory comes back when it's cleared or scrolled away, where
+  DJGPP's heap kept it until FLT exited. `SET FLT_BIGMEM=0` turns it off. (The
   scrollback is kept compact by `terminal.cpp` on every system: a few bytes
   a line instead of the screen's width of cells, about 0.6 MB for 5000
   lines.)
