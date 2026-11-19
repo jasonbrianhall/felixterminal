@@ -86,7 +86,10 @@ LIBS     = -L$(DEPS)/lib -lssh2 -lssl -lcrypto -lvmdosnet -lpng -lfreetype -lz $
 # felixterminal's own files, unchanged but for a few #ifdef __DJGPP__ in
 # ssh_session.cpp; flt_dos.cpp is the DOS front end.
 SHARED   = terminal term_color sixel_graphics kitty_graphics ssh_session
-OBJS     = $(BUILD)/flt_dos.o $(SHARED:%=$(BUILD)/%.o)
+OBJS     = $(BUILD)/flt_dos.o $(BUILD)/fonts.o $(SHARED:%=$(BUILD)/%.o)
+# The fonts flt_dos.cpp uses, from felixterminal's headers, decoded from
+# base64 and linked in as they are (fonts-dos.py)
+FONTS    = DejaVuMono DejaVuMonoBold DejaVuMonoOblique DejaVuMonoBoldOblique FreeMono
 STAMP    = $(DEPS)/.built
 
 # The libraries: once (build-deps.sh leaves $(STAMP) when it's done).
@@ -106,6 +109,9 @@ FLT.EXE: $(OBJS) $(SDL3_LIB)
 $(OBJS): $(STAMP) dos_compat.h include/GL/glew.h include/SDL2/SDL.h | $(BUILD)
 $(BUILD)/flt_dos.o: flt_dos.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD)/fonts.o: fonts-dos.py $(FONTS:%=$(TOP)/%.h) | $(BUILD)
+	python3 fonts-dos.py $(BUILD)/fonts $(FONTS:%=$(TOP)/%.h)
+	$(CXX) -c -Wa,-I$(BUILD)/fonts $(BUILD)/fonts/fonts.S -o $@
 $(BUILD)/ssh_session.o: $(TOP)/ssh_session.cpp
 	$(CXX) $(CXXFLAGS) $(SSH_CXXFLAGS) -c $< -o $@
 $(BUILD)/%.o: $(TOP)/%.cpp

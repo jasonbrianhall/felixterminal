@@ -47,8 +47,18 @@ static const uint32_t DEC_LINE_DRAWING[] = {
 
 static void sb_push(Terminal *t, int row) {
     //SDL_Log("[Scroll] sb_push called: sb_buf=%p sb_cap=%d scroll_top=%d scroll_bot=%d rows=%d\n", (void*)t->sb_buf, t->sb_cap, t->scroll_top, t->scroll_bot, t->rows);
-    if (!t->sb_buf || t->sb_cap == 0) return;
+    if (t->sb_cap == 0) return;
     if (t->scroll_top != 0 || t->scroll_bot != t->rows - 1) return;
+    if (!t->sb_buf) {
+        // Made on the first line that scrolls off, at the screen's width by
+        // then (term_init's 80 columns are usually resized away at once):
+        // one block of the right size rather than an 80-column one and then a
+        // wider copy. On DOS freed memory isn't given back, so that first
+        // block (8 MB) would stay part of the program's size.
+        t->sb_cols = t->cols;
+        t->sb_buf = (Cell*)calloc((size_t)t->sb_cap * t->sb_cols, sizeof(Cell));
+        if (!t->sb_buf) return;
+    }
     int slot = (t->sb_head + t->sb_count) % t->sb_cap;
     Cell *sb_row_ptr = t->sb_buf + slot * t->sb_cols;
     
@@ -1183,7 +1193,7 @@ void term_init(Terminal *t) {
     t->rows   = TERM_ROWS_DEFAULT;
     t->sb_cols = t->cols;  // Initialize scrollback width to match display width
 
-    t->sb_buf = (Cell*)calloc(t->sb_cap * t->sb_cols, sizeof(Cell));
+    t->sb_buf = nullptr;   // sb_push() makes it, when a line first scrolls off
     t->cells  = (Cell*)malloc(sizeof(Cell) * t->cols * t->rows);
     for (int i = 0; i < t->cols * t->rows; i++)
         t->cells[i] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
@@ -1339,23 +1349,32 @@ void term_resize(Terminal *t, int win_w, int win_h) {
     // Scrollback buffer: width only increases, never decreases
     // This preserves old data when shrinking the window; we just don't display
     // the overflow. Only reallocate if the new width is larger than scrollback width.
-    if (new_cols > t->sb_cols && t->sb_buf) {
-        // Column count increased — expand scrollback to new width
-        Cell *new_sb_buf = (Cell*)calloc(t->sb_cap * new_cols, sizeof(Cell));
-        
-        // Copy existing scrollback data to new buffer, padding new columns with blanks
-        for (int i = 0; i < t->sb_count; i++) {
-            Cell *old_row = sb_row(t, i);
-            Cell *new_row = new_sb_buf + ((t->sb_head + i) % t->sb_cap) * new_cols;
-            memcpy(new_row, old_row, sizeof(Cell) * t->sb_cols);
-            // Pad the extra columns with blanks
-            for (int c = t->sb_cols; c < new_cols; c++)
-                new_row[c] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
+    if (!t->sb_buf) {
+        t->sb_cols = new_cols;              // (not made yet: sb_push uses t->cols)
+    } else if (new_cols > t->sb_cols) {
+        // Column count increased: widen every slot in place. realloc can
+        // often just extend the block (no second copy of the scrollback at
+        // once); the rows then move up to their new offsets, last first, so
+        // none is overwritten before it has moved. Slots keep their places in
+        // the ring (sb_head is unchanged).
+        int old_cols = t->sb_cols;
+        Cell *nb = (Cell*)realloc(t->sb_buf, sizeof(Cell) * (size_t)t->sb_cap * new_cols);
+        if (nb) {
+            for (int slot = t->sb_cap - 1; slot >= 0; slot--) {
+                Cell *dst = nb + (size_t)slot * new_cols;
+                bool used = ((slot - t->sb_head + t->sb_cap) % t->sb_cap) < t->sb_count;
+                if (used) {
+                    memmove(dst, nb + (size_t)slot * old_cols, sizeof(Cell) * old_cols);
+                    for (int c = old_cols; c < new_cols; c++)
+                        dst[c] = {' ', TCOLOR_PALETTE(7), TCOLOR_PALETTE(0), 0, {0,0,0}};
+                } else {
+                    memset(dst, 0, sizeof(Cell) * new_cols);
+                }
+            }
+            t->sb_buf = nb;
+            t->sb_cols = new_cols;
         }
-        
-        free(t->sb_buf);
-        t->sb_buf = new_sb_buf;
-        t->sb_cols = new_cols;
+        // (realloc failed: the old, narrower scrollback stays as it was)
     }
     // If new_cols <= t->sb_cols, scrollback width stays at sb_cols; overflow is simply not displayed
 

@@ -28,6 +28,12 @@ sockets; no X11 forwarding). What's DOS-specific is in this folder:
   SDL's software renderer. Keys are turned into what `handle_key()` sends.
   `ssh_connect()` runs on the one thread there is; its host key and
   password questions are asked in the terminal.
+* `fonts-dos.py`: the fonts (`../DejaVuMono.h` and the rest) decoded from
+  their base64 at build time and linked in as TTF bytes, which FreeType reads
+  in place: no decoded copy of them (2 MB) on the heap. The text layer is
+  drawn straight into its SDL texture, and the scrollback is made when the
+  first line scrolls off, at the screen's width, for the same reason: DJGPP
+  never gives freed memory back to DOS, so what's allocated once stays.
 * `include/GL/glew.h`: stand-ins for the OpenGL names in the sixel and kitty
   files. Their OpenGL code never runs on DOS (`g_use_sdl_renderer` is true).
 * `include/SDL2/SDL.h`: the SDL2 calls those files make, on SDL3.
