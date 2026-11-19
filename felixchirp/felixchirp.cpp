@@ -31,6 +31,7 @@
 #include "../gl_renderer.h"
 #include "../sdl_renderer.h"
 #include "../ft_font.h"
+float measure_text(const char *text, int font_px);   // (ft_font.cpp)
 #include "../term_color.h"
 
 #include <SDL2/SDL.h>
@@ -1839,9 +1840,10 @@ void iv_render(int win_w, int win_h) {
             char timebuf[32];
             snprintf(timebuf, sizeof(timebuf), "%d:%02d / %d:%02d",
                      cur_s/60, cur_s%60, tot_s/60, tot_s%60);
-            iv_draw_text(timebuf,
-                         bar_x + bar_w*0.5f - strlen(timebuf)*g_font_size*0.3f,
-                         bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
+            // (laid out by measured widths: on a narrow screen, as 640x480,
+            // the volume on the left and the time on the right don't meet)
+            float time_w = measure_text(timebuf, g_font_size);
+            iv_draw_text(timebuf, bar_x + bar_w - time_w, bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
 
             // Status indicators (volume, repeat)
             char status_indicators[256] = "";
@@ -1857,16 +1859,24 @@ void iv_render(int win_w, int win_h) {
             strcat(status_indicators, vol_str);
             
             if (strlen(status_indicators) > 0) {
-                iv_draw_text(status_indicators,
-                             bar_x + bar_w * 0.05f,
-                             bar_y + 14.f, 0.50f, 0.70f, 0.85f, 1.f);
+                iv_draw_text(status_indicators, bar_x, bar_y + 14.f,
+                             0.50f, 0.70f, 0.85f, 1.f);
             }
 
-            const char *ctrl = "Space: pause/resume   S: stop   ←→: prev/next   V: next viz   DblClick: fullscreen   +/-: vol   .: repeat";
-            iv_draw_text(ctrl,
-                         ix + iw*0.5f - strlen(ctrl)*g_font_size*0.3f,
-                         bar_y + (float)rh + 4.f,
-                         0.40f, 0.45f, 0.55f, 1.f);
+            // The keys, centred; shorter where the long line doesn't fit
+            const char *ctrls[] = {
+                "Space: pause/resume   S: stop   ←→: prev/next   V: next viz   DblClick: fullscreen   +/-: vol   .: repeat",
+                "Space: pause   S: stop   ←→: prev/next   V: viz   +/-: vol",
+                "Space: pause   S: stop   V: viz",
+            };
+            for (const char *ctrl : ctrls) {
+                float cw = measure_text(ctrl, g_font_size);
+                if (cw <= iw - 8.f) {
+                    iv_draw_text(ctrl, ix + (iw - cw) * 0.5f, bar_y + (float)rh + 4.f,
+                                 0.40f, 0.45f, 0.55f, 1.f);
+                    break;
+                }
+            }
 
             // ── Visualizer drawing area (between label and progress bar) ──
             float viz_top = lbl_y + rh * 1.8f;
@@ -1938,9 +1948,10 @@ void iv_render(int win_w, int win_h) {
             char timebuf[32];
             snprintf(timebuf, sizeof(timebuf), "%d:%02d / %d:%02d",
                      cur_s/60, cur_s%60, tot_s/60, tot_s%60);
-            iv_draw_text(timebuf,
-                         bar_x + bar_w*0.5f - strlen(timebuf)*g_font_size*0.3f,
-                         bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
+            // (laid out by measured widths: on a narrow screen, as 640x480,
+            // the volume on the left and the time on the right don't meet)
+            float time_w = measure_text(timebuf, g_font_size);
+            iv_draw_text(timebuf, bar_x + bar_w - time_w, bar_y + 14.f, 0.55f, 0.65f, 0.75f, 1.f);
 
             // Video label
             iv_draw_text(g_iv.video_label,
