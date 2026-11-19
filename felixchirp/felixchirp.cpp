@@ -239,6 +239,18 @@ void iv_free_tex() {
 // AUDIO STOP / CDG FREE
 // ============================================================================
 
+// The packet the CDG texture last showed (-1: none yet / redraw it).
+static int s_cdg_shown_packet = -1;
+
+// Temp files a song is read from as it plays (unpacked from a zip): kept
+// until it stops. (They were deleted as soon as the song started: on DOS
+// that frees the clusters of a file still open, and the next file written
+// can take them.)
+static std::vector<std::string> s_playing_tmp;
+static void iv_keep_tmp_while_playing(const std::string &path) {
+    if (!path.empty()) s_playing_tmp.push_back(path);
+}
+
 void iv_stop_audio() {
     // Every "switch to something else" path (new song, video, image, text,
     // or an explicit stop) routes through here to tear down the current
@@ -263,6 +275,8 @@ void iv_stop_audio() {
     g_iv.audio_paused   = false;
     g_iv.audio_position = 0.0;
     g_iv.audio_label[0] = '\0';
+    for (auto &t : s_playing_tmp) iv_delete_tempfile(t.c_str());
+    s_playing_tmp.clear();
 }
 
 void iv_cdg_free() {
@@ -272,6 +286,7 @@ void iv_cdg_free() {
         if (g_iv.cdg_tex) { glDeleteTextures(1, (GLuint*)&g_iv.cdg_tex); g_iv.cdg_tex = 0; }
     }
     if (g_iv.cdg_display) { cdg_display_free(g_iv.cdg_display); g_iv.cdg_display = nullptr; }
+    s_cdg_shown_packet = -1;
 }
 
 void iv_video_stop() {
@@ -394,6 +409,8 @@ bool iv_cdg_load(const char *cdg_path) {
 void iv_cdg_upload_texture() {
     CDGDisplay *cdg = g_iv.cdg_display;
     if (!cdg) return;
+    bool have_tex = g_use_sdl_renderer ? g_iv.sdl_cdg_tex != nullptr : g_iv.cdg_tex != 0;
+    if (have_tex && cdg->current_packet == s_cdg_shown_packet) return;   // (nothing new to show)
     static uint8_t rgba[CDG_HEIGHT * CDG_WIDTH * 4];
     for (int y = 0; y < CDG_HEIGHT; y++) {
         for (int x = 0; x < CDG_WIDTH; x++) {
@@ -407,12 +424,16 @@ void iv_cdg_upload_texture() {
         }
     }
     if (g_use_sdl_renderer) {
-        if (g_iv.sdl_cdg_tex) SDL_DestroyTexture(g_iv.sdl_cdg_tex);
-        g_iv.sdl_cdg_tex = SDL_CreateTexture(g_sdl_renderer,
-            SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
-            CDG_WIDTH, CDG_HEIGHT);
-        if (g_iv.sdl_cdg_tex)
-            SDL_UpdateTexture(g_iv.sdl_cdg_tex, nullptr, rgba, CDG_WIDTH * 4);
+        // Made once per song and updated in place. (It was destroyed and
+        // made again every frame: 260 KB freed and allocated each time, and
+        // when memory ran short the allocation failed, there was no texture,
+        // and the CD+G screen gave way to the visualizer.)
+        if (!g_iv.sdl_cdg_tex)
+            g_iv.sdl_cdg_tex = SDL_CreateTexture(g_sdl_renderer,
+                SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                CDG_WIDTH, CDG_HEIGHT);
+        if (!g_iv.sdl_cdg_tex) return;
+        SDL_UpdateTexture(g_iv.sdl_cdg_tex, nullptr, rgba, CDG_WIDTH * 4);
     } else {
         if (!g_iv.cdg_tex) {
             glGenTextures(1, (GLuint*)&g_iv.cdg_tex);
@@ -430,6 +451,7 @@ void iv_cdg_upload_texture() {
         }
         glBindTexture(GL_TEXTURE_2D, 0);
     }
+    s_cdg_shown_packet = cdg->current_packet;
 }
 
 // ============================================================================
@@ -799,13 +821,15 @@ void iv_enter_selected() {
                         if (!tmp_cdg.empty()) iv_cdg_load(tmp_cdg.c_str());
                     }
                     if (!tmp_cdg.empty()) iv_delete_tempfile(tmp_cdg.c_str());
-                    iv_delete_tempfile(tmp_path.c_str());
+                    if (g_iv.music) iv_keep_tmp_while_playing(tmp_path);
+                    else iv_delete_tempfile(tmp_path.c_str());
                     return;
                 }
             }
 
             iv_play_audio(tmp_path.c_str(), e.name, false);
-            iv_delete_tempfile(tmp_path.c_str());
+            if (g_iv.audio_playing) iv_keep_tmp_while_playing(tmp_path);
+            else iv_delete_tempfile(tmp_path.c_str());
             return;
         }
 
@@ -966,7 +990,8 @@ void iv_enter_selected() {
                         g_iv.error[0] = '\0';
                         if (!tmp_cdg.empty()) iv_cdg_load(tmp_cdg.c_str());
                     }
-                    iv_delete_tempfile(tmp_audio.c_str());
+                    if (g_iv.music) iv_keep_tmp_while_playing(tmp_audio);
+                    else iv_delete_tempfile(tmp_audio.c_str());
                     if (!tmp_cdg.empty()) iv_delete_tempfile(tmp_cdg.c_str());
                     auto_played = true;
                 }
@@ -1044,7 +1069,8 @@ void iv_enter_selected() {
                     free(buf);
                     if (!tmp.empty()) {
                         iv_play_audio(tmp.c_str(), e.name, false);
-                        iv_delete_tempfile(tmp.c_str());
+                        if (g_iv.audio_playing) iv_keep_tmp_while_playing(tmp);
+                        else iv_delete_tempfile(tmp.c_str());
                     } else {
                         snprintf(g_iv.error, sizeof(g_iv.error), "Cannot write temp file");
                     }
