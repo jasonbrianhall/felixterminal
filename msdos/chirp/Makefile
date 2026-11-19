@@ -123,7 +123,7 @@ $(BUILD)/aes_dos.o: aes_dos.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD)/clock_dos.o: clock_dos.c
 	$(CC) $(CFLAGS) -c $< -o $@
-$(BUILD)/bigmem_dos.o: bigmem_dos.c
+$(BUILD)/bigmem_dos.o: ../bigmem_dos.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD)/fc/%.o: $(TOP)/felixchirp/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@

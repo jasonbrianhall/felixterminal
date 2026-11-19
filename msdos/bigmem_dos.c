@@ -2,12 +2,14 @@
    when they're freed.
 
    DJGPP's malloc takes memory from the DPMI host as the heap grows and never
-   gives it back: a program's memory is the most it ever needed. Chirp's big
-   blocks are pictures (the decoded pixels, their texture), so the memory it
-   held was that of the largest picture it had opened until it exited.
+   gives it back: a program's memory is the most it ever needed. The big
+   blocks are pictures (CHIRP.EXE: the decoded pixels, their texture;
+   FLT.EXE: sixel and kitty images, their canvas and texture), so the memory
+   held was that of the largest picture shown, until the program exited.
+   Both link this file (chirp/Makefile, Makefile).
 
    malloc, calloc, realloc and free are wrapped (-Wl,--wrap=..., see the
-   Makefile), everywhere: Chirp, SDL, stb_image, libwebp, C++'s new. A block
+   Makefile), everywhere: the program, SDL, stb_image, libwebp, libpng, OpenSSL, C++'s new. A block
    of BIG bytes or more is a DPMI memory block of its own (INT 31h 0501h),
    freed to the host at once (0502h); anything smaller is DJGPP's malloc.
    A DPMI block is outside DJGPP's data segment's usual limit, so this needs
@@ -71,7 +73,8 @@ static int host_frees_well(void) {
 int g_bigmem_state;                                /* (CHIRP_LOG: 1 on, -1 off) */
 static int big_ready(void) {
     if (!s_state) {
-        const char *e = getenv("CHIRP_BIGMEM");      /* SET CHIRP_BIGMEM=0: DJGPP's malloc for everything */
+        const char *e = getenv("CHIRP_BIGMEM");      /* SET CHIRP_BIGMEM=0 (FLT_BIGMEM=0): DJGPP's malloc for everything */
+        if (!e) e = getenv("FLT_BIGMEM");
         s_state = !(e && *e == '0') && host_frees_well() && __djgpp_nearptr_enable() ? 1 : -1;
     }
     g_bigmem_state = s_state;
