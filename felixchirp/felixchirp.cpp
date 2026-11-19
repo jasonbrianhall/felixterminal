@@ -744,6 +744,10 @@ void iv_refresh() {
 // (A plain pointer, not a weak symbol: MSVC has none.)
 void (*g_iv_busy_hook)(const char *name) = nullptr;
 
+// Chirp is a program of its own (felixchirp, --chirp), not Felix Terminal's
+// F5 overlay: the title says so.
+bool g_iv_standalone = false;
+
 void iv_enter_selected() {
     if (g_iv.entries.empty()) return;
     const IVEntry &e = g_iv.entries[g_iv.selected];
@@ -1625,9 +1629,14 @@ void iv_render(int win_w, int win_h) {
                  "%s   %dx%d (F2: mode)   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Alt+letter: drive   Esc: quit",
                  mode_str, win_w, win_h);
 #else
-        snprintf(title, sizeof(title),
-                 "%s (F5)   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Esc: close",
-                 mode_str);
+        if (g_iv_standalone)        // felixchirp / --chirp: its own window, Esc ends it
+            snprintf(title, sizeof(title),
+                     "%s   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Esc: quit",
+                     mode_str);
+        else
+            snprintf(title, sizeof(title),
+                     "%s (F5)   ↑↓: navigate   ←→: prev/next   Shift+←→: ±5s   Shift+↑↓: ±30s   Enter/DblClick: open   Space: pause   R: rotate   0: reset zoom   Esc: close",
+                     mode_str);
 #endif
         iv_draw_text(title, (float)IV_PAD, (float)title_h * 0.72f, 0.75f, 0.88f, 1.0f, 1.f);
     }

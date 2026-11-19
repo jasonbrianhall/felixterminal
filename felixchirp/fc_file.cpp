@@ -13,6 +13,8 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#include <sys/stat.h>
+#include <stdlib.h>
 
 #include "felixchirp.h"
 
@@ -172,6 +174,53 @@ void iv_open(bool remote, int /*win_w*/, int /*win_h*/) {
         strncpy(g_iv.path, "/", sizeof(g_iv.path)-1);
         iv_list_remote(g_iv.path, g_iv.entries);
     }
+}
+
+// Start in a folder, or open a file at once (its folder listed, it
+// selected): for a path given on the command line. Relative paths are from
+// the current folder. Returns false (and says why in g_iv.error) when there's
+// no such file or folder; the listing is then the home folder's.
+bool iv_open_path(const char *path) {
+    if (!path || !*path) return false;
+    std::string full = path;
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    if (_fullpath(buf, path, sizeof buf)) full = buf;
+    const char *seps = "\\/";
+#else
+    char *rp = realpath(path, nullptr);
+    if (rp) { full = rp; free(rp); }
+    const char *seps = "/";
+#endif
+    struct stat st;
+    if (stat(full.c_str(), &st) != 0) {
+        snprintf(g_iv.error, sizeof(g_iv.error), "No such file or folder: %s", path);
+        return false;
+    }
+    std::string dir = full, file;
+    if ((st.st_mode & S_IFMT) != S_IFDIR) {          // (MSVC has no S_ISDIR)
+        size_t sl = full.find_last_of(seps);
+        if (sl == std::string::npos) { dir = "."; file = full; }
+        else { dir = full.substr(0, sl == 0 ? 1 : sl); file = full.substr(sl + 1); }
+#ifdef _WIN32
+        if (dir.size() == 2 && dir[1] == ':') dir += '\\';     // ("C:" is C:'s current folder)
+#endif
+    }
+    strncpy(g_iv.path, dir.c_str(), sizeof(g_iv.path) - 1);
+    g_iv.path[sizeof(g_iv.path) - 1] = '\0';
+    g_iv.in_zip = false;
+    iv_list_local(g_iv.path, g_iv.entries);
+    g_iv.selected = 0;
+    g_iv.scroll_top = 0;
+    if (!file.empty()) {
+        for (size_t i = 0; i < g_iv.entries.size(); i++)
+            if (strcmp(g_iv.entries[i].name, file.c_str()) == 0) {
+                g_iv.selected = (int)i;
+                iv_enter_selected();
+                break;
+            }
+    }
+    return true;
 }
 
 void iv_close() {
