@@ -737,16 +737,17 @@ void iv_refresh() {
     }
 }
 
-// Called just before a file is opened, which can take a few seconds (a
-// .kfn's tracks to unpack, a zip to look through, a large picture): the
-// front end may show that something is happening. Felix Terminal doesn't;
-// Chirp for DOS (msdos/chirp) draws "Loading ...".
-__attribute__((weak)) void iv_show_busy(const char *) {}
+// Called (when set) just before a file is opened, which can take a few
+// seconds (a .kfn's tracks to unpack, a zip to look through, a large
+// picture): the front end may show that something is happening. Felix
+// Terminal leaves it unset; Chirp for DOS (msdos/chirp) draws "Loading ...".
+// (A plain pointer, not a weak symbol: MSVC has none.)
+void (*g_iv_busy_hook)(const char *name) = nullptr;
 
 void iv_enter_selected() {
     if (g_iv.entries.empty()) return;
     const IVEntry &e = g_iv.entries[g_iv.selected];
-    if (!e.is_dir) iv_show_busy(e.name);
+    if (!e.is_dir && g_iv_busy_hook) g_iv_busy_hook(e.name);
 
     // ── Inside a zip: handle image, audio, or CDG entry ──────────────────
     if (e.is_zip_entry) {

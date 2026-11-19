@@ -371,11 +371,11 @@ static void fail_critical_errors(void) {
 }
 
 // ---- "Loading ..." ----------------------------------------------------------
-// felixchirp/ calls this before it opens a file; on DOS nothing else runs
+// felixchirp/ calls this (g_iv_busy_hook) before it opens a file; on DOS nothing else runs
 // while it does (a .kfn's tracks take a few seconds), so the screen as it was
 // gets a notice over it, shown at once.
 static int s_win_w, s_win_h;
-void iv_show_busy(const char *name) {
+static void show_busy(const char *name) {
     if (!g_sdl_renderer || !s_win_w) return;
     if (g_chirp_log) { fprintf(g_chirp_log, "%llu ms: opening %s\n", (unsigned long long)SDL_GetTicks(), name); fflush(g_chirp_log); }
     iv_render(s_win_w, s_win_h);
@@ -507,6 +507,7 @@ static std::string dos_path(std::string p) {
 int main(int argc, char **argv) {
     if (getenv("CHIRP_LOG")) g_chirp_log = fopen(getenv("CHIRP_LOG"), "w");
     fail_critical_errors();
+    g_iv_busy_hook = show_busy;      // "Loading ..." while felixchirp/ opens a file
     log_memory("at start");
     int want_w = 0, want_h = 0, want_bpp = 0;
     const char *start = nullptr;
