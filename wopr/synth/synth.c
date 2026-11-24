@@ -452,6 +452,28 @@ static const DictEntry DICT[] = {
     {"uplink",   "AH1 P L IH2 NG K"},
     {"falken",   "F AO1 L K AH0 N"},
     {"falken's", "F AO1 L K AH0 N Z"},
+    /* places and words from WOPR's intelligence reports, sitreps and wire */
+    {"magdeburg",   "M AE1 G D AH0 B ER2 G"},
+    {"pechenga",    "P EH1 CH EH0 NG G AH0"},
+    {"zhukovsky",   "ZH UW0 K AA1 F S K IY0"},
+    {"zatec",       "Z AA1 T EH0 T S"},
+    {"vnukovo",     "V N UW1 K AH0 V OW0"},
+    {"thuringian",  "TH UH0 R IH1 N JH IY0 AH0 N"},
+    {"sudetenland", "S UW0 D EY1 T AH0 N L AE2 N D"},
+    {"rostock",     "R AA1 S T AA2 K"},
+    {"pribram",     "P R IY1 B R AA0 M"},
+    {"nordhausen",  "N AO1 R T HH AW2 Z AH0 N"},
+    {"harz",        "HH AA1 R T S"},
+    {"fulda",       "F UH1 L D AH0"},
+    {"erfurt",      "EH1 R F UH0 R T"},
+    {"cottbus",     "K AA1 T B UH0 S"},
+    {"cheb",        "K EH1 B"},
+    {"triangulated","T R AY0 AE1 NG G Y AH0 L EY2 T IH0 D"},
+    {"simulant",    "S IH1 M Y AH0 L AH0 N T"},
+    {"orions",      "AO0 R AY1 AH0 N Z"},
+    {"nape",        "N EY1 P"},
+    {"firebreak",   "F AY1 ER0 B R EY2 K"},
+    {"emplacing",   "EH0 M P L EY1 S IH0 NG"},
     {NULL,      NULL}
 };
 

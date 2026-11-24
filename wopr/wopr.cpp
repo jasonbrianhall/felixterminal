@@ -8,6 +8,7 @@
 #include "wopr_render.h"
 #include "../felix_settings.h"
 #include <ctime>
+#include <regex>
 
 // ============================================================================
 // GLOBALS
@@ -171,6 +172,107 @@ static void push_line(WoprState *w, const std::string &line) {
 static void say_line(WoprState *w, const std::string &line) {
     push_line_quiet(w, line);
     wopr_say(line.c_str());
+}
+
+// ── Reports read aloud ──────────────────────────────────────────────────────
+// INTELLIGENCE, SITREP and WIRE are read as a short spoken summary of what
+// matters (the event, the unit, where, the story), not line by line: grid
+// references and coordinates stay on the screen, and military shorthand is
+// expanded so it can be said ("14KM NE" -> "14 kilometers northeast").
+
+static std::string rx(const std::string &s, const char *pattern, const char *with) {
+    return std::regex_replace(s, std::regex(pattern), with);
+}
+
+// "06:14" -> "zero six fourteen", "03:00" -> "zero three hundred"
+static std::string say_times(const std::string &s) {
+    static const std::regex t("\\b(\\d)(\\d):(\\d\\d)\\b");
+    std::string out;
+    auto it = std::sregex_iterator(s.begin(), s.end(), t);
+    size_t last = 0;
+    for (; it != std::sregex_iterator(); ++it) {
+        const std::smatch &m = *it;
+        out += s.substr(last, m.position() - last);
+        std::string h1 = m[1], h2 = m[2], mm = m[3];
+        out += (h1 == "0" ? std::string("zero ") + h2 : h1 + h2);
+        if (mm == "00") out += " hundred";
+        else if (mm[0] == '0') out += std::string(" zero ") + mm[1];
+        else out += " " + mm;
+        last = m.position() + m.length();
+    }
+    return out + s.substr(last);
+}
+
+static std::string spoken(std::string s) {
+    // places given as grids or coordinates: on screen only
+    s = rx(s, "\\b(BEARING TRIANGULATION|TRANSMITTER LOCATED|COORDINATES|COORD)\\s*:", " ");
+    s = rx(s, "\\bGRID \\d+-\\d+", " ");
+    s = rx(s, "\\bAPPROX\\.?\\s+(\\d+(\\.\\d+)?[NS])\\s+\\d+(\\.\\d+)?[EW]\\b", " ");
+    s = rx(s, "\\b\\d+(\\.\\d+)?[NS]\\s+\\d+(\\.\\d+)?[EW]\\b", " ");
+    s = say_times(s);
+    s = rx(s, "\\+/-", " plus or minus ");
+    s = rx(s, "\\(\\+\\)", " plus ");
+    s = rx(s, "--+", ", ");
+    s = rx(s, "[()]", ", ");
+    s = rx(s, "~", " about ");
+    s = rx(s, "\\bAPPROX\\b\\.?", "approximately");
+    s = rx(s, "\\bEST\\.", "estimated");
+    s = rx(s, "\\b(\\d+)\\s*KM\\b", "$1 kilometers");
+    s = rx(s, "\\b(\\d+)\\s*NM\\b", "$1 nautical miles");
+    s = rx(s, "\\b(\\d+)\\s*HRS\\b", "$1 hours");
+    s = rx(s, "\\b(\\d+)-MIN\\b", "$1 minute");
+    s = rx(s, "\\b(\\d+)x\\s", "$1 ");
+    s = rx(s, "\\b(kilometers|miles) NE\\b", "$1 northeast");
+    s = rx(s, "\\b(kilometers|miles) NW\\b", "$1 northwest");
+    s = rx(s, "\\b(kilometers|miles) SE\\b", "$1 southeast");
+    s = rx(s, "\\b(kilometers|miles) SW\\b", "$1 southwest");
+    s = rx(s, "\\b(kilometers|miles) N\\b", "$1 north");
+    s = rx(s, "\\b(kilometers|miles) S\\b", "$1 south");
+    s = rx(s, "\\b(kilometers|miles) E\\b", "$1 east");
+    s = rx(s, "\\b(kilometers|miles) W\\b", "$1 west");
+    s = rx(s, "\\bFL(\\d+)", "flight level $1");
+    s = rx(s, "-III\\b", " three");
+    s = rx(s, "\\bFREQ\\b", "frequency");
+    s = rx(s, "\\bTELs\\b", "launchers");
+    s = rx(s, "\\bIGB\\b", "the inner German border");
+    s = rx(s, "\\bNOE\\b", "nap of the earth");
+    s = rx(s, "\\bBURST TX\\b", "burst transmissions");
+    s = rx(s, "\\bAT DITCHES\\b", "anti-tank ditches");
+    s = rx(s, "\\bUSAREUR\\b", "U S army Europe");
+    s = rx(s, "\\bW/", "with ");
+    s = rx(s, "\\bU\\.S\\.", "U S");
+    s = rx(s, "\\bWY\\b", "Wyoming");
+    s = rx(s, "\\bAP\\b", "A P");
+    s = rx(s, "\\bUPI\\b", "U P I");
+    s = rx(s, "\\bMOD\\b", "M O D");
+    s = rx(s, "\\bFAA\\b", "F A A");
+    s = rx(s, "\\bIZ-WEST\\b", "inner zone west");
+    s = rx(s, "\\s+,", ",");                   // tidy what the removals left
+    s = rx(s, ",(\\s*,)+", ",");
+    s = rx(s, "\\s*,\\s*\\.", ".");
+    s = rx(s, "^[\\s,]+|[\\s,]+$", "");
+    s = rx(s, "\\s{2,}", " ");
+    return s;
+}
+
+// Two lines of one report field, joined: a continuation ("... STAGED" +
+// "AT RIVER CROSSING SITE") runs on, a new clause gets a pause.
+static std::string join_lines(const char *a, const char *b) {
+    if (!b || !*b) return a;
+    static const char *RUN_ON[] = { "AT ", "TO ", "ON ", "IN ", "OF ", "ALONG ", "BEING ", "WITH ",
+                                    "FROM ", "AND ", "INTO ", "BY ", nullptr };
+    for (int i = 0; RUN_ON[i]; i++)
+        if (strncmp(b, RUN_ON[i], strlen(RUN_ON[i])) == 0) return std::string(a) + " " + b;
+    std::string s = a;
+    if (!s.empty() && s.back() != '.' && s.back() != ',') s += ',';
+    return s + " " + b;
+}
+
+// A sentence from report fragments: "A" + "B." -> "A B."
+static std::string sentence(std::string s) {
+    s = rx(s, "^[\\s,]+|[\\s,]+$", "");
+    if (!s.empty() && s.back() != '.' && s.back() != '?' && s.back() != '!') s += '.';
+    return s;
 }
 
 static void begin_crawl(WoprState *w, const std::string &text) {
@@ -412,16 +514,19 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "");
         const char *report = INTEL_REPORTS[g_intel_idx % INTEL_COUNT];
         g_intel_idx++;
-        std::string line;
+        std::string line, body;
+        int n = 0;
         for (const char *p = report; ; p++) {
             if (*p == '\n' || *p == '\0') {
-                push_line(w, "  " + line);
+                push_line_quiet(w, "  " + line);
+                if (n++ > 0) body += line + " ";     // the report; line 1 is its source
                 line.clear();
                 if (*p == '\0') break;
             } else {
                 line += *p;
             }
         }
+        wopr_say(spoken(body).c_str());
         push_line(w, "");
         push_line(w, "  END OF REPORT.  DESTROY AFTER READING.");
         push_line(w, "");
@@ -605,9 +710,20 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "");
         const char **story = WIRE_STORIES[g_wire_story_idx % WIRE_STORY_COUNT];
         g_wire_story_idx++;
+        std::string text;
         for (int i = 0; story[i] != nullptr; i++) {
             g_drip_queue.push_back(std::string("  ") + story[i]);
+            if (i == 0) {                          // dateline: agency and city, not the time
+                std::string d = story[0];
+                size_t a = d.find("--"), b = d.find("--", a == std::string::npos ? 0 : a + 2);
+                if (a != std::string::npos && b != std::string::npos)
+                    d = d.substr(0, a) + ", " + d.substr(a + 2, b - a - 2);
+                text += sentence(spoken(d)) + " ";
+            } else {
+                text += std::string(story[i]) + " ";
+            }
         }
+        wopr_say(spoken(text).c_str());
         g_drip_queue.push_back("");
         g_drip_queue.push_back("  -- END TRANSMISSION --");
         g_drip_queue.push_back("");
@@ -620,33 +736,45 @@ static void do_command(WoprState *w, const std::string &raw) {
 
         srand((unsigned)time(nullptr));
         SaluteReport current_salute = SALUTE_POOL[rand()%SALUTE_POOL_SIZE];
-        push_line(w, "Source: ");
-        push_line(w, current_salute.source);
-        push_line(w, "");
+        const SaluteReport &r = current_salute;
+        push_line_quiet(w, "Source: ");
+        push_line_quiet(w, r.source);
+        push_line_quiet(w, "");
 
-        push_line(w, "Activity:");
-        push_line(w, current_salute.activity);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.activity2);
-        push_line(w, "");
+        push_line_quiet(w, "Size:");
+        push_line_quiet(w, r.size);
+        push_line_quiet(w, "");
 
-        push_line(w, "Location:");
-        push_line(w, current_salute.location);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.location2);
-        push_line(w, "");
+        push_line_quiet(w, "Activity:");
+        push_line_quiet(w, r.activity);
+        if (r.activity2 != NULL) push_line_quiet(w, r.activity2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Uniform:");
-        push_line(w, current_salute.uniform);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.uniform2);
-        push_line(w, "");
+        push_line_quiet(w, "Location:");
+        push_line_quiet(w, r.location);
+        if (r.location2 != NULL) push_line_quiet(w, r.location2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Time:");
-        push_line(w, current_salute.time_dtg);
-        push_line(w, "");
+        push_line_quiet(w, "Uniform:");
+        push_line_quiet(w, r.uniform);
+        if (r.uniform2 != NULL) push_line_quiet(w, r.uniform2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Equipment:");
-        push_line(w, current_salute.equipment);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.equipment2);
-        push_line(w, "");
+        push_line_quiet(w, "Time:");
+        push_line_quiet(w, r.time_dtg);
+        push_line_quiet(w, "");
+
+        // Spoken: who, what, where -- the uniform, time and equipment
+        // details stay on the screen.
+        std::string what = join_lines(r.activity, r.activity2);
+        std::string where = std::string(r.location) + ", " + (r.location2 ? r.location2 : "");
+        wopr_say((sentence(spoken(r.size)) + " " + sentence(spoken(what)) + " " +
+                  sentence(spoken(where))).c_str());
+
+        push_line_quiet(w, "Equipment:");
+        push_line_quiet(w, r.equipment);
+        if (r.equipment2 != NULL) push_line_quiet(w, r.equipment2);
+        push_line_quiet(w, "");
         return;
     }
 
@@ -887,7 +1015,7 @@ void wopr_update(double dt) {
             g_drip_acc += dt;
             while (g_drip_acc >= g_drip_delay && !g_drip_queue.empty()) {
                 g_drip_acc -= g_drip_delay;
-                push_line(w, g_drip_queue.front());
+                push_line_quiet(w, g_drip_queue.front());
                 g_drip_queue.erase(g_drip_queue.begin());
             }
         }
