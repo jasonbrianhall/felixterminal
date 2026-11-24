@@ -2,9 +2,30 @@
 #include "gl_terminal.h"   // FONT_SIZE_DEFAULT, FONT_SIZE_MIN, FONT_SIZE_MAX
 #include "term_color.h"    // g_theme_idx, THEME_COUNT, apply_theme
 #include "crt_audio.h"     // term_audio_set_enabled, term_audio_get_enabled
+#ifdef WOPR
+#include "wopr/wopr.h"     // wopr_voice_mode, wopr_set_voice_mode
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
+
+// WOPR's voice: 0 off, 1 key lines (default), 2 everything
+static int voice_get(void) {
+#ifdef WOPR
+    return (int)wopr_voice_mode();
+#else
+    return 1;
+#endif
+}
+
+static void voice_set(int v) {
+#ifdef WOPR
+    if (v < 0 || v > 2) v = 1;
+    wopr_set_voice_mode((WoprVoice)v);
+#else
+    (void)v;
+#endif
+}
 
 extern int g_font_size;
 
@@ -41,6 +62,7 @@ void settings_load(void) {
     int font = (int)reg_get_dword(hk, "FontSize",  (DWORD)FONT_SIZE_DEFAULT);
     int theme = (int)reg_get_dword(hk, "ThemeIndex", 0);
     int sound = (int)reg_get_dword(hk, "SoundEnabled", 0);  // default off
+    int voice = (int)reg_get_dword(hk, "WoprVoice", 1);     // default: key lines
 
     RegCloseKey(hk);
 
@@ -51,6 +73,7 @@ void settings_load(void) {
     g_font_size = font;
     apply_theme(theme);
     term_audio_set_enabled(sound != 0);
+    voice_set(voice);
 }
 
 void settings_save(void) {
@@ -60,6 +83,7 @@ void settings_save(void) {
     reg_set_dword(hk, "FontSize",     (DWORD)g_font_size);
     reg_set_dword(hk, "ThemeIndex",   (DWORD)g_theme_idx);
     reg_set_dword(hk, "SoundEnabled", (DWORD)(term_audio_get_enabled() ? 1 : 0));
+    reg_set_dword(hk, "WoprVoice",    (DWORD)voice_get());
 
     RegCloseKey(hk);
 }
@@ -91,6 +115,7 @@ void settings_load(void) {
     int font  = FONT_SIZE_DEFAULT;
     int theme = 0;
     int sound = 0;
+    int voice = 1;
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -98,6 +123,7 @@ void settings_load(void) {
         if (sscanf(line, "FontSize=%d",    &v) == 1) font  = v;
         if (sscanf(line, "ThemeIndex=%d",  &v) == 1) theme = v;
         if (sscanf(line, "SoundEnabled=%d",&v) == 1) sound = v;
+        if (sscanf(line, "WoprVoice=%d",   &v) == 1) voice = v;
     }
     fclose(f);
 
@@ -108,6 +134,7 @@ void settings_load(void) {
     g_font_size = font;
     apply_theme(theme);
     term_audio_set_enabled(sound != 0);
+    voice_set(voice);
 }
 
 void settings_save(void) {
@@ -120,6 +147,7 @@ void settings_save(void) {
     fprintf(f, "FontSize=%d\n",     g_font_size);
     fprintf(f, "ThemeIndex=%d\n",   g_theme_idx);
     fprintf(f, "SoundEnabled=%d\n", term_audio_get_enabled() ? 1 : 0);
+    fprintf(f, "WoprVoice=%d\n",    voice_get());
     fclose(f);
 }
 

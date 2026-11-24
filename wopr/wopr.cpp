@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cctype>
 #include "wopr_render.h"
+#include "../felix_settings.h"
 #include <ctime>
+#include <regex>
 
 // ============================================================================
 // GLOBALS
@@ -123,7 +125,7 @@ static std::string to_upper(const std::string &s) {
     return r;
 }
 
-static void push_line(WoprState *w, const std::string &line) {
+static void push_line_quiet(WoprState *w, const std::string &line) {
     // Stamp current terminal color as a \x01 fgR fgG fgB bgR bgG bgB prefix.
     // bg is always 0,0,0 for WOPR UI lines.
     extern uint8_t g_term_r, g_term_g, g_term_b;
@@ -153,7 +155,128 @@ static void push_line(WoprState *w, const std::string &line) {
     // The clamp in wopr_render will prevent overscrolling automatically.
 }
 
+// Every line WOPR prints is spoken with VOICE ALL, except the user's own
+// input echoed back (the WOPR> command line, the typed username/password).
+static bool is_echo(const std::string &line) {
+    std::string t = line;
+    if (!t.empty() && (unsigned char)t[0] == 0x01) t = t.size() > 7 ? t.substr(7) : "";
+    return t.rfind("WOPR> ", 0) == 0 || t.rfind("USERNAME:", 0) == 0 || t.rfind("PASSWORD:", 0) == 0;
+}
+
+static void push_line(WoprState *w, const std::string &line) {
+    push_line_quiet(w, line);
+    if (!is_echo(line)) wopr_say_any(line.c_str());
+}
+
+// A key line: printed, and spoken unless VOICE OFF.
+static void say_line(WoprState *w, const std::string &line) {
+    push_line_quiet(w, line);
+    wopr_say(line.c_str());
+}
+
+// ── Reports read aloud (VOICE ALL) ──────────────────────────────────────────
+// With VOICE ALL, INTELLIGENCE, SITREP and WIRE are read as a short spoken summary of what
+// matters (the event, the unit, where, the story), not line by line: grid
+// references and coordinates stay on the screen, and military shorthand is
+// expanded so it can be said ("14KM NE" -> "14 kilometers northeast").
+
+static std::string rx(const std::string &s, const char *pattern, const char *with) {
+    return std::regex_replace(s, std::regex(pattern), with);
+}
+
+// "06:14" -> "zero six fourteen", "03:00" -> "zero three hundred"
+static std::string say_times(const std::string &s) {
+    static const std::regex t("\\b(\\d)(\\d):(\\d\\d)\\b");
+    std::string out;
+    auto it = std::sregex_iterator(s.begin(), s.end(), t);
+    size_t last = 0;
+    for (; it != std::sregex_iterator(); ++it) {
+        const std::smatch &m = *it;
+        out += s.substr(last, m.position() - last);
+        std::string h1 = m[1], h2 = m[2], mm = m[3];
+        out += (h1 == "0" ? std::string("zero ") + h2 : h1 + h2);
+        if (mm == "00") out += " hundred";
+        else if (mm[0] == '0') out += std::string(" zero ") + mm[1];
+        else out += " " + mm;
+        last = m.position() + m.length();
+    }
+    return out + s.substr(last);
+}
+
+static std::string spoken(std::string s) {
+    // places given as grids or coordinates: on screen only
+    s = rx(s, "\\b(BEARING TRIANGULATION|TRANSMITTER LOCATED|COORDINATES|COORD)\\s*:", " ");
+    s = rx(s, "\\bGRID \\d+-\\d+", " ");
+    s = rx(s, "\\bAPPROX\\.?\\s+(\\d+(\\.\\d+)?[NS])\\s+\\d+(\\.\\d+)?[EW]\\b", " ");
+    s = rx(s, "\\b\\d+(\\.\\d+)?[NS]\\s+\\d+(\\.\\d+)?[EW]\\b", " ");
+    s = say_times(s);
+    s = rx(s, "\\+/-", " plus or minus ");
+    s = rx(s, "\\(\\+\\)", " plus ");
+    s = rx(s, "--+", ", ");
+    s = rx(s, "[()]", ", ");
+    s = rx(s, "~", " about ");
+    s = rx(s, "\\bAPPROX\\b\\.?", "approximately");
+    s = rx(s, "\\bEST\\.", "estimated");
+    s = rx(s, "\\b(\\d+)\\s*KM\\b", "$1 kilometers");
+    s = rx(s, "\\b(\\d+)\\s*NM\\b", "$1 nautical miles");
+    s = rx(s, "\\b(\\d+)\\s*HRS\\b", "$1 hours");
+    s = rx(s, "\\b(\\d+)-MIN\\b", "$1 minute");
+    s = rx(s, "\\b(\\d+)x\\s", "$1 ");
+    s = rx(s, "\\b(kilometers|miles) NE\\b", "$1 northeast");
+    s = rx(s, "\\b(kilometers|miles) NW\\b", "$1 northwest");
+    s = rx(s, "\\b(kilometers|miles) SE\\b", "$1 southeast");
+    s = rx(s, "\\b(kilometers|miles) SW\\b", "$1 southwest");
+    s = rx(s, "\\b(kilometers|miles) N\\b", "$1 north");
+    s = rx(s, "\\b(kilometers|miles) S\\b", "$1 south");
+    s = rx(s, "\\b(kilometers|miles) E\\b", "$1 east");
+    s = rx(s, "\\b(kilometers|miles) W\\b", "$1 west");
+    s = rx(s, "\\bFL(\\d+)", "flight level $1");
+    s = rx(s, "-III\\b", " three");
+    s = rx(s, "\\bFREQ\\b", "frequency");
+    s = rx(s, "\\bTELs\\b", "launchers");
+    s = rx(s, "\\bIGB\\b", "the inner German border");
+    s = rx(s, "\\bNOE\\b", "nap of the earth");
+    s = rx(s, "\\bBURST TX\\b", "burst transmissions");
+    s = rx(s, "\\bAT DITCHES\\b", "anti-tank ditches");
+    s = rx(s, "\\bUSAREUR\\b", "U S army Europe");
+    s = rx(s, "\\bW/", "with ");
+    s = rx(s, "\\bU\\.S\\.", "U S");
+    s = rx(s, "\\bWY\\b", "Wyoming");
+    s = rx(s, "\\bAP\\b", "A P");
+    s = rx(s, "\\bUPI\\b", "U P I");
+    s = rx(s, "\\bMOD\\b", "M O D");
+    s = rx(s, "\\bFAA\\b", "F A A");
+    s = rx(s, "\\bIZ-WEST\\b", "inner zone west");
+    s = rx(s, "\\s+,", ",");                   // tidy what the removals left
+    s = rx(s, ",(\\s*,)+", ",");
+    s = rx(s, "\\s*,\\s*\\.", ".");
+    s = rx(s, "^[\\s,]+|[\\s,]+$", "");
+    s = rx(s, "\\s{2,}", " ");
+    return s;
+}
+
+// Two lines of one report field, joined: a continuation ("... STAGED" +
+// "AT RIVER CROSSING SITE") runs on, a new clause gets a pause.
+static std::string join_lines(const char *a, const char *b) {
+    if (!b || !*b) return a;
+    static const char *RUN_ON[] = { "AT ", "TO ", "ON ", "IN ", "OF ", "ALONG ", "BEING ", "WITH ",
+                                    "FROM ", "AND ", "INTO ", "BY ", nullptr };
+    for (int i = 0; RUN_ON[i]; i++)
+        if (strncmp(b, RUN_ON[i], strlen(RUN_ON[i])) == 0) return std::string(a) + " " + b;
+    std::string s = a;
+    if (!s.empty() && s.back() != '.' && s.back() != ',') s += ',';
+    return s + " " + b;
+}
+
+// A sentence from report fragments: "A" + "B." -> "A B."
+static std::string sentence(std::string s) {
+    s = rx(s, "^[\\s,]+|[\\s,]+$", "");
+    if (!s.empty() && s.back() != '.' && s.back() != '?' && s.back() != '!') s += '.';
+    return s;
+}
+
 static void begin_crawl(WoprState *w, const std::string &text) {
+    if (!is_echo(text)) wopr_say_any(text.c_str());
     w->crawl_target = text;
     w->crawl_pos    = 0;
     w->crawl_acc    = 0.0;
@@ -165,7 +288,7 @@ static bool crawl_done(const WoprState *w) {
 
 static void crawl_commit(WoprState *w) {
     if (!w->crawl_target.empty())
-        push_line(w, w->crawl_target);
+        push_line_quiet(w, w->crawl_target);       // already spoken when the crawl began
     w->crawl_target.clear();
     w->crawl_pos = 0;
     w->crawl_acc = 0.0;
@@ -234,41 +357,41 @@ static void launch_game(WoprState *w, WoprGame game) {
     push_line(w, "");
     switch (game) {
         case WoprGame::TIC_TAC_TOE:
-            push_line(w, "INITIATING: TIC-TAC-TOE");
+            say_line(w, "INITIATING: TIC-TAC-TOE");
             set_phase(w, WoprPhase::PLAYING_TTT);
             wopr_ttt_enter(w);
             break;
         case WoprGame::CHESS:
-            push_line(w, "INITIATING: CHESS");
+            say_line(w, "INITIATING: CHESS");
             set_phase(w, WoprPhase::PLAYING_CHESS);
             wopr_chess_enter(w);
             break;
         case WoprGame::CHECKERS:
-            push_line(w, "INITIATING: CHECKERS");
+            say_line(w, "INITIATING: CHECKERS");
             set_phase(w, WoprPhase::PLAYING_CHECKERS);
             wopr_checkers_enter(w);
             break;
         case WoprGame::MINESWEEPER:
-            push_line(w, "INITIATING: MINESWEEPER");
+            say_line(w, "INITIATING: MINESWEEPER");
             set_phase(w, WoprPhase::PLAYING_MINES);
             wopr_mines_enter(w);
             break;
         case WoprGame::FALKEN_MAZE:
-            push_line(w, "INITIATING: FALKEN'S MAZE");
+            say_line(w, "INITIATING: FALKEN'S MAZE");
             set_phase(w, WoprPhase::PLAYING_MAZE);
             wopr_maze_enter(w);
             break;
         case WoprGame::GLOBAL_WAR:
-            push_line(w, "INITIATING: GLOBAL THERMONUCLEAR WAR");
+            say_line(w, "INITIATING: GLOBAL THERMONUCLEAR WAR");
             push_line(w, "");
-            push_line(w, "  WARNING: THIS SIMULATION USES LIVE TARGETING DATA.");
-            push_line(w, "  ESTIMATED CASUALTIES: 4.2 BILLION.");
+            say_line(w, "  WARNING: THIS SIMULATION USES LIVE TARGETING DATA.");
+            say_line(w, "  ESTIMATED CASUALTIES: 4.2 BILLION.");
             push_line(w, "");
             set_phase(w, WoprPhase::PLAYING_WAR);
             wopr_war_enter(w);
             break;
         case WoprGame::ZORK:
-            push_line(w, "INITIATING: ZORK");
+            say_line(w, "INITIATING: ZORK");
             push_line(w, "");
             push_line(w, "  LOADING GREAT UNDERGROUND EMPIRE...");
             push_line(w, "");
@@ -276,7 +399,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_zork_enter(w);
             break;
         case WoprGame::BASIC:
-            push_line(w, "INITIATING: BASIC");
+            say_line(w, "INITIATING: BASIC");
             push_line(w, "");
             push_line(w, "  LOADING ANTIQUATED PROGRAMMING LANGUAGE...");
             push_line(w, "");
@@ -284,7 +407,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_basic_enter(w);
             break;
         case WoprGame::WIZARD:
-            push_line(w, "INITIATING: WIZARD'S CASTLE");
+            say_line(w, "INITIATING: WIZARD'S CASTLE");
             push_line(w, "");
             push_line(w, "  LOADING ADVENTURE SIMULATION...");
             push_line(w, "");
@@ -292,7 +415,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_wizard_enter(w);
             break;
         case WoprGame::WILLY_WORM:
-            push_line(w, "INITIATING: WILLY THE WORM");
+            say_line(w, "INITIATING: WILLY THE WORM");
             push_line(w, "");
             push_line(w, "  LOADING INVERTEBRATE SIMULATION...");
             push_line(w, "");
@@ -301,7 +424,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             break;
 
         case WoprGame::SDI:
-            push_line(w, "INITIATING: STRATEGIC DEFENSE INITIATIVE");
+            say_line(w, "INITIATING: STRATEGIC DEFENSE INITIATIVE");
             push_line(w, "");
             push_line(w, "  MISSILE DEFENSE NETWORK ONLINE...");
             push_line(w, "  RADAR SYSTEMS ACTIVATED");
@@ -318,6 +441,9 @@ static void launch_game(WoprState *w, WoprGame game) {
 static void do_command(WoprState *w, const std::string &raw) {
     std::string cmd = normalize(raw);
     if (cmd.empty()) { push_line(w, ""); return; }
+
+    // A new command interrupts the reading of the last one's output
+    if (wopr_voice_mode() == WoprVoice::ALL) wopr_speech_stop();
 
     // Echo with prompt
     push_line(w, std::string("WOPR> ") + cmd);
@@ -346,6 +472,7 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "  HISTORY               COMMAND HISTORY");
         push_line(w, "  CLEAR                 CLEAR TERMINAL BUFFER");
         push_line(w, "  COLOR <preset|R G B>  SET TERMINAL COLOR  (GREEN AMBER BLUE WHITE RED CYAN)");
+        push_line(w, "  VOICE ON|ALL|OFF      SPEAK KEY LINES / EVERYTHING / NOTHING");
         push_line(w, "  LOGOUT / QUIT / EXIT  TERMINATE SESSION");
         push_line(w, "");
         return;
@@ -387,16 +514,19 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "");
         const char *report = INTEL_REPORTS[g_intel_idx % INTEL_COUNT];
         g_intel_idx++;
-        std::string line;
+        std::string line, body;
+        int n = 0;
         for (const char *p = report; ; p++) {
             if (*p == '\n' || *p == '\0') {
-                push_line(w, "  " + line);
+                push_line_quiet(w, "  " + line);
+                if (n++ > 0) body += line + " ";     // the report; line 1 is its source
                 line.clear();
                 if (*p == '\0') break;
             } else {
                 line += *p;
             }
         }
+        wopr_say_any(spoken(body).c_str());
         push_line(w, "");
         push_line(w, "  END OF REPORT.  DESTROY AFTER READING.");
         push_line(w, "");
@@ -537,11 +667,39 @@ static void do_command(WoprState *w, const std::string &raw) {
         return;
     }
 
+    // ── VOICE ─────────────────────────────────────────────────────────────
+    if (verb == "VOICE" || verb == "SPEECH") {
+        if (rest == "ON" || rest == "KEY" || rest == "KEY LINES") {
+            wopr_set_voice_mode(WoprVoice::KEY_LINES);
+            settings_save();
+            say_line(w, "  VOICE ON.  KEY LINES WILL BE SPOKEN.");
+        } else if (rest == "ALL") {
+            wopr_set_voice_mode(WoprVoice::ALL);
+            settings_save();
+            push_line(w, "  VOICE ON.  ALL OUTPUT WILL BE SPOKEN.");
+        } else if (rest == "OFF") {
+            wopr_set_voice_mode(WoprVoice::OFF);
+            settings_save();
+            push_line(w, "  VOICE OFF.");
+        } else if (rest.empty()) {
+            WoprVoice m = wopr_voice_mode();
+            push_line(w, m == WoprVoice::OFF ? "  VOICE: OFF"
+                       : m == WoprVoice::ALL ? "  VOICE: ALL OUTPUT" : "  VOICE: KEY LINES");
+            push_line(w, "  USAGE:  VOICE ON | VOICE ALL | VOICE OFF");
+        } else {
+            push_line(w, "  USAGE:  VOICE ON | VOICE ALL | VOICE OFF");
+        }
+        push_line(w, "");
+        return;
+    }
+
     // ── LOGOUT / QUIT / EXIT ──────────────────────────────────────────────
     if (verb == "LOGOUT" || verb == "QUIT" || verb == "EXIT" || verb == "BYE") {
-        begin_crawl(w, "SESSION TERMINATED.  GOODBYE, PROFESSOR FALKEN.");
+        static const char *BYE = "SESSION TERMINATED.  GOODBYE, PROFESSOR FALKEN.";
+        w->crawl_target = BYE;                     // shown for the moment before closing
         SDL_Delay(100);
         wopr_close();
+        wopr_say(BYE);                             // plays on after the overlay closes
         return;
     }
 
@@ -552,9 +710,20 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "");
         const char **story = WIRE_STORIES[g_wire_story_idx % WIRE_STORY_COUNT];
         g_wire_story_idx++;
+        std::string text;
         for (int i = 0; story[i] != nullptr; i++) {
             g_drip_queue.push_back(std::string("  ") + story[i]);
+            if (i == 0) {                          // dateline: agency and city, not the time
+                std::string d = story[0];
+                size_t a = d.find("--"), b = d.find("--", a == std::string::npos ? 0 : a + 2);
+                if (a != std::string::npos && b != std::string::npos)
+                    d = d.substr(0, a) + ", " + d.substr(a + 2, b - a - 2);
+                text += sentence(spoken(d)) + " ";
+            } else {
+                text += std::string(story[i]) + " ";
+            }
         }
+        wopr_say_any(spoken(text).c_str());
         g_drip_queue.push_back("");
         g_drip_queue.push_back("  -- END TRANSMISSION --");
         g_drip_queue.push_back("");
@@ -567,33 +736,45 @@ static void do_command(WoprState *w, const std::string &raw) {
 
         srand((unsigned)time(nullptr));
         SaluteReport current_salute = SALUTE_POOL[rand()%SALUTE_POOL_SIZE];
-        push_line(w, "Source: ");
-        push_line(w, current_salute.source);
-        push_line(w, "");
+        const SaluteReport &r = current_salute;
+        push_line_quiet(w, "Source: ");
+        push_line_quiet(w, r.source);
+        push_line_quiet(w, "");
 
-        push_line(w, "Activity:");
-        push_line(w, current_salute.activity);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.activity2);
-        push_line(w, "");
+        push_line_quiet(w, "Size:");
+        push_line_quiet(w, r.size);
+        push_line_quiet(w, "");
 
-        push_line(w, "Location:");
-        push_line(w, current_salute.location);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.location2);
-        push_line(w, "");
+        push_line_quiet(w, "Activity:");
+        push_line_quiet(w, r.activity);
+        if (r.activity2 != NULL) push_line_quiet(w, r.activity2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Uniform:");
-        push_line(w, current_salute.uniform);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.uniform2);
-        push_line(w, "");
+        push_line_quiet(w, "Location:");
+        push_line_quiet(w, r.location);
+        if (r.location2 != NULL) push_line_quiet(w, r.location2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Time:");
-        push_line(w, current_salute.time_dtg);
-        push_line(w, "");
+        push_line_quiet(w, "Uniform:");
+        push_line_quiet(w, r.uniform);
+        if (r.uniform2 != NULL) push_line_quiet(w, r.uniform2);
+        push_line_quiet(w, "");
 
-        push_line(w, "Equipment:");
-        push_line(w, current_salute.equipment);
-        if (current_salute.activity2 != NULL) push_line(w, current_salute.equipment2);
-        push_line(w, "");
+        push_line_quiet(w, "Time:");
+        push_line_quiet(w, r.time_dtg);
+        push_line_quiet(w, "");
+
+        // Spoken: who, what, where -- the uniform, time and equipment
+        // details stay on the screen.
+        std::string what = join_lines(r.activity, r.activity2);
+        std::string where = std::string(r.location) + ", " + (r.location2 ? r.location2 : "");
+        wopr_say_any((sentence(spoken(r.size)) + " " + sentence(spoken(what)) + " " +
+                  sentence(spoken(where))).c_str());
+
+        push_line_quiet(w, "Equipment:");
+        push_line_quiet(w, r.equipment);
+        if (r.equipment2 != NULL) push_line_quiet(w, r.equipment2);
+        push_line_quiet(w, "");
         return;
     }
 
@@ -638,6 +819,8 @@ void wopr_open() {
     g_drip_acc       = 0.0;
     g_term_r = 0; g_term_g = 255; g_term_b = 69; // phosphor green
 
+    wopr_speech_stop();
+    wopr_speech_preload();          // unpack the voice's dictionary while the modem screeches
     wopr_audio_play_screech();
 
     // -----------------------------
@@ -703,6 +886,7 @@ void wopr_close() {
         default: break;
     }
     wopr_audio_stop();
+    wopr_speech_stop();
     w->visible = false;
     w->phase   = WoprPhase::INACTIVE;
 }
@@ -816,8 +1000,10 @@ void wopr_update(double dt) {
             push_line(w, "  WARGAMES SYSTEMS DIVISION");
             push_line(w, "  CLASSIFIED -- LEVEL 5 CLEARANCE");
             push_line(w, "");
-            push_line(w, "  HELLO, PROFESSOR FALKEN.");
+            say_line(w, "  GREETINGS, PROFESSOR FALKEN.");
             push_line(w, "  LAST LOGIN: 1983-06-03  03:14:07 MDT");
+            push_line(w, "");
+            say_line(w, "  SHALL WE PLAY A GAME?");
             enter_shell(w);
         }
         break;
@@ -829,7 +1015,7 @@ void wopr_update(double dt) {
             g_drip_acc += dt;
             while (g_drip_acc >= g_drip_delay && !g_drip_queue.empty()) {
                 g_drip_acc -= g_drip_delay;
-                push_line(w, g_drip_queue.front());
+                push_line_quiet(w, g_drip_queue.front());
                 g_drip_queue.erase(g_drip_queue.begin());
             }
         }
@@ -1138,6 +1324,14 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
 
     // Login input
     if (w->phase == WoprPhase::LOGIN_INPUT) {
+        // Typing takes over from auto-login: the user logs in by hand from
+        // here on (and can get it wrong, which Joshua has things to say about).
+        if (w->auto_login) {
+            bool typed = (text && text[0] >= 32 && text[0] < 127) || sym == SDLK_BACKSPACE;
+            if (!typed) return true;               // Enter etc. mid-auto-type: ignore
+            w->auto_login = false;
+            w->input_buf.clear();
+        }
         if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
             if (!w->username_done) {
                 w->username_entered = to_upper(w->input_buf);
@@ -1171,11 +1365,11 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
                         case 3:
                             push_line(w, "IDENTITY CONFIRMATION REQUIRED.");
                             push_line(w, "");
-                            push_line(w, "DR. FALKEN?");
-                            push_line(w, "IS THAT YOU?");
+                            say_line(w, "DR. FALKEN?");
+                            say_line(w, "IS THAT YOU?");
                             break;
                         case 4:
-                            push_line(w, "GREETINGS, PROFESSOR.");
+                            say_line(w, "GREETINGS, PROFESSOR.");
                             push_line(w, "");
                             push_line(w, "SEARCHING FOR PRIMARY USER...");
                             push_line(w, "PRIMARY USER: DR. STEPHEN FALKEN");
@@ -1242,7 +1436,7 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
             static const char *VERBS[] = {
                 "HELP", "LIST GAMES", "PLAY ", "INTELLIGENCE",
                 "WIRE", "SITREP", "STATUS", "WHOAMI", "HISTORY", "CLEAR",
-                "COLOR ", "LOGOUT"
+                "COLOR ", "VOICE ", "LOGOUT"
             };
             std::string up = to_upper(w->input_buf);
             for (auto *v : VERBS) {

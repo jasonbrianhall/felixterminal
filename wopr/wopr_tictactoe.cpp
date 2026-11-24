@@ -156,6 +156,7 @@ static void reset_game(TttState *s) {
             s->result    = 2;
             s->wopr_turn = false;
             strcpy(s->message, "A STRANGE GAME.  THE ONLY WINNING MOVE IS NOT TO PLAY.");
+            wopr_say(s->message);
             return;
         }
 
@@ -245,9 +246,9 @@ void wopr_ttt_update(WoprState *w, double dt) {
                     } else {
                         // res==player_side means player won, else WOPR won
                         if (res == s->player_side)
-                            strcpy(s->message, "YOU WIN.  UNEXPECTED OUTCOME.");
+                            { strcpy(s->message, "YOU WIN.  UNEXPECTED OUTCOME."); wopr_say(s->message); }
                         else
-                            strcpy(s->message, "WOPR WINS.  INTERESTING GAME.");
+                            { strcpy(s->message, "WOPR WINS.  INTERESTING GAME."); wopr_say(s->message); }
                     }
                 } else if (ttt_full(s->board)) {
                     s->result = 2;
@@ -257,7 +258,7 @@ void wopr_ttt_update(WoprState *w, double dt) {
                                        ? s->min_think_ms / 1000.0 * 2.0 : 0.4;
                         strcpy(s->message, "DRAW.  RESTARTING...");
                     } else {
-                        strcpy(s->message, "DRAW.  SHALL WE PLAY AGAIN?");
+                        { strcpy(s->message, "DRAW.  SHALL WE PLAY AGAIN?"); wopr_say(s->message); }
                     }
                 } else {
                     if (s->num_players == 0) {
@@ -626,10 +627,10 @@ static void ttt_try_place(TttState *s, int idx) {
         s->result = res;
         s->has_win_line = ttt_winner_line(s->board, s->win_line);
         s->win_anim = 0.0;
-        strcpy(s->message, "YOU WIN.  UNEXPECTED OUTCOME.");
+        { strcpy(s->message, "YOU WIN.  UNEXPECTED OUTCOME."); wopr_say(s->message); }
     } else if (ttt_full(s->board)) {
         s->result = 2;
-        strcpy(s->message, "DRAW.  SHALL WE PLAY AGAIN?");
+        { strcpy(s->message, "DRAW.  SHALL WE PLAY AGAIN?"); wopr_say(s->message); }
     } else {
         strcpy(s->message, "WOPR CALCULATING...");
         s->wopr_turn = true;

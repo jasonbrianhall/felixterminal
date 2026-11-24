@@ -130,6 +130,19 @@ void  wopr_audio_play_screech();
 void  wopr_audio_stop();
 void  wopr_audio_play_keystroke();   // short click for auto-login typing
 
+// ─── Voice (wopr_speech.cpp: Joshua speaks, via synth/synth.c) ────────────
+// VOICE ON speaks WOPR's key lines ("GREETINGS, PROFESSOR FALKEN."...),
+// VOICE ALL everything WOPR prints, VOICE OFF nothing.
+enum class WoprVoice { OFF = 0, KEY_LINES = 1, ALL = 2 };
+void      wopr_say(const char *text);       // key line: spoken unless VOICE OFF
+void      wopr_say_any(const char *text);   // any other output: spoken with VOICE ALL
+void      wopr_speech_preload();            // unpack the dictionary in the background
+void      wopr_speech_stop();               // stop talking, drop queued lines
+bool      wopr_speech_busy();
+WoprVoice wopr_voice_mode();
+void      wopr_set_voice_mode(WoprVoice m);
+void      wopr_speech_shutdown();
+
 // ─── Sub-game interfaces (implemented in wopr_*.cpp) ──────────────────────
 
 // Tic-Tac-Toe

@@ -10,7 +10,8 @@
  *        → Klatt-style synthesizer: glottal pulses and aspiration through a
  *          cascade of formant resonators (with a nasal pole/zero pair), noise
  *          through parallel resonators for fricatives and stop bursts
- *        → SDL2 audio output (or a WAV file with -o)
+ *        → float samples (library: synth.h), or SDL2 audio / a WAV file
+ *          (standalone program)
  *
  * Phoneme set (ARPABET):
  *   Vowels:  AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW  (stress 0/1/2)
@@ -20,8 +21,10 @@
  *   Affric:  CH JH
  *   Approx:  L  R  W  Y
  *
- * Build:
- *   gcc synth.c -o synth $(sdl2-config --cflags --libs) -lm
+ * Build the standalone program:
+ *   gcc -DSYNTH_STANDALONE synth.c -o synth $(sdl2-config --cflags --libs) -lm
+ * As a library (Felix Terminal's WOPR), compile without SYNTH_STANDALONE and
+ * use the functions in synth.h.
  *
  * Usage:
  *   ./synth "Hello Dr. Falken. How is Joshua?"
@@ -29,8 +32,9 @@
  *   ./synth -o out.wav "text"  (write a WAV file instead of playing)
  */
 
-#include <SDL2/SDL.h>
+#include "synth.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,11 +43,22 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define SAMPLE_RATE   22050
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* Output sample rate: set per call by tts_render(); every filter and time
+ * constant below is worked out from it. */
+static double syn_rate = 22050;
+static int    syn_verbose = 0;
+#define SAMPLE_RATE   syn_rate
 #define BUFFER_SIZE   512
 #define MAX_PHONEMES  1024
 #define MAX_WORD      64
 #define MS(x)         ((int)((x) * (SAMPLE_RATE / 1000.0)))
+
+/* one-pole low-pass coefficient for a corner frequency, at the current rate */
+static double onepole(double hz) { return 1.0 - exp(-2.0 * M_PI * hz / SAMPLE_RATE); }
 
 typedef struct DictNode {
     char *word;
@@ -133,12 +148,12 @@ static const PhonDef PHDEF[PH_COUNT] = {
 [PH_NG]={"NG",CL_NASAL|CL_VOICED, PL_VEL, 80,{280,2000,2700},{100,150,200},{0,0,0},         52,0,{0,0,0,0,0},0},
 
 /* Stops: formants are the locus; dur is closure + burst. */
-[PH_B] ={"B", CL_STOP|CL_VOICED,  PL_LAB, 65,{200, 900,2150},{60,110,130},{0,0,0},          0, 50,{0,0,0,0,0},57},
-[PH_D] ={"D", CL_STOP|CL_VOICED,  PL_ALV, 55,{200,1700,2650},{60,110,150},{0,0,0},          0, 50,{0,0,40,50,52},0},
-[PH_G] ={"G", CL_STOP|CL_VOICED,  PL_VEL, 65,{200,1600,2400},{60,110,150},{0,0,0},          0, 50,{50,50,0,0,0},0},
-[PH_P] ={"P", CL_STOP,            PL_LAB, 80,{200, 900,2150},{60,110,130},{0,0,0},          0, 58,{0,0,0,0,0},60},
-[PH_T] ={"T", CL_STOP,            PL_ALV, 70,{200,1700,2650},{60,110,150},{0,0,0},          0, 58,{0,0,46,56,60},0},
-[PH_K] ={"K", CL_STOP,            PL_VEL, 80,{200,1600,2400},{60,110,150},{0,0,0},          0, 58,{56,56,0,0,0},0},
+[PH_B] ={"B", CL_STOP|CL_VOICED,  PL_LAB, 65,{200, 900,2150},{200,110,130},{0,0,0},          0, 44,{44,38,0,0,0},34},
+[PH_D] ={"D", CL_STOP|CL_VOICED,  PL_ALV, 55,{200,1700,2650},{200,110,150},{0,0,0},          0, 46,{0,0,40,50,52},0},
+[PH_G] ={"G", CL_STOP|CL_VOICED,  PL_VEL, 65,{200,1600,2400},{200,110,150},{0,0,0},          0, 46,{50,50,0,0,0},0},
+[PH_P] ={"P", CL_STOP,            PL_LAB, 80,{200, 900,2150},{200,110,130},{0,0,0},          0, 50,{46,40,0,0,0},38},
+[PH_T] ={"T", CL_STOP,            PL_ALV, 70,{200,1700,2650},{200,110,150},{0,0,0},          0, 52,{0,0,46,56,60},0},
+[PH_K] ={"K", CL_STOP,            PL_VEL, 80,{200,1600,2400},{200,110,150},{0,0,0},          0, 54,{56,56,0,0,0},0},
 
 [PH_V] ={"V", CL_FRIC|CL_VOICED,  PL_LAB, 65,{220,1100,2080},{60,90,120},{0,0,0},           48,52,{0,0,0,0,0},40},
 [PH_DH]={"DH",CL_FRIC|CL_VOICED,  PL_ALV, 50,{270,1290,2540},{60,80,170},{0,0,0},           50,48,{0,0,0,0,30},36},
@@ -418,6 +433,47 @@ static const DictEntry DICT[] = {
     {"thermonuclear","TH ER M OW N UW K L IY ER"},
     {"chess",   "CH EH S"},
     {"strange", "S T R EY N JH"},
+    /* WOPR's vocabulary (stress digits: these override CMUdict) */
+    {"wopr",     "W AA1 P ER0"},
+    {"norad",    "N AO1 R AE2 D"},
+    {"defcon",   "D EH1 F K AA2 N"},
+    {"icbm",     "AY1 S IY1 B IY1 EH1 M"},
+    {"icbms",    "AY1 S IY1 B IY1 EH1 M Z"},
+    {"sdi",      "EH1 S D IY1 AY1"},
+    {"abm",      "EY1 B IY1 EH1 M"},
+    {"nsa",      "EH1 N EH1 S EY1"},
+    {"mdt",      "EH1 M D IY1 T IY1"},
+    {"milnet",   "M IH1 L N EH2 T"},
+    {"sitrep",   "S IH1 T R EH2 P"},
+    {"zork",     "Z AO1 R K"},
+    {"wargames", "W AO1 R G EY2 M Z"},
+    {"logon",    "L AO1 G AA2 N"},
+    {"codeword", "K OW1 D W ER2 D"},
+    {"uplink",   "AH1 P L IH2 NG K"},
+    {"falken",   "F AO1 L K AH0 N"},
+    {"falken's", "F AO1 L K AH0 N Z"},
+    /* places and words from WOPR's intelligence reports, sitreps and wire */
+    {"magdeburg",   "M AE1 G D AH0 B ER2 G"},
+    {"pechenga",    "P EH1 CH EH0 NG G AH0"},
+    {"zhukovsky",   "ZH UW0 K AA1 F S K IY0"},
+    {"zatec",       "Z AA1 T EH0 T S"},
+    {"vnukovo",     "V N UW1 K AH0 V OW0"},
+    {"thuringian",  "TH UH0 R IH1 N JH IY0 AH0 N"},
+    {"sudetenland", "S UW0 D EY1 T AH0 N L AE2 N D"},
+    {"rostock",     "R AA1 S T AA2 K"},
+    {"pribram",     "P R IY1 B R AA0 M"},
+    {"nordhausen",  "N AO1 R T HH AW2 Z AH0 N"},
+    {"harz",        "HH AA1 R T S"},
+    {"fulda",       "F UH1 L D AH0"},
+    {"erfurt",      "EH1 R F UH0 R T"},
+    {"cottbus",     "K AA1 T B UH0 S"},
+    {"cheb",        "K EH1 B"},
+    {"triangulated","T R AY0 AE1 NG G Y AH0 L EY2 T IH0 D"},
+    {"simulant",    "S IH1 M Y AH0 L AH0 N T"},
+    {"orions",      "AO0 R AY1 AH0 N Z"},
+    {"nape",        "N EY1 P"},
+    {"firebreak",   "F AY1 ER0 B R EY2 K"},
+    {"emplacing",   "EH0 M P L EY1 S IH0 NG"},
     {NULL,      NULL}
 };
 
@@ -437,11 +493,18 @@ static const char *dict_lookup(const char *word) {
 }
 
 /* Newest entry wins (each bucket's list starts with the newest). */
+static char *syn_strdup(const char *s) {          /* strdup isn't standard C */
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
 static void dict_insert(const char *word, const char *phones) {
     unsigned h = hash_word(word);
     DictNode *n = malloc(sizeof(DictNode));
-    n->word = strdup(word);
-    n->phones = strdup(phones);
+    n->word = syn_strdup(word);
+    n->phones = syn_strdup(phones);
     n->next = cmu_dict[h];
     cmu_dict[h] = n;
 }
@@ -450,37 +513,70 @@ static void dict_insert(const char *word, const char *phones) {
  * length, loudness and pitch. Only each word's first (main) pronunciation
  * is kept: "A(1)  EY1" or "THE(1)  DH IY0" must not replace "A  AH0" and
  * "THE  DH AH0". */
-static void load_cmudict(const char *path) {
+static void dict_line(char *line) {
+    if (line[0] == ';')
+        return;
+    char *word = line;
+    while (*word == ' ' || *word == '\t') word++;
+    char *e = word;
+    while (*e && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n') e++;
+    if (e == word || !*e || memchr(word, '(', (size_t)(e - word)))
+        return;
+    *e++ = 0;
+    while (*e == ' ' || *e == '\t') e++;
+    char *end = e + strlen(e);
+    while (end > e && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) *--end = 0;
+    if (!*e)
+        return;
+    for (char *c = word; *c; c++)
+        *c = tolower((unsigned char)*c);
+    dict_insert(word, e);
+}
+
+static int load_cmudict(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "Could not open CMUdict file: %s\n", path);
-        return;
+        return -1;
     }
     char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == ';')
-            continue;
-        char *word = strtok(line, " \t\r\n");
-        if (!word || strchr(word, '('))
-            continue;
-        char *phones = strtok(NULL, "\r\n");
-        if (!phones)
-            continue;
-        while (*phones == ' ') phones++;
-        for (char *s = word; *s; s++)
-            *s = tolower((unsigned char)*s);
-        dict_insert(word, phones);
-    }
+    while (fgets(line, sizeof(line), f))
+        dict_line(line);
     fclose(f);
+    return 0;
 }
 
-/* The hand-written entries: abbreviations always win (CMUdict reads "dr"
- * as "drive" and so on); the rest only fill words CMUdict doesn't have,
+static void load_cmudict_text(const char *text, size_t len) {
+    char line[512];
+    size_t i = 0;
+    while (i < len) {
+        size_t n = 0;
+        while (i < len && text[i] != '\n') {
+            if (n < sizeof line - 1) line[n++] = text[i];
+            i++;
+        }
+        i++;
+        line[n] = 0;
+        dict_line(line);
+    }
+}
+
+static void dict_free(void) {
+    for (int b = 0; b < DICT_BUCKETS; b++) {
+        DictNode *n = cmu_dict[b];
+        while (n) { DictNode *x = n->next; free(n->word); free(n->phones); free(n); n = x; }
+        cmu_dict[b] = NULL;
+    }
+}
+
+/* The hand-written entries: abbreviations and entries written with stress
+ * digits always win (CMUdict reads "dr" as "drive", stresses "defcon" on
+ * the wrong syllable...); the rest only fill words CMUdict doesn't have,
  * since CMUdict's own entries carry stress and are more exact. */
 static void load_hand_dict(void) {
     static const char *always[] = { "dr", "mr", "mrs", "ms", NULL };
     for (int i = 0; DICT[i].word; i++) {
-        int force = 0;
+        int force = strchr(DICT[i].phones, '1') != NULL;
         for (int k = 0; always[k]; k++)
             if (strcmp(DICT[i].word, always[k]) == 0) force = 1;
         if (force || !dict_lookup(DICT[i].word))
@@ -647,11 +743,16 @@ static Phoneme name_to_ph(const char *s) {
  * are kept; when a word has none (hand dictionary, letter rules), its
  * first full vowel gets the stress. */
 static int add_phones(const char *phones, PItem *out, int n, int maxout, int func) {
-    char buf[256], *save = NULL;
+    char buf[256];
     int first = n, has_stress = 0;
     strncpy(buf, phones, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
-    for (char *tok = strtok_r(buf, " ", &save); tok && n < maxout - 2; tok = strtok_r(NULL, " ", &save)) {
+    for (char *tok = buf, *next; *tok && n < maxout - 2; tok = next) {
+        while (*tok == ' ') tok++;
+        if (!*tok) break;
+        next = tok;
+        while (*next && *next != ' ') next++;
+        if (*next) *next++ = 0;
         int st = -1;
         size_t l = strlen(tok);
         if (l > 1 && isdigit((unsigned char)tok[l - 1])) { st = tok[l - 1] - '0'; tok[l - 1] = 0; has_stress = 1; }
@@ -715,6 +816,7 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
     expand_text(text, lower, sizeof lower);
     const char *p = lower;
     char prev_word[MAX_WORD] = "";
+    int sentence_start = 1, wh_question = 0;
 
     n = add_pause(out, n, maxout, 60, 0);
     while (*p && n < maxout - 40) {
@@ -725,7 +827,8 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
                      !(*p == '.' && (strcmp(prev_word, "dr") == 0 || strcmp(prev_word, "mr") == 0 ||
                                      strcmp(prev_word, "mrs") == 0 || strcmp(prev_word, "ms") == 0 ||
                                      strcmp(prev_word, "st") == 0 || strcmp(prev_word, "vs") == 0)))
-                n = add_pause(out, n, maxout, 420, *p == '?' ? '?' : '.');
+                n = add_pause(out, n, maxout, 420, *p == '?' && !wh_question ? '?' : '.');
+            if (strchr(".!?", *p)) sentence_start = 1;
             p++;
             continue;
         }
@@ -736,27 +839,63 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
             word[wl++] = *p++;
         word[wl] = 0;
         strcpy(prev_word, word);
+        if (sentence_start) {          /* "what/where/how...?" questions fall like statements */
+            static const char *wh[] = { "what","what's","where","where's","when","who","who's",
+                                        "whom","whose","why","which","how","how's", NULL };
+            wh_question = 0;
+            for (int k = 0; wh[k]; k++) if (strcmp(word, wh[k]) == 0) wh_question = 1;
+            sentence_start = 0;
+        }
 
         int func = is_function_word(word);
         const char *dict = dict_lookup(word);
+        if (strcmp(word, "the") == 0) {              /* "thee" before a vowel: "thee only" */
+            const char *q = p;
+            while (*q && !isalpha((unsigned char)*q) && !strchr(".,;:!?", *q)) q++;
+            if (*q && strchr("aeio", *q)) dict = "DH IY0";
+        }
         if (dict) {
-            printf("[DICT]  %-20s → %s\n", word, dict);
+            if (syn_verbose) printf("[DICT]  %-20s → %s\n", word, dict);
             n = add_phones(dict, out, n, maxout, func);
         } else {
             char letters[MAX_WORD], phones[512];
             int k = 0;
             for (int i = 0; word[i]; i++) if (word[i] != '\'') letters[k++] = word[i];
             letters[k] = 0;
+            if (!strpbrk(letters, "aeiouy") && k <= 6) {         /* no vowels: an abbreviation */
+                static const char *LETTER[26] = {
+                    "EY1","B IY1","S IY1","D IY1","IY1","EH1 F","JH IY1","EY1 CH","AY1","JH EY1",
+                    "K EY1","EH1 L","EH1 M","EH1 N","OW1","P IY1","K Y UW1","AA1 R","EH1 S","T IY1",
+                    "Y UW1","V IY1","D AH1 B AH0 L Y UW0","EH1 K S","W AY1","Z IY1" };
+                int first = 1;
+                for (int i = 0; letters[i]; i++) {
+                    if (letters[i] < 'a' || letters[i] > 'z') continue;
+                    int before = n;
+                    n = add_phones(LETTER[letters[i] - 'a'], out, n, maxout, func);
+                    if (!first && before < n) out[before].flags &= ~F_WORD_START;
+                    first = 0;
+                }
+                if (syn_verbose) printf("[ABBR]  %-20s\n", word);
+                continue;
+            }
             g2p_word(letters, phones, sizeof phones);
             if (phones[0]) {
-                printf("[G2P ]  %-20s → %s\n", word, phones);
+                if (syn_verbose) printf("[G2P ]  %-20s → %s\n", word, phones);
                 n = add_phones(phones, out, n, maxout, func);
             } else {
-                printf("[MISS] %-20s → (no match)\n", word);
+                if (syn_verbose) printf("[MISS] %-20s → (no match)\n", word);
             }
         }
     }
-    n = add_pause(out, n, maxout, 300, '.');
+    /* American flap: t/d between a vowel (or r) and an unstressed vowel in
+     * the same word, as in "water", "better", "greetings" */
+    for (int i = 1; i + 1 < n; i++)
+        if ((out[i].ph == PH_T || out[i].ph == PH_D) && !(out[i].flags & F_WORD_START) &&
+            (PHDEF[out[i - 1].ph].cls & CL_VOWEL || out[i - 1].ph == PH_R) &&
+            (PHDEF[out[i + 1].ph].cls & CL_VOWEL) && out[i + 1].stress == 0 &&
+            !(out[i + 1].flags & F_WORD_START))
+            out[i].stress = -3;
+    n = add_pause(out, n, maxout, 300, 0);      /* keeps a '?' or '.' already there */
     if (n > 0 && out[n - 1].ph == PH_SIL && !out[n - 1].punct)
         out[n - 1].punct = '.';
     return n;
@@ -769,7 +908,8 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
 #define RATE        1.0          /* > 1 slower, < 1 faster              */
 #define PITCH_START 122.0        /* Hz at the start of a phrase         */
 #define PITCH_END    98.0        /* ... falling to this at its end      */
-#define PITCH_ACCENT 18.0        /* rise on stressed syllables          */
+#define PITCH_ACCENT 22.0        /* peak of an accented syllable (Hz)   */
+#define PITCH_HAT    10.0        /* how far the voice stays up between  */
 
 static int cls_of(const PItem *it, int n, int i) {
     return (i < 0 || i >= n) ? CL_SIL : PHDEF[it[i].ph].cls;
@@ -782,6 +922,23 @@ static int is_cons(const PItem *it, int n, int i) {
 static int is_front(Phoneme p) {
     return p == PH_IY || p == PH_IH || p == PH_EY || p == PH_EH || p == PH_AE || p == PH_Y;
 }
+
+/* Inherent and minimum durations (ms), after MITalk. Stops: closure +
+ * burst; affricates: closure + frication. */
+static const double DUR[PH_COUNT][2] = {
+    [PH_AA] = {240, 100}, [PH_AE] = {230, 80},  [PH_AH] = {140, 60},  [PH_AO] = {240, 100},
+    [PH_AW] = {260, 100}, [PH_AY] = {250, 150}, [PH_EH] = {150, 70},  [PH_ER] = {180, 80},
+    [PH_EY] = {190, 100}, [PH_IH] = {135, 40},  [PH_IY] = {155, 55},  [PH_OW] = {220, 80},
+    [PH_OY] = {280, 150}, [PH_UH] = {160, 60},  [PH_UW] = {210, 70},
+    [PH_M]  = {70, 60},   [PH_N]  = {60, 50},   [PH_NG] = {95, 60},
+    [PH_B]  = {85, 60},   [PH_D]  = {75, 50},   [PH_G]  = {80, 60},
+    [PH_P]  = {85, 50},   [PH_T]  = {75, 50},   [PH_K]  = {80, 60},
+    [PH_V]  = {60, 40},   [PH_DH] = {50, 30},   [PH_Z]  = {75, 40},   [PH_ZH] = {70, 40},
+    [PH_F]  = {100, 80},  [PH_TH] = {90, 60},   [PH_S]  = {105, 60},  [PH_SH] = {105, 80},
+    [PH_HH] = {80, 20},   [PH_CH] = {110, 70},  [PH_JH] = {90, 60},
+    [PH_L]  = {80, 40},   [PH_R]  = {80, 30},   [PH_W]  = {80, 60},   [PH_Y]  = {80, 40},
+    [PH_SIL] = {0, 0},
+};
 
 /* One point of the formant track */
 typedef struct { int t; double f[3], b[3], fnz; } FAnchor;
@@ -810,6 +967,13 @@ static void target(const PItem *it, int n, int i, int end, double f[3], double b
         b[k] = d->b[k];
     }
     *fnz = (d->cls & CL_NASAL) ? 450.0 : 270.0;
+    if (d->cls & CL_VOWEL) {                               /* nasalized next to m/n/ng: the */
+        if (end && i + 1 < n && (PHDEF[it[i + 1].ph].cls & CL_NASAL)) {   /* soft palate opens early */
+            *fnz = 340; b[0] += 30;
+        } else if (!end && i > 0 && (PHDEF[it[i - 1].ph].cls & CL_NASAL)) {
+            *fnz = 320; b[0] += 20;
+        }
+    }
     if (it[i].ph == PH_AH && it[i].stress == 0) {          /* schwa: central */
         f[0] = 500; f[1] = 1400; f[2] = 2450;
     }
@@ -835,7 +999,7 @@ static double trans_ms(const PItem *it, int n, int i, int nb) {
     if (c & CL_VOWEL) {
         if (cn & (CL_STOP | CL_AFFRIC)) return 45;
         if (cn & CL_FRIC) return it[nb].ph == PH_HH ? 0 : 35;
-        if (cn & CL_NASAL) return 35;
+        if (cn & CL_NASAL) return 20;               /* the mouth shape snaps at a nasal's edge */
         if (cn & CL_APPROX) return 40;
         return 40;
     }
@@ -859,28 +1023,77 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
     int *start = calloc(n + 1, sizeof(int)), *dur = calloc(n + 1, sizeof(int));
     memset(pl, 0, sizeof *pl);
 
-    /* ── Durations ── */
-    for (int i = 0; i < n; i++) {
-        const PhonDef *d = &PHDEF[it[i].ph];
-        double ms = d->dur_ms;
-        if (it[i].ph == PH_SIL) ms = it[i].pause_ms;
-        else if (d->cls & CL_VOWEL) {
-            if (it[i].stress == 0) ms = fmax(45, ms * 0.55);
-            else if (it[i].stress == 2) ms *= 0.8;
-            if (it[i].flags & F_FUNC) ms *= 0.7;
-        } else {
-            if (is_cons(it, n, i - 1) || is_cons(it, n, i + 1)) ms *= 0.8;   /* clusters are quicker */
-            if ((d->cls & CL_STOP) && !(d->cls & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) ms += 35;
-        }
-        dur[i] = (int)(MS(ms) * RATE);
+    /* ── Durations: Klatt's rules from MITalk (Allen, Hunnicutt & Klatt
+     *    1987). Each sound has an inherent and a minimum length; rules
+     *    scale the part above the minimum: dur = min + (inh - min) * pct. ── */
+    int *wfirst = calloc(n + 1, sizeof(int)), *wlast = calloc(n + 1, sizeof(int));
+    int *wvowels = calloc(n + 1, sizeof(int)), *pfinal = calloc(n + 1, sizeof(int));
+    for (int i = 0; i < n; i++) {                       /* word extents */
+        if (it[i].ph == PH_SIL) { wfirst[i] = wlast[i] = i; continue; }
+        int a = i;
+        while (a > 0 && !(it[a].flags & F_WORD_START) && it[a - 1].ph != PH_SIL) a--;
+        int b = i;
+        while (b + 1 < n && !(it[b + 1].flags & F_WORD_START) && it[b + 1].ph != PH_SIL) b++;
+        wfirst[i] = a; wlast[i] = b;
     }
-    /* Phrase-final lengthening: the last syllable before a pause */
     for (int i = 0; i < n; i++) {
+        int v = 0;
+        for (int j = wfirst[i]; j <= wlast[i]; j++) v += is_vowel(it, n, j);
+        wvowels[i] = v;
+    }
+    for (int i = 0; i < n; i++) {                       /* the last syllable before a pause */
         if (it[i].ph != PH_SIL || i == 0) continue;
         int j = i - 1;
-        while (j > 0 && !is_vowel(it, n, j) && it[j].ph != PH_SIL) dur[j] = dur[j] * 6 / 5, j--;
-        if (j > 0 && is_vowel(it, n, j)) dur[j] = dur[j] * 7 / 5;
+        while (j > 0 && !is_vowel(it, n, j) && it[j].ph != PH_SIL) pfinal[j--] = 2;   /* its coda */
+        if (j > 0 && is_vowel(it, n, j)) pfinal[j] = 1;
     }
+    for (int i = 0; i < n; i++) {
+        const PhonDef *d = &PHDEF[it[i].ph];
+        int c = d->cls;
+        double inh = DUR[it[i].ph][0], mn = DUR[it[i].ph][1], pct = 1.0, extra = 0;
+        if (it[i].ph == PH_SIL) { dur[i] = MS(it[i].pause_ms); continue; }
+        if (it[i].stress == -3) { dur[i] = (int)(MS(28) * RATE); continue; }      /* flap */
+        if (c & CL_VOWEL) {
+            int last_v = 1, first_v = 1;
+            for (int j = i + 1; j <= wlast[i]; j++) if (is_vowel(it, n, j)) last_v = 0;
+            for (int j = wfirst[i]; j < i; j++) if (is_vowel(it, n, j)) first_v = 0;
+            int unstressed = it[i].stress == 0 || (it[i].flags & F_FUNC);
+            if (pfinal[i]) pct *= 1.4;                        /* phrase-final lengthening   */
+            else pct *= 0.6;                                  /* everything else is quicker */
+            if (!last_v) pct *= 0.85;                         /* not the word's last syllable */
+            if (wvowels[i] > 1) pct *= 0.8;                   /* in a word of several syllables */
+            if (unstressed) {
+                mn /= 2;
+                pct *= (!first_v && !last_v) ? 0.5 : 0.7;
+            } else if (it[i].stress == 2) pct *= 0.85;
+            /* what follows in the word: longer before voiced sounds ("bead" vs "beat") */
+            if (i + 1 <= wlast[i]) {
+                int cn = cls_of(it, n, i + 1);
+                double f = 1.0;
+                if ((cn & CL_FRIC) && (cn & CL_VOICED)) f = 1.6;
+                else if ((cn & (CL_STOP | CL_AFFRIC)) && (cn & CL_VOICED)) f = 1.2;
+                else if (cn & CL_NASAL) f = 0.85;
+                else if (cn & (CL_STOP | CL_AFFRIC)) f = 0.7;
+                pct *= pfinal[i] ? f : 0.7 + 0.3 * f;
+            }
+            if (is_vowel(it, n, i + 1)) pct *= 1.2;
+            if (is_vowel(it, n, i - 1)) pct *= 0.7;
+            /* after an aspirated p/t/k the breath takes the vowel's start: give it back */
+            int pc = i > 0 ? it[i - 1].ph : PH_SIL;
+            if ((pc == PH_P || pc == PH_T || pc == PH_K) && it[i].stress == 1 && !(it[i].flags & F_FUNC)
+                && !(i > 1 && it[i - 2].ph == PH_S))
+                extra = 25;
+        } else {
+            if (!(it[i].flags & F_WORD_START)) pct *= 0.85;  /* not word-initial */
+            int cb = is_cons(it, n, i - 1), ca = is_cons(it, n, i + 1);
+            if (cb && ca) pct *= 0.5;                         /* in clusters */
+            else if (cb || ca) pct *= 0.7;
+            if (pfinal[i] == 2) pct *= 1.2;
+            if ((c & CL_STOP) && !(c & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) extra = 25;
+        }
+        dur[i] = (int)(MS(mn + (inh - mn) * pct + extra) * RATE);
+    }
+    free(wfirst); free(wlast); free(wvowels); free(pfinal);
     int t = 0;
     for (int i = 0; i < n; i++) { start[i] = t; t += dur[i]; }
     start[n] = t;
@@ -918,6 +1131,11 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
 
         if (c & CL_SIL) { add_event(pl, t0, t1, 0, 0, 0, NULL, 0, 0); vot_left = 0; continue; }
 
+        if (it[i].stress == -3) {                          /* flap: a quick voiced tap, no burst */
+            add_event(pl, t0, t1, 46, 0, 0, NULL, 0, 0);
+            vot_left = 0;
+            continue;
+        }
         if (c & CL_STOP) {
             int burst = MS((c & CL_VOICED) ? 8 : 12);
             double voicebar = ((c & CL_VOICED) && cls_of(it, n, i - 1) != CL_SIL) ? 42 : 0;
@@ -931,25 +1149,25 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
             double af = d->af, ab = d->ab;
             int asp = 0;
             if (cls_of(it, n, i + 1) & CL_SIL) {        /* before a pause: released, a little breath */
-                if (!(c & CL_VOICED)) asp = MS(35);
+                if (!(c & CL_VOICED)) asp = MS(25);
             } else if (!is_vowel(it, n, i + 1) && !(cls_of(it, n, i + 1) & CL_APPROX))
                 af -= 8;                                /* inside a cluster: a weak release */
-            add_event(pl, t0, t1 - burst - asp, voicebar, 0, 0, NULL, 0, 1);
+            add_event(pl, t0, t1 - burst - asp, voicebar, 0, 0, NULL, 0, 0);   /* voicing fades out, no click */
             add_event(pl, t1 - burst - asp, t1 - asp, voicebar, 0, af, a, ab, 1);
-            if (asp) add_event(pl, t1 - asp, t1, 0, 50, 0, NULL, 0, 1);
+            if (asp) add_event(pl, t1 - asp, t1, 0, 44, 0, NULL, 0, 1);
             vot_left = 0;
             if (!(c & CL_VOICED) && (is_vowel(it, n, i + 1) || (cls_of(it, n, i + 1) & CL_APPROX))
                 && !(i > 0 && it[i - 1].ph == PH_S)) {
-                int stressed = is_vowel(it, n, i + 1) ? it[i + 1].stress == 1 : 1;
-                vot_left = MS(stressed && !(it[i + 1].flags & F_FUNC) ? 55 : 30);
-                vot_db = 56;
+                int stressed = is_vowel(it, n, i + 1) && it[i + 1].stress == 1 && !(it[i + 1].flags & F_FUNC);
+                vot_left = MS(stressed ? 45 : 25);      /* p/t/k + l/r/w/y ("play"): short */
+                vot_db = stressed ? 50 : 46;
             }
             continue;
         }
         if (c & CL_AFFRIC) {
             int clos = dur[i] * 45 / 100;
             double voicebar = (c & CL_VOICED) && cls_of(it, n, i - 1) != CL_SIL ? 42 : 0;
-            add_event(pl, t0, t0 + clos, voicebar, 0, 0, NULL, 0, 1);
+            add_event(pl, t0, t0 + clos, voicebar, 0, 0, NULL, 0, 0);
             add_event(pl, t0 + clos, t1, (c & CL_VOICED) ? d->av : 0, 0, d->af, d->a, d->ab, 1);
             vot_left = 0;
             continue;
@@ -972,40 +1190,78 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
             vot_left -= te - t0;
             t0 = te;
         }
+        if ((c & CL_VOWEL) && (it[i].flags & F_WORD_START) && is_vowel(it, n, i - 1)) {
+            int g = MS(35) < dur[i] / 2 ? MS(35) : dur[i] / 2;    /* a brief catch in the voice */
+            add_event(pl, t0, t0 + g, av - 20, 0, 0, NULL, 0, 0);
+            t0 += g;
+        }
         add_event(pl, t0, t1, av, 0, 0, NULL, 0, 0);
     }
 
-    /* ── Pitch: a falling line over each phrase, a rise on stressed
-     *    syllables of content words, a final fall (or a rise for '?') ── */
-    pl->pa = calloc(4 * n + 4, sizeof(PAnchor));
-    int ps = 0;
+    /* ── Pitch: the "hat" pattern of English. Over each phrase the voice
+     *    drifts down; it steps up on the first important word, stays up,
+     *    and on the last important word (the nucleus) peaks and falls to
+     *    the bottom (a statement), or dips and climbs (a question), or
+     *    falls part way and lifts (a comma: more to come). Only stressed
+     *    syllables of content words carry accents; "the", "of", "is"... don't. ── */
+    pl->pa = calloc(4 * n + 8, sizeof(PAnchor));
+    int ps = 0, phrase_start = 0;
     for (int i = 0; i < n; i++) {
         if (it[i].ph != PH_SIL) continue;
+        if (i == 0) { ps = start[i] + dur[i]; phrase_start = 1; continue; }
         int pe = start[i];
-        int last_v = -1;
-        for (int j = i - 1; j >= 0 && it[j].ph != PH_SIL; j--)
-            if (is_vowel(it, n, j)) { last_v = j; break; }
         double span = pe > ps ? pe - ps : 1;
-        pl->pa[pl->npa++] = (PAnchor){ start[i] + dur[i] / 2, PITCH_START };
-        for (int j = 0; j < i; j++) {
-            if (start[j] < ps || !is_vowel(it, n, j)) continue;
-            double a = start[j], b = start[j] + dur[j];
-            double base_a = PITCH_START + (PITCH_END - PITCH_START) * (a - ps) / span;
-            double base_b = PITCH_START + (PITCH_END - PITCH_START) * (b - ps) / span;
-            int accent = it[j].stress == 1 && !(it[j].flags & F_FUNC);
-            if (j == last_v) {
-                char pu = it[i].punct;
-                double endhz = pu == '?' ? PITCH_START * 1.3 : pu == ',' ? base_b + 8 : PITCH_END * 0.82;
-                pl->pa[pl->npa++] = (PAnchor){ (int)a, base_a + (accent ? 10 : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.3 * dur[j]), base_a + (accent && pu != '?' ? PITCH_ACCENT : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)b, endhz };
-            } else {
-                pl->pa[pl->npa++] = (PAnchor){ (int)a, base_a + (accent ? 6 : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.45 * dur[j]), base_a + (accent ? PITCH_ACCENT : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)b, base_b + (accent ? 8 : 0) };
-            }
+        char pu = it[i].punct ? it[i].punct : '.';
+        int acc[MAX_PHONEMES], m = 0, last_v = -1;
+        for (int j = phrase_start; j < i; j++) {
+            if (!is_vowel(it, n, j)) continue;
+            last_v = j;
+            if (it[j].stress == 1 && !(it[j].flags & F_FUNC)) acc[m++] = j;
         }
+        #define BASE(x) (PITCH_START + (PITCH_END - PITCH_START) * ((x) - ps) / span)
+        double low = PITCH_END * 0.82, high = PITCH_START * 1.35;
+        int first = m ? acc[0] : -1, nuc = m ? acc[m - 1] : -1;
+        for (int j = phrase_start; j < i; j++) {
+            if (!is_vowel(it, n, j)) continue;
+            double a = start[j], b = start[j] + dur[j], dj = dur[j];
+            int is_acc = 0;
+            for (int q = 0; q < m; q++) if (acc[q] == j) is_acc = 1;
+            int after_nuc = nuc >= 0 && j > nuc, before_first = first < 0 || j < first;
+            double hat = before_first ? 0 : PITCH_HAT;
+            if (j == nuc) {
+                if (pu == '?') {
+                    pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat * 0.5 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.4 * dj), BASE(a) - 8 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)b, j == last_v ? high : BASE(b) + 4 };
+                } else {
+                    double fall_to = pu == ',' ? BASE(b) - 4 : (j == last_v ? low : BASE(b) - 10);
+                    pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.35 * dj), BASE(a) + PITCH_ACCENT + 8 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)b, fall_to };
+                }
+            } else if (after_nuc) {                        /* the tail after the nucleus */
+                double u = (b - start[nuc]) / (double)(pe - start[nuc] > 0 ? pe - start[nuc] : 1);
+                double v = pu == '?' ? BASE(b) + 4 + (high - BASE(b) - 4) * u
+                         : pu == ',' ? BASE(b) - 4 + 12 * u
+                         : BASE(b) - 10 + (low - BASE(b) + 10) * u;
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, v };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, v };
+            } else if (is_acc) {                           /* accents on the way */
+                double peak = BASE(a) + (j == first ? PITCH_ACCENT + 6 : PITCH_ACCENT);
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat * 0.6 };
+                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.4 * dj), peak };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, BASE(b) + PITCH_HAT };
+            } else {                                       /* unaccented: on the line or the hat */
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, BASE(b) + hat };
+            }
+            if (j == last_v && pu == '.' && j != nuc && !after_nuc)
+                pl->pa[pl->npa - 1].hz = low;              /* no accent at all: still end low */
+        }
+        #undef BASE
         ps = start[i] + dur[i];
+        phrase_start = i + 1;
+        pl->pa[pl->npa++] = (PAnchor){ start[i] + dur[i] - 1, PITCH_START };   /* reset during the pause */
     }
     /* anchors were added phrase by phrase; sort by time (insertion sort, nearly sorted) */
     for (int i = 1; i < pl->npa; i++) {
@@ -1063,12 +1319,20 @@ static inline double bpf(Bpf *f, double x) {
 static inline double db_amp(double db) { return db <= 0 ? 0.0 : pow(10.0, (db - 60.0) / 20.0); }
 
 /* Relative levels of the three sources */
-#define G_VOICE  1.0
+#ifndef VOICE_MODEL
+#define VOICE_MODEL 1            /* 0: filtered pulses, 1: KLGLOTT88 vocal folds */
+#endif
+#ifndef G_VOICE
+#define G_VOICE  0.25
+#endif
+#define OPEN_QUOTIENT 0.6        /* part of each period the folds are open */
+#define VOICE_BRIGHTNESS 2400.0  /* Hz: lower = softer, darker voice        */
+#define BREATHY       0.06       /* breath noise in the voice              */
 #define G_ASP    0.005
 #define G_FRIC   0.02
 
-/* Render a plan into 16-bit samples. Returns a malloc'd buffer. */
-static Sint16 *render(const Plan *pl, int *out_len) {
+/* Render a plan into samples in -1..1. Returns a malloc'd buffer. */
+static float *render(const Plan *pl, int *out_len) {
     int N = pl->n_samples;
     float *y = calloc(N > 0 ? N : 1, sizeof(float));
     Reson r[5], rnp, rgp;
@@ -1085,16 +1349,18 @@ static Sint16 *render(const Plan *pl, int *out_len) {
     bpf_set(&p[3], 3850, 400);
     bpf_set(&p[4], 5300, 1200);
 
-    double phase = 0, lp_noise = 0, prev_c = 0;
+    double phase = 0, lp_noise = 0, soft_noise = 0, prev_c = 0;
+    double jitter = 1.0, shimmer = 1.0, tilt = 0;
     double av = 0, ah = 0, af = 0, ab = 0, a[5] = { 0 };
     unsigned seed = 12345;
     int fi = 0, ei = 0, pi = 0;
     double k = 1.0 - exp(-1.0 / (0.004 * SAMPLE_RATE));     /* 4 ms ramps */
+    double c_asp = onepole(1000), c_soft = onepole(5650), c_tilt = onepole(VOICE_BRIGHTNESS);
     double peak = 1e-9;
 
     for (int s = 0; s < N; s++) {
-        /* formants: every 32 samples */
-        if ((s & 31) == 0) {
+        /* formants: every 4 samples */
+        if ((s & 3) == 0) {                       /* small steps: no clicks from sudden filter changes */
             while (fi + 1 < pl->nfa && pl->fa[fi + 1].t <= s) fi++;
             const FAnchor *A = &pl->fa[fi], *B = &pl->fa[fi + 1 < pl->nfa ? fi + 1 : fi];
             double u = (B->t > A->t && s > A->t) ? (double)(s - A->t) / (B->t - A->t) : 0;
@@ -1134,17 +1400,41 @@ static Sint16 *render(const Plan *pl, int *out_len) {
         double tsec = (double)s / SAMPLE_RATE;
         f0 *= 1.0 + 0.006 * sin(2 * M_PI * 4.7 * tsec) + 0.004 * sin(2 * M_PI * 7.3 * tsec);
 
+        seed = seed * 1664525u + 1013904223u;
+        double noise = (double)(int)seed / 2147483648.0;
+        lp_noise += c_asp * (noise - lp_noise);
+
+#if VOICE_MODEL == 0
         /* glottal pulses through a low-pass (the voice's -12 dB/octave) */
         double imp = 0;
         phase += f0 / SAMPLE_RATE;
         if (phase >= 1.0) { phase -= 1.0; imp = 1.0; }
         double glot = anti(&rgz, reson(&rgp, imp * 60.0)) * av * G_VOICE;
-
-        seed = seed * 1664525u + 1013904223u;
-        double noise = (double)(int)seed / 2147483648.0;
-        lp_noise += 0.25 * (noise - lp_noise);
+#else
+        /* The vocal folds (KLGLOTT88): each period the airflow rises and
+         * falls smoothly while the folds are open, then stops sharply as
+         * they snap shut. Real voices also wobble a little from one period
+         * to the next (jitter, shimmer) and leak a little breath. */
+        phase += f0 * jitter / SAMPLE_RATE;
+        if (phase >= 1.0) {
+            phase -= 1.0;
+            seed = seed * 1664525u + 1013904223u;
+            jitter = 1.0 + 0.012 * ((double)(int)seed / 2147483648.0);
+            seed = seed * 1664525u + 1013904223u;
+            shimmer = 1.0 + 0.06 * ((double)(int)seed / 2147483648.0);
+        }
+        double flow = 0;
+        if (phase < OPEN_QUOTIENT) {
+            double xq = phase / OPEN_QUOTIENT;
+            flow = 6.75 * xq * xq * (1.0 - xq);           /* peak 1 at 2/3 of the opening */
+        }
+        tilt += c_tilt * (flow - tilt);                     /* softens the closure a little */
+        double breath = lp_noise * (phase < OPEN_QUOTIENT ? 1.0 : 0.25) * BREATHY;
+        double glot = (tilt + breath) * shimmer * av * G_VOICE;
+#endif
         double asp = lp_noise * ah * G_ASP * 4.0;
-        double fric_noise = noise * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
+        soft_noise += c_soft * (noise - soft_noise);             /* takes the fizz off the top (~6 kHz) */
+        double fric_noise = soft_noise * 1.3 * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
 
         /* cascade: nasal pole/zero pair, then F5..F1 */
         double x = glot + asp;
@@ -1163,23 +1453,58 @@ static Sint16 *render(const Plan *pl, int *out_len) {
         if (fabs(out) > peak) peak = fabs(out);
     }
 
-    Sint16 *pcm = malloc((N > 0 ? N : 1) * sizeof(Sint16));
     double g = 0.85 / peak;
     int fade = MS(10);
     for (int s = 0; s < N; s++) {
         double v = y[s] * g;
         if (s < fade) v *= (double)s / fade;
         if (N - s < fade) v *= (double)(N - s) / fade;
-        pcm[s] = (Sint16)(tanh(v * 1.1) / tanh(1.1) * 32000.0);
+        y[s] = (float)(tanh(v * 1.1) / tanh(1.1) * 0.976);
     }
-    free(y);
     *out_len = N;
-    return pcm;
+    return y;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Playback
+ * Library interface (synth.h)
  * ═══════════════════════════════════════════════════════════════════════════ */
+int tts_init_file(const char *cmudict_path) {
+    int r = load_cmudict(cmudict_path);
+    load_hand_dict();
+    return r;
+}
+
+void tts_init_text(const char *cmudict_text, size_t len) {
+    if (cmudict_text) load_cmudict_text(cmudict_text, len);
+    load_hand_dict();
+}
+
+float *tts_render(const char *text, int sample_rate, int *n_samples) {
+    static PItem items[MAX_PHONEMES];
+    Plan pl;
+    syn_rate = sample_rate > 8000 ? sample_rate : 22050;
+    int n = text_to_phonemes(text ? text : "", items, MAX_PHONEMES);
+    make_plan(items, n, &pl);
+    float *out = render(&pl, n_samples);
+    plan_free(&pl);
+    return out;
+}
+
+void tts_free(float *samples) { free(samples); }
+
+void tts_set_verbose(int on) { syn_verbose = on; }
+
+void tts_shutdown(void) { dict_free(); }
+
+
+#ifdef SYNTH_STANDALONE
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Standalone program: playback through SDL2, or a WAV file
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#include <SDL2/SDL.h>
+
+#define PLAY_RATE 22050
+
 typedef struct {
     Sint16 *pcm;
     int     len, pos;
@@ -1189,14 +1514,12 @@ typedef struct {
 static Player     g_player;
 static SDL_mutex *g_mutex;
 
-/* Text → samples (outside the audio lock; it takes a few milliseconds) */
+/* Text → 16-bit samples (outside the audio lock; it takes a few milliseconds) */
 static Sint16 *synth_render(const char *text, int *len) {
-    static PItem items[MAX_PHONEMES];
-    Plan pl;
-    int n = text_to_phonemes(text, items, MAX_PHONEMES);
-    make_plan(items, n, &pl);
-    Sint16 *pcm = render(&pl, len);
-    plan_free(&pl);
+    float *f = tts_render(text, PLAY_RATE, len);
+    Sint16 *pcm = malloc((*len > 0 ? *len : 1) * sizeof(Sint16));
+    for (int i = 0; i < *len; i++) pcm[i] = (Sint16)(f[i] * 32767.0f);
+    tts_free(f);
     return pcm;
 }
 
@@ -1231,7 +1554,7 @@ static int write_wav(const char *path, const Sint16 *pcm, int n) {
     memcpy(h, "RIFF", 4); v = 36 + data; memcpy(h + 4, &v, 4);
     memcpy(h + 8, "WAVEfmt ", 8); v = 16; memcpy(h + 16, &v, 4);
     h[20] = 1; h[21] = 0; h[22] = 1; h[23] = 0;                  /* PCM, mono */
-    v = SAMPLE_RATE; memcpy(h + 24, &v, 4); v = SAMPLE_RATE * 2; memcpy(h + 28, &v, 4);
+    v = PLAY_RATE; memcpy(h + 24, &v, 4); v = PLAY_RATE * 2; memcpy(h + 28, &v, 4);
     h[32] = 2; h[33] = 0; h[34] = 16; h[35] = 0;
     memcpy(h + 36, "data", 4); memcpy(h + 40, &data, 4);
     fwrite(h, 1, 44, f);
@@ -1244,11 +1567,11 @@ static int write_wav(const char *path, const Sint16 *pcm, int n) {
  * Main
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[]) {
+    tts_set_verbose(1);
     printf("Loading Dictionary\n");
-    load_cmudict("cmudict-0.7b");
-    /* The hand-curated entries (proper nouns like "falken"/"joshua" and
-     * abbreviations like "dr"/"mrs") go in after CMUdict; see load_hand_dict. */
-    load_hand_dict();
+    /* CMUdict, then the hand-curated entries (proper nouns like "falken",
+     * abbreviations like "dr"/"mrs"); see load_hand_dict. */
+    tts_init_file("cmudict-0.7b");
     printf("End Loading Dictionary\n");
 
     if (argc > 3 && strcmp(argv[1], "-o") == 0) {               /* -o out.wav "text" */
@@ -1266,7 +1589,7 @@ int main(int argc, char *argv[]) {
     g_mutex = SDL_CreateMutex();
 
     SDL_AudioSpec want = {0}, got;
-    want.freq     = SAMPLE_RATE;
+    want.freq     = PLAY_RATE;
     want.format   = AUDIO_S16SYS;
     want.channels = 1;
     want.samples  = BUFFER_SIZE;
@@ -1306,3 +1629,4 @@ int main(int argc, char *argv[]) {
     SDL_Quit();
     return 0;
 }
+#endif /* SYNTH_STANDALONE */
