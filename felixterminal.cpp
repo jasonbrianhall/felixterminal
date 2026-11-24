@@ -2533,6 +2533,7 @@ int main(int argc, char **argv) {
     SDL_DestroyWindow(window);
     wopr_close();          // join/detach any running sub-game thread before audio shutdown
     wopr_audio_shutdown();
+    wopr_speech_shutdown();
     crt_audio_shutdown();
     kitty_shutdown();
     sixel_shutdown();

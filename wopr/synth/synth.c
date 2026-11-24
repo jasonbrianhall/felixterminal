@@ -10,7 +10,8 @@
  *        → Klatt-style synthesizer: glottal pulses and aspiration through a
  *          cascade of formant resonators (with a nasal pole/zero pair), noise
  *          through parallel resonators for fricatives and stop bursts
- *        → SDL2 audio output (or a WAV file with -o)
+ *        → float samples (library: synth.h), or SDL2 audio / a WAV file
+ *          (standalone program)
  *
  * Phoneme set (ARPABET):
  *   Vowels:  AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW  (stress 0/1/2)
@@ -20,8 +21,10 @@
  *   Affric:  CH JH
  *   Approx:  L  R  W  Y
  *
- * Build:
- *   gcc synth.c -o synth $(sdl2-config --cflags --libs) -lm
+ * Build the standalone program:
+ *   gcc -DSYNTH_STANDALONE synth.c -o synth $(sdl2-config --cflags --libs) -lm
+ * As a library (Felix Terminal's WOPR), compile without SYNTH_STANDALONE and
+ * use the functions in synth.h.
  *
  * Usage:
  *   ./synth "Hello Dr. Falken. How is Joshua?"
@@ -29,8 +32,9 @@
  *   ./synth -o out.wav "text"  (write a WAV file instead of playing)
  */
 
-#include <SDL2/SDL.h>
+#include "synth.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,11 +43,22 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define SAMPLE_RATE   22050
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* Output sample rate: set per call by tts_render(); every filter and time
+ * constant below is worked out from it. */
+static double syn_rate = 22050;
+static int    syn_verbose = 0;
+#define SAMPLE_RATE   syn_rate
 #define BUFFER_SIZE   512
 #define MAX_PHONEMES  1024
 #define MAX_WORD      64
 #define MS(x)         ((int)((x) * (SAMPLE_RATE / 1000.0)))
+
+/* one-pole low-pass coefficient for a corner frequency, at the current rate */
+static double onepole(double hz) { return 1.0 - exp(-2.0 * M_PI * hz / SAMPLE_RATE); }
 
 typedef struct DictNode {
     char *word;
@@ -418,6 +433,24 @@ static const DictEntry DICT[] = {
     {"thermonuclear","TH ER M OW N UW K L IY ER"},
     {"chess",   "CH EH S"},
     {"strange", "S T R EY N JH"},
+    /* WOPR's vocabulary (stress digits: these override CMUdict) */
+    {"wopr",     "W AA1 P ER0"},
+    {"norad",    "N AO1 R AE2 D"},
+    {"defcon",   "D EH1 F K AA2 N"},
+    {"icbm",     "AY1 S IY1 B IY1 EH1 M"},
+    {"icbms",    "AY1 S IY1 B IY1 EH1 M Z"},
+    {"sdi",      "EH1 S D IY1 AY1"},
+    {"abm",      "EY1 B IY1 EH1 M"},
+    {"nsa",      "EH1 N EH1 S EY1"},
+    {"mdt",      "EH1 M D IY1 T IY1"},
+    {"milnet",   "M IH1 L N EH2 T"},
+    {"sitrep",   "S IH1 T R EH2 P"},
+    {"zork",     "Z AO1 R K"},
+    {"wargames", "W AO1 R G EY2 M Z"},
+    {"logon",    "L AO1 G AA2 N"},
+    {"codeword", "K OW1 D W ER2 D"},
+    {"uplink",   "AH1 P L IH2 NG K"},
+    {"falken",   "F AO1 L K AH0 N"},
     {NULL,      NULL}
 };
 
@@ -437,11 +470,18 @@ static const char *dict_lookup(const char *word) {
 }
 
 /* Newest entry wins (each bucket's list starts with the newest). */
+static char *syn_strdup(const char *s) {          /* strdup isn't standard C */
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
 static void dict_insert(const char *word, const char *phones) {
     unsigned h = hash_word(word);
     DictNode *n = malloc(sizeof(DictNode));
-    n->word = strdup(word);
-    n->phones = strdup(phones);
+    n->word = syn_strdup(word);
+    n->phones = syn_strdup(phones);
     n->next = cmu_dict[h];
     cmu_dict[h] = n;
 }
@@ -450,37 +490,70 @@ static void dict_insert(const char *word, const char *phones) {
  * length, loudness and pitch. Only each word's first (main) pronunciation
  * is kept: "A(1)  EY1" or "THE(1)  DH IY0" must not replace "A  AH0" and
  * "THE  DH AH0". */
-static void load_cmudict(const char *path) {
+static void dict_line(char *line) {
+    if (line[0] == ';')
+        return;
+    char *word = line;
+    while (*word == ' ' || *word == '\t') word++;
+    char *e = word;
+    while (*e && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n') e++;
+    if (e == word || !*e || memchr(word, '(', (size_t)(e - word)))
+        return;
+    *e++ = 0;
+    while (*e == ' ' || *e == '\t') e++;
+    char *end = e + strlen(e);
+    while (end > e && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ')) *--end = 0;
+    if (!*e)
+        return;
+    for (char *c = word; *c; c++)
+        *c = tolower((unsigned char)*c);
+    dict_insert(word, e);
+}
+
+static int load_cmudict(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) {
         fprintf(stderr, "Could not open CMUdict file: %s\n", path);
-        return;
+        return -1;
     }
     char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == ';')
-            continue;
-        char *word = strtok(line, " \t\r\n");
-        if (!word || strchr(word, '('))
-            continue;
-        char *phones = strtok(NULL, "\r\n");
-        if (!phones)
-            continue;
-        while (*phones == ' ') phones++;
-        for (char *s = word; *s; s++)
-            *s = tolower((unsigned char)*s);
-        dict_insert(word, phones);
-    }
+    while (fgets(line, sizeof(line), f))
+        dict_line(line);
     fclose(f);
+    return 0;
 }
 
-/* The hand-written entries: abbreviations always win (CMUdict reads "dr"
- * as "drive" and so on); the rest only fill words CMUdict doesn't have,
+static void load_cmudict_text(const char *text, size_t len) {
+    char line[512];
+    size_t i = 0;
+    while (i < len) {
+        size_t n = 0;
+        while (i < len && text[i] != '\n') {
+            if (n < sizeof line - 1) line[n++] = text[i];
+            i++;
+        }
+        i++;
+        line[n] = 0;
+        dict_line(line);
+    }
+}
+
+static void dict_free(void) {
+    for (int b = 0; b < DICT_BUCKETS; b++) {
+        DictNode *n = cmu_dict[b];
+        while (n) { DictNode *x = n->next; free(n->word); free(n->phones); free(n); n = x; }
+        cmu_dict[b] = NULL;
+    }
+}
+
+/* The hand-written entries: abbreviations and entries written with stress
+ * digits always win (CMUdict reads "dr" as "drive", stresses "defcon" on
+ * the wrong syllable...); the rest only fill words CMUdict doesn't have,
  * since CMUdict's own entries carry stress and are more exact. */
 static void load_hand_dict(void) {
     static const char *always[] = { "dr", "mr", "mrs", "ms", NULL };
     for (int i = 0; DICT[i].word; i++) {
-        int force = 0;
+        int force = strchr(DICT[i].phones, '1') != NULL;
         for (int k = 0; always[k]; k++)
             if (strcmp(DICT[i].word, always[k]) == 0) force = 1;
         if (force || !dict_lookup(DICT[i].word))
@@ -647,11 +720,16 @@ static Phoneme name_to_ph(const char *s) {
  * are kept; when a word has none (hand dictionary, letter rules), its
  * first full vowel gets the stress. */
 static int add_phones(const char *phones, PItem *out, int n, int maxout, int func) {
-    char buf[256], *save = NULL;
+    char buf[256];
     int first = n, has_stress = 0;
     strncpy(buf, phones, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
-    for (char *tok = strtok_r(buf, " ", &save); tok && n < maxout - 2; tok = strtok_r(NULL, " ", &save)) {
+    for (char *tok = buf, *next; *tok && n < maxout - 2; tok = next) {
+        while (*tok == ' ') tok++;
+        if (!*tok) break;
+        next = tok;
+        while (*next && *next != ' ') next++;
+        if (*next) *next++ = 0;
         int st = -1;
         size_t l = strlen(tok);
         if (l > 1 && isdigit((unsigned char)tok[l - 1])) { st = tok[l - 1] - '0'; tok[l - 1] = 0; has_stress = 1; }
@@ -754,19 +832,35 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
             if (*q && strchr("aeio", *q)) dict = "DH IY0";
         }
         if (dict) {
-            printf("[DICT]  %-20s → %s\n", word, dict);
+            if (syn_verbose) printf("[DICT]  %-20s → %s\n", word, dict);
             n = add_phones(dict, out, n, maxout, func);
         } else {
             char letters[MAX_WORD], phones[512];
             int k = 0;
             for (int i = 0; word[i]; i++) if (word[i] != '\'') letters[k++] = word[i];
             letters[k] = 0;
+            if (!strpbrk(letters, "aeiouy") && k <= 6) {         /* no vowels: an abbreviation */
+                static const char *LETTER[26] = {
+                    "EY1","B IY1","S IY1","D IY1","IY1","EH1 F","JH IY1","EY1 CH","AY1","JH EY1",
+                    "K EY1","EH1 L","EH1 M","EH1 N","OW1","P IY1","K Y UW1","AA1 R","EH1 S","T IY1",
+                    "Y UW1","V IY1","D AH1 B AH0 L Y UW0","EH1 K S","W AY1","Z IY1" };
+                int first = 1;
+                for (int i = 0; letters[i]; i++) {
+                    if (letters[i] < 'a' || letters[i] > 'z') continue;
+                    int before = n;
+                    n = add_phones(LETTER[letters[i] - 'a'], out, n, maxout, func);
+                    if (!first && before < n) out[before].flags &= ~F_WORD_START;
+                    first = 0;
+                }
+                if (syn_verbose) printf("[ABBR]  %-20s\n", word);
+                continue;
+            }
             g2p_word(letters, phones, sizeof phones);
             if (phones[0]) {
-                printf("[G2P ]  %-20s → %s\n", word, phones);
+                if (syn_verbose) printf("[G2P ]  %-20s → %s\n", word, phones);
                 n = add_phones(phones, out, n, maxout, func);
             } else {
-                printf("[MISS] %-20s → (no match)\n", word);
+                if (syn_verbose) printf("[MISS] %-20s → (no match)\n", word);
             }
         }
     }
@@ -1209,13 +1303,13 @@ static inline double db_amp(double db) { return db <= 0 ? 0.0 : pow(10.0, (db - 
 #define G_VOICE  0.25
 #endif
 #define OPEN_QUOTIENT 0.6        /* part of each period the folds are open */
-#define TILT          0.5        /* 0..0.95: higher = softer, darker voice  */
+#define VOICE_BRIGHTNESS 2400.0  /* Hz: lower = softer, darker voice        */
 #define BREATHY       0.06       /* breath noise in the voice              */
 #define G_ASP    0.005
 #define G_FRIC   0.02
 
-/* Render a plan into 16-bit samples. Returns a malloc'd buffer. */
-static Sint16 *render(const Plan *pl, int *out_len) {
+/* Render a plan into samples in -1..1. Returns a malloc'd buffer. */
+static float *render(const Plan *pl, int *out_len) {
     int N = pl->n_samples;
     float *y = calloc(N > 0 ? N : 1, sizeof(float));
     Reson r[5], rnp, rgp;
@@ -1238,6 +1332,7 @@ static Sint16 *render(const Plan *pl, int *out_len) {
     unsigned seed = 12345;
     int fi = 0, ei = 0, pi = 0;
     double k = 1.0 - exp(-1.0 / (0.004 * SAMPLE_RATE));     /* 4 ms ramps */
+    double c_asp = onepole(1000), c_soft = onepole(5650), c_tilt = onepole(VOICE_BRIGHTNESS);
     double peak = 1e-9;
 
     for (int s = 0; s < N; s++) {
@@ -1284,7 +1379,7 @@ static Sint16 *render(const Plan *pl, int *out_len) {
 
         seed = seed * 1664525u + 1013904223u;
         double noise = (double)(int)seed / 2147483648.0;
-        lp_noise += 0.25 * (noise - lp_noise);
+        lp_noise += c_asp * (noise - lp_noise);
 
 #if VOICE_MODEL == 0
         /* glottal pulses through a low-pass (the voice's -12 dB/octave) */
@@ -1310,12 +1405,12 @@ static Sint16 *render(const Plan *pl, int *out_len) {
             double xq = phase / OPEN_QUOTIENT;
             flow = 6.75 * xq * xq * (1.0 - xq);           /* peak 1 at 2/3 of the opening */
         }
-        tilt += (1.0 - TILT) * (flow - tilt);              /* softens the closure a little */
+        tilt += c_tilt * (flow - tilt);                     /* softens the closure a little */
         double breath = lp_noise * (phase < OPEN_QUOTIENT ? 1.0 : 0.25) * BREATHY;
         double glot = (tilt + breath) * shimmer * av * G_VOICE;
 #endif
         double asp = lp_noise * ah * G_ASP * 4.0;
-        soft_noise += 0.8 * (noise - soft_noise);                /* takes the fizz off the top (~6 kHz) */
+        soft_noise += c_soft * (noise - soft_noise);             /* takes the fizz off the top (~6 kHz) */
         double fric_noise = soft_noise * 1.3 * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
 
         /* cascade: nasal pole/zero pair, then F5..F1 */
@@ -1335,23 +1430,58 @@ static Sint16 *render(const Plan *pl, int *out_len) {
         if (fabs(out) > peak) peak = fabs(out);
     }
 
-    Sint16 *pcm = malloc((N > 0 ? N : 1) * sizeof(Sint16));
     double g = 0.85 / peak;
     int fade = MS(10);
     for (int s = 0; s < N; s++) {
         double v = y[s] * g;
         if (s < fade) v *= (double)s / fade;
         if (N - s < fade) v *= (double)(N - s) / fade;
-        pcm[s] = (Sint16)(tanh(v * 1.1) / tanh(1.1) * 32000.0);
+        y[s] = (float)(tanh(v * 1.1) / tanh(1.1) * 0.976);
     }
-    free(y);
     *out_len = N;
-    return pcm;
+    return y;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Playback
+ * Library interface (synth.h)
  * ═══════════════════════════════════════════════════════════════════════════ */
+int tts_init_file(const char *cmudict_path) {
+    int r = load_cmudict(cmudict_path);
+    load_hand_dict();
+    return r;
+}
+
+void tts_init_text(const char *cmudict_text, size_t len) {
+    if (cmudict_text) load_cmudict_text(cmudict_text, len);
+    load_hand_dict();
+}
+
+float *tts_render(const char *text, int sample_rate, int *n_samples) {
+    static PItem items[MAX_PHONEMES];
+    Plan pl;
+    syn_rate = sample_rate > 8000 ? sample_rate : 22050;
+    int n = text_to_phonemes(text ? text : "", items, MAX_PHONEMES);
+    make_plan(items, n, &pl);
+    float *out = render(&pl, n_samples);
+    plan_free(&pl);
+    return out;
+}
+
+void tts_free(float *samples) { free(samples); }
+
+void tts_set_verbose(int on) { syn_verbose = on; }
+
+void tts_shutdown(void) { dict_free(); }
+
+
+#ifdef SYNTH_STANDALONE
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Standalone program: playback through SDL2, or a WAV file
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#include <SDL2/SDL.h>
+
+#define PLAY_RATE 22050
+
 typedef struct {
     Sint16 *pcm;
     int     len, pos;
@@ -1361,14 +1491,12 @@ typedef struct {
 static Player     g_player;
 static SDL_mutex *g_mutex;
 
-/* Text → samples (outside the audio lock; it takes a few milliseconds) */
+/* Text → 16-bit samples (outside the audio lock; it takes a few milliseconds) */
 static Sint16 *synth_render(const char *text, int *len) {
-    static PItem items[MAX_PHONEMES];
-    Plan pl;
-    int n = text_to_phonemes(text, items, MAX_PHONEMES);
-    make_plan(items, n, &pl);
-    Sint16 *pcm = render(&pl, len);
-    plan_free(&pl);
+    float *f = tts_render(text, PLAY_RATE, len);
+    Sint16 *pcm = malloc((*len > 0 ? *len : 1) * sizeof(Sint16));
+    for (int i = 0; i < *len; i++) pcm[i] = (Sint16)(f[i] * 32767.0f);
+    tts_free(f);
     return pcm;
 }
 
@@ -1403,7 +1531,7 @@ static int write_wav(const char *path, const Sint16 *pcm, int n) {
     memcpy(h, "RIFF", 4); v = 36 + data; memcpy(h + 4, &v, 4);
     memcpy(h + 8, "WAVEfmt ", 8); v = 16; memcpy(h + 16, &v, 4);
     h[20] = 1; h[21] = 0; h[22] = 1; h[23] = 0;                  /* PCM, mono */
-    v = SAMPLE_RATE; memcpy(h + 24, &v, 4); v = SAMPLE_RATE * 2; memcpy(h + 28, &v, 4);
+    v = PLAY_RATE; memcpy(h + 24, &v, 4); v = PLAY_RATE * 2; memcpy(h + 28, &v, 4);
     h[32] = 2; h[33] = 0; h[34] = 16; h[35] = 0;
     memcpy(h + 36, "data", 4); memcpy(h + 40, &data, 4);
     fwrite(h, 1, 44, f);
@@ -1416,11 +1544,11 @@ static int write_wav(const char *path, const Sint16 *pcm, int n) {
  * Main
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char *argv[]) {
+    tts_set_verbose(1);
     printf("Loading Dictionary\n");
-    load_cmudict("cmudict-0.7b");
-    /* The hand-curated entries (proper nouns like "falken"/"joshua" and
-     * abbreviations like "dr"/"mrs") go in after CMUdict; see load_hand_dict. */
-    load_hand_dict();
+    /* CMUdict, then the hand-curated entries (proper nouns like "falken",
+     * abbreviations like "dr"/"mrs"); see load_hand_dict. */
+    tts_init_file("cmudict-0.7b");
     printf("End Loading Dictionary\n");
 
     if (argc > 3 && strcmp(argv[1], "-o") == 0) {               /* -o out.wav "text" */
@@ -1438,7 +1566,7 @@ int main(int argc, char *argv[]) {
     g_mutex = SDL_CreateMutex();
 
     SDL_AudioSpec want = {0}, got;
-    want.freq     = SAMPLE_RATE;
+    want.freq     = PLAY_RATE;
     want.format   = AUDIO_S16SYS;
     want.channels = 1;
     want.samples  = BUFFER_SIZE;
@@ -1478,3 +1606,4 @@ int main(int argc, char *argv[]) {
     SDL_Quit();
     return 0;
 }
+#endif /* SYNTH_STANDALONE */

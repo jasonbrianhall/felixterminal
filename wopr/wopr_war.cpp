@@ -400,6 +400,8 @@ void wopr_war_update(WoprState *w, double dt) {
         war_log(s, "THE ONLY WINNING MOVE IS NOT TO PLAY.");
         war_log(s, ""); war_log(s, "HOW ABOUT A NICE GAME OF CHESS?");
         war_sound_ending();
+        wopr_say("GREETINGS, PROFESSOR FALKEN.  A STRANGE GAME.  "
+                 "THE ONLY WINNING MOVE IS NOT TO PLAY.  HOW ABOUT A NICE GAME OF CHESS?");
     }
     if (s->phase == 3 && s->phase_t >= 8.0) s->phase = 4;
 }

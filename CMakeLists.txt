@@ -156,6 +156,7 @@ set(SRCS_WOPR
     wopr/wopr_basic/main.cpp wopr/wopr_basic/program.cpp
     wopr/wopr_basic/sound_sdl.cpp wopr/wopr_basic/vars.cpp
     wopr/wopr_willy.cpp wopr/chess_sound.cpp wopr/wopr_sdi.cpp
+    wopr/wopr_speech.cpp
 )
 
 set(SRCS_MINIZ
@@ -172,6 +173,7 @@ set(SRCS_MINIZ
     wopr/zork/np3.c wopr/zork/nrooms.c wopr/zork/objcts.c
     wopr/zork/rooms.c wopr/zork/sobjs.c wopr/zork_modified/supp.c
     wopr/zork/sverbs.c wopr/zork/verbs.c wopr/zork/villns.c
+    wopr/synth/synth.c
 )
 
 add_executable(flt WIN32 ${SRCS_COMMON} ${SRCS_WOPR} ${SRCS_MINIZ})

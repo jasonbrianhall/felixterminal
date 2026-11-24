@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include "wopr_render.h"
+#include "../felix_settings.h"
 #include <ctime>
 
 // ============================================================================
@@ -123,7 +124,7 @@ static std::string to_upper(const std::string &s) {
     return r;
 }
 
-static void push_line(WoprState *w, const std::string &line) {
+static void push_line_quiet(WoprState *w, const std::string &line) {
     // Stamp current terminal color as a \x01 fgR fgG fgB bgR bgG bgB prefix.
     // bg is always 0,0,0 for WOPR UI lines.
     extern uint8_t g_term_r, g_term_g, g_term_b;
@@ -153,7 +154,27 @@ static void push_line(WoprState *w, const std::string &line) {
     // The clamp in wopr_render will prevent overscrolling automatically.
 }
 
+// Every line WOPR prints is spoken with VOICE ALL, except the user's own
+// input echoed back (the WOPR> command line, the typed username/password).
+static bool is_echo(const std::string &line) {
+    std::string t = line;
+    if (!t.empty() && (unsigned char)t[0] == 0x01) t = t.size() > 7 ? t.substr(7) : "";
+    return t.rfind("WOPR> ", 0) == 0 || t.rfind("USERNAME:", 0) == 0 || t.rfind("PASSWORD:", 0) == 0;
+}
+
+static void push_line(WoprState *w, const std::string &line) {
+    push_line_quiet(w, line);
+    if (!is_echo(line)) wopr_say_any(line.c_str());
+}
+
+// A key line: printed, and spoken unless VOICE OFF.
+static void say_line(WoprState *w, const std::string &line) {
+    push_line_quiet(w, line);
+    wopr_say(line.c_str());
+}
+
 static void begin_crawl(WoprState *w, const std::string &text) {
+    if (!is_echo(text)) wopr_say_any(text.c_str());
     w->crawl_target = text;
     w->crawl_pos    = 0;
     w->crawl_acc    = 0.0;
@@ -165,7 +186,7 @@ static bool crawl_done(const WoprState *w) {
 
 static void crawl_commit(WoprState *w) {
     if (!w->crawl_target.empty())
-        push_line(w, w->crawl_target);
+        push_line_quiet(w, w->crawl_target);       // already spoken when the crawl began
     w->crawl_target.clear();
     w->crawl_pos = 0;
     w->crawl_acc = 0.0;
@@ -319,6 +340,9 @@ static void do_command(WoprState *w, const std::string &raw) {
     std::string cmd = normalize(raw);
     if (cmd.empty()) { push_line(w, ""); return; }
 
+    // A new command interrupts the reading of the last one's output
+    if (wopr_voice_mode() == WoprVoice::ALL) wopr_speech_stop();
+
     // Echo with prompt
     push_line(w, std::string("WOPR> ") + cmd);
     push_line(w, "");
@@ -346,6 +370,7 @@ static void do_command(WoprState *w, const std::string &raw) {
         push_line(w, "  HISTORY               COMMAND HISTORY");
         push_line(w, "  CLEAR                 CLEAR TERMINAL BUFFER");
         push_line(w, "  COLOR <preset|R G B>  SET TERMINAL COLOR  (GREEN AMBER BLUE WHITE RED CYAN)");
+        push_line(w, "  VOICE ON|ALL|OFF      SPEAK KEY LINES / EVERYTHING / NOTHING");
         push_line(w, "  LOGOUT / QUIT / EXIT  TERMINATE SESSION");
         push_line(w, "");
         return;
@@ -537,11 +562,39 @@ static void do_command(WoprState *w, const std::string &raw) {
         return;
     }
 
+    // ── VOICE ─────────────────────────────────────────────────────────────
+    if (verb == "VOICE" || verb == "SPEECH") {
+        if (rest == "ON" || rest == "KEY" || rest == "KEY LINES") {
+            wopr_set_voice_mode(WoprVoice::KEY_LINES);
+            settings_save();
+            say_line(w, "  VOICE ON.  KEY LINES WILL BE SPOKEN.");
+        } else if (rest == "ALL") {
+            wopr_set_voice_mode(WoprVoice::ALL);
+            settings_save();
+            push_line(w, "  VOICE ON.  ALL OUTPUT WILL BE SPOKEN.");
+        } else if (rest == "OFF") {
+            wopr_set_voice_mode(WoprVoice::OFF);
+            settings_save();
+            push_line(w, "  VOICE OFF.");
+        } else if (rest.empty()) {
+            WoprVoice m = wopr_voice_mode();
+            push_line(w, m == WoprVoice::OFF ? "  VOICE: OFF"
+                       : m == WoprVoice::ALL ? "  VOICE: ALL OUTPUT" : "  VOICE: KEY LINES");
+            push_line(w, "  USAGE:  VOICE ON | VOICE ALL | VOICE OFF");
+        } else {
+            push_line(w, "  USAGE:  VOICE ON | VOICE ALL | VOICE OFF");
+        }
+        push_line(w, "");
+        return;
+    }
+
     // ── LOGOUT / QUIT / EXIT ──────────────────────────────────────────────
     if (verb == "LOGOUT" || verb == "QUIT" || verb == "EXIT" || verb == "BYE") {
-        begin_crawl(w, "SESSION TERMINATED.  GOODBYE, PROFESSOR FALKEN.");
+        static const char *BYE = "SESSION TERMINATED.  GOODBYE, PROFESSOR FALKEN.";
+        w->crawl_target = BYE;                     // shown for the moment before closing
         SDL_Delay(100);
         wopr_close();
+        wopr_say(BYE);                             // plays on after the overlay closes
         return;
     }
 
@@ -638,6 +691,8 @@ void wopr_open() {
     g_drip_acc       = 0.0;
     g_term_r = 0; g_term_g = 255; g_term_b = 69; // phosphor green
 
+    wopr_speech_stop();
+    wopr_speech_preload();          // unpack the voice's dictionary while the modem screeches
     wopr_audio_play_screech();
 
     // -----------------------------
@@ -703,6 +758,7 @@ void wopr_close() {
         default: break;
     }
     wopr_audio_stop();
+    wopr_speech_stop();
     w->visible = false;
     w->phase   = WoprPhase::INACTIVE;
 }
@@ -816,7 +872,7 @@ void wopr_update(double dt) {
             push_line(w, "  WARGAMES SYSTEMS DIVISION");
             push_line(w, "  CLASSIFIED -- LEVEL 5 CLEARANCE");
             push_line(w, "");
-            push_line(w, "  HELLO, PROFESSOR FALKEN.");
+            say_line(w, "  HELLO, PROFESSOR FALKEN.");
             push_line(w, "  LAST LOGIN: 1983-06-03  03:14:07 MDT");
             enter_shell(w);
         }
@@ -1171,11 +1227,11 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
                         case 3:
                             push_line(w, "IDENTITY CONFIRMATION REQUIRED.");
                             push_line(w, "");
-                            push_line(w, "DR. FALKEN?");
-                            push_line(w, "IS THAT YOU?");
+                            say_line(w, "DR. FALKEN?");
+                            say_line(w, "IS THAT YOU?");
                             break;
                         case 4:
-                            push_line(w, "GREETINGS, PROFESSOR.");
+                            say_line(w, "GREETINGS, PROFESSOR.");
                             push_line(w, "");
                             push_line(w, "SEARCHING FOR PRIMARY USER...");
                             push_line(w, "PRIMARY USER: DR. STEPHEN FALKEN");
@@ -1242,7 +1298,7 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
             static const char *VERBS[] = {
                 "HELP", "LIST GAMES", "PLAY ", "INTELLIGENCE",
                 "WIRE", "SITREP", "STATUS", "WHOAMI", "HISTORY", "CLEAR",
-                "COLOR ", "LOGOUT"
+                "COLOR ", "VOICE ", "LOGOUT"
             };
             std::string up = to_upper(w->input_buf);
             for (auto *v : VERBS) {

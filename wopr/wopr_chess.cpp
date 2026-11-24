@@ -322,6 +322,7 @@ void wopr_chess_update(WoprState *w, double dt) {
                 if (s->num_players == 0) { start_game(s); return; }
                 chess_sound_play(SFX_CHECKMATE);
                 snprintf(s->message, sizeof(s->message), "CHECKMATE.  %s", get_taunt());
+                wopr_say(s->message);
                 s->game_over = true;
             } else if (plr_wins) {
                 if (s->num_players == 0) { start_game(s); return; }
@@ -1109,6 +1110,7 @@ void wopr_chess_mousedown(WoprState *w, int x, int y, int button) {
         y >= s->resign_button_y && y <= s->resign_button_y + s->resign_button_h) {
         chess_sound_play(SFX_RESIGN);
         snprintf(s->message, sizeof(s->message), "YOU RESIGN. %s", get_taunt());
+        wopr_say(s->message);
         s->game_over = true;
         return;
     }
