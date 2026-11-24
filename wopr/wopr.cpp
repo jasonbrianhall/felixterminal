@@ -174,8 +174,8 @@ static void say_line(WoprState *w, const std::string &line) {
     wopr_say(line.c_str());
 }
 
-// ── Reports read aloud ──────────────────────────────────────────────────────
-// INTELLIGENCE, SITREP and WIRE are read as a short spoken summary of what
+// ── Reports read aloud (VOICE ALL) ──────────────────────────────────────────
+// With VOICE ALL, INTELLIGENCE, SITREP and WIRE are read as a short spoken summary of what
 // matters (the event, the unit, where, the story), not line by line: grid
 // references and coordinates stay on the screen, and military shorthand is
 // expanded so it can be said ("14KM NE" -> "14 kilometers northeast").
@@ -526,7 +526,7 @@ static void do_command(WoprState *w, const std::string &raw) {
                 line += *p;
             }
         }
-        wopr_say(spoken(body).c_str());
+        wopr_say_any(spoken(body).c_str());
         push_line(w, "");
         push_line(w, "  END OF REPORT.  DESTROY AFTER READING.");
         push_line(w, "");
@@ -723,7 +723,7 @@ static void do_command(WoprState *w, const std::string &raw) {
                 text += std::string(story[i]) + " ";
             }
         }
-        wopr_say(spoken(text).c_str());
+        wopr_say_any(spoken(text).c_str());
         g_drip_queue.push_back("");
         g_drip_queue.push_back("  -- END TRANSMISSION --");
         g_drip_queue.push_back("");
@@ -768,7 +768,7 @@ static void do_command(WoprState *w, const std::string &raw) {
         // details stay on the screen.
         std::string what = join_lines(r.activity, r.activity2);
         std::string where = std::string(r.location) + ", " + (r.location2 ? r.location2 : "");
-        wopr_say((sentence(spoken(r.size)) + " " + sentence(spoken(what)) + " " +
+        wopr_say_any((sentence(spoken(r.size)) + " " + sentence(spoken(what)) + " " +
                   sentence(spoken(where))).c_str());
 
         push_line_quiet(w, "Equipment:");
