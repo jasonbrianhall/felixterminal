@@ -93,6 +93,36 @@ static inline int SDL2_RenderGeometry(SDL_Renderer *r, SDL_Texture *t, const SDL
 #define SDL_Vertex SDL2_Vertex
 #define SDL_RenderGeometry SDL2_RenderGeometry
 
+/* Clip rects, turned textures and a texture's size, as SDL2 spells them
+   (SDL_oldnames.h points the old names at errors: they're replaced here). */
+#undef SDL_RenderSetClipRect
+#undef SDL_RenderCopyExF
+#undef SDL_QueryTexture
+static inline int SDL2_RenderSetClipRect(SDL_Renderer *r, const SDL_Rect *rect)
+{
+    return SDL_SetRenderClipRect(r, rect) ? 0 : -1;
+}
+static inline int SDL2_RenderCopyExF(SDL_Renderer *r, SDL_Texture *t, const SDL_Rect *src, const SDL_FRect *dst,
+                                     double angle, const SDL_FPoint *center, SDL_FlipMode flip)
+{
+    SDL_FRect s;
+    if (src) { s.x = (float)src->x; s.y = (float)src->y; s.w = (float)src->w; s.h = (float)src->h; }
+    return SDL_RenderTextureRotated(r, t, src ? &s : NULL, dst, angle, center, flip) ? 0 : -1;
+}
+static inline int SDL2_QueryTexture(SDL_Texture *t, Uint32 *format, int *access, int *w, int *h)
+{
+    float fw = 0.f, fh = 0.f;
+    if (!SDL_GetTextureSize(t, &fw, &fh)) return -1;
+    if (format) *format = 0;
+    if (access) *access = 0;
+    if (w) *w = (int)fw;
+    if (h) *h = (int)fh;
+    return 0;
+}
+#define SDL_RenderSetClipRect SDL2_RenderSetClipRect
+#define SDL_RenderCopyExF SDL2_RenderCopyExF
+#define SDL_QueryTexture SDL2_QueryTexture
+
 typedef SDL_Mutex SDL_mutex;
 #define SDL_CreateMutex() ((SDL_Mutex *)0)
 #define SDL_LockMutex(m) ((void)(m))

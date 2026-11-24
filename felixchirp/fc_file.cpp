@@ -315,14 +315,16 @@ void iv_draw_texture_in_view(SDL_Texture *t, float tw, float th, float ccx, floa
     float x0 = std::max(0.f, floorf(minx) - 1.f), y0 = std::max(0.f, floorf(miny) - 1.f);
     float x1 = std::min(tw, ceilf(maxx) + 1.f),  y1 = std::min(th, ceilf(maxy) + 1.f);
     if (x1 <= x0 || y1 <= y0) return;
-    SDL_FRect src = { x0, y0, x1 - x0, y1 - y0 };
-    float lx = x0 + src.w * 0.5f - tw * 0.5f, ly = y0 + src.h * 0.5f - th * 0.5f;
+    // (x0..y1 are whole texels: floor/ceil of them, clamped to the texture's size)
+    SDL_Rect src = { (int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0) };
+    float sw = (float)src.w, sh = (float)src.h;
+    float lx = x0 + sw * 0.5f - tw * 0.5f, ly = y0 + sh * 0.5f - th * 0.5f;
     float scx = ccx + (lx * c - ly * sn) * sc, scy = ccy + (lx * sn + ly * c) * sc;
-    SDL_FRect dst = { scx - src.w * sc * 0.5f, scy - src.h * sc * 0.5f, src.w * sc, src.h * sc };
+    SDL_FRect dst = { scx - sw * sc * 0.5f, scy - sh * sc * 0.5f, sw * sc, sh * sc };
     SDL_Rect clip = { (int)vx, (int)vy, (int)vw, (int)vh };
-    SDL_SetRenderClipRect(g_sdl_renderer, &clip);
-    SDL_RenderTextureRotated(g_sdl_renderer, t, &src, &dst, (double)angle, nullptr, SDL_FLIP_NONE);
-    SDL_SetRenderClipRect(g_sdl_renderer, nullptr);
+    SDL_RenderSetClipRect(g_sdl_renderer, &clip);
+    SDL_RenderCopyExF(g_sdl_renderer, t, &src, &dst, (double)angle, nullptr, SDL_FLIP_NONE);
+    SDL_RenderSetClipRect(g_sdl_renderer, nullptr);
 }
 
 // ---- full detail when zoomed in (pictures made smaller above) -------------
@@ -434,9 +436,9 @@ void iv_detail_draw(float img_cx, float img_cy, float effective, float vx, float
     // rotation), turned as the picture is.
     float lx = s_det_x + s_det_w * 0.5f - s_full_w * 0.5f, ly = s_det_y + s_det_h * 0.5f - s_full_h * 0.5f;
     float scx = img_cx + (lx * c - ly * sn) * fs, scy = img_cy + (lx * sn + ly * c) * fs;
-    float tw = 0, th = 0;
-    SDL_GetTextureSize(s_detail_tex, &tw, &th);
-    iv_draw_texture_in_view(s_detail_tex, tw, th, scx, scy, fs / s_det_scale, g_iv.img_rot, vx, vy, vw, vh);
+    int tw = 0, th = 0;
+    SDL_QueryTexture(s_detail_tex, nullptr, nullptr, &tw, &th);
+    iv_draw_texture_in_view(s_detail_tex, (float)tw, (float)th, scx, scy, fs / s_det_scale, g_iv.img_rot, vx, vy, vw, vh);
 }
 
 void iv_load_image_from_mem(const unsigned char *data, size_t len, const char *label) {
