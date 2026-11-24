@@ -715,6 +715,7 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
     expand_text(text, lower, sizeof lower);
     const char *p = lower;
     char prev_word[MAX_WORD] = "";
+    int sentence_start = 1, wh_question = 0;
 
     n = add_pause(out, n, maxout, 60, 0);
     while (*p && n < maxout - 40) {
@@ -725,7 +726,8 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
                      !(*p == '.' && (strcmp(prev_word, "dr") == 0 || strcmp(prev_word, "mr") == 0 ||
                                      strcmp(prev_word, "mrs") == 0 || strcmp(prev_word, "ms") == 0 ||
                                      strcmp(prev_word, "st") == 0 || strcmp(prev_word, "vs") == 0)))
-                n = add_pause(out, n, maxout, 420, *p == '?' ? '?' : '.');
+                n = add_pause(out, n, maxout, 420, *p == '?' && !wh_question ? '?' : '.');
+            if (strchr(".!?", *p)) sentence_start = 1;
             p++;
             continue;
         }
@@ -736,6 +738,13 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
             word[wl++] = *p++;
         word[wl] = 0;
         strcpy(prev_word, word);
+        if (sentence_start) {          /* "what/where/how...?" questions fall like statements */
+            static const char *wh[] = { "what","what's","where","where's","when","who","who's",
+                                        "whom","whose","why","which","how","how's", NULL };
+            wh_question = 0;
+            for (int k = 0; wh[k]; k++) if (strcmp(word, wh[k]) == 0) wh_question = 1;
+            sentence_start = 0;
+        }
 
         int func = is_function_word(word);
         const char *dict = dict_lookup(word);
@@ -769,7 +778,7 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
             (PHDEF[out[i + 1].ph].cls & CL_VOWEL) && out[i + 1].stress == 0 &&
             !(out[i + 1].flags & F_WORD_START))
             out[i].stress = -3;
-    n = add_pause(out, n, maxout, 300, '.');
+    n = add_pause(out, n, maxout, 300, 0);      /* keeps a '?' or '.' already there */
     if (n > 0 && out[n - 1].ph == PH_SIL && !out[n - 1].punct)
         out[n - 1].punct = '.';
     return n;
@@ -782,7 +791,8 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
 #define RATE        1.0          /* > 1 slower, < 1 faster              */
 #define PITCH_START 122.0        /* Hz at the start of a phrase         */
 #define PITCH_END    98.0        /* ... falling to this at its end      */
-#define PITCH_ACCENT 18.0        /* rise on stressed syllables          */
+#define PITCH_ACCENT 22.0        /* peak of an accented syllable (Hz)   */
+#define PITCH_HAT    10.0        /* how far the voice stays up between  */
 
 static int cls_of(const PItem *it, int n, int i) {
     return (i < 0 || i >= n) ? CL_SIL : PHDEF[it[i].ph].cls;
@@ -795,6 +805,23 @@ static int is_cons(const PItem *it, int n, int i) {
 static int is_front(Phoneme p) {
     return p == PH_IY || p == PH_IH || p == PH_EY || p == PH_EH || p == PH_AE || p == PH_Y;
 }
+
+/* Inherent and minimum durations (ms), after MITalk. Stops: closure +
+ * burst; affricates: closure + frication. */
+static const double DUR[PH_COUNT][2] = {
+    [PH_AA] = {240, 100}, [PH_AE] = {230, 80},  [PH_AH] = {140, 60},  [PH_AO] = {240, 100},
+    [PH_AW] = {260, 100}, [PH_AY] = {250, 150}, [PH_EH] = {150, 70},  [PH_ER] = {180, 80},
+    [PH_EY] = {190, 100}, [PH_IH] = {135, 40},  [PH_IY] = {155, 55},  [PH_OW] = {220, 80},
+    [PH_OY] = {280, 150}, [PH_UH] = {160, 60},  [PH_UW] = {210, 70},
+    [PH_M]  = {70, 60},   [PH_N]  = {60, 50},   [PH_NG] = {95, 60},
+    [PH_B]  = {85, 60},   [PH_D]  = {75, 50},   [PH_G]  = {80, 60},
+    [PH_P]  = {85, 50},   [PH_T]  = {75, 50},   [PH_K]  = {80, 60},
+    [PH_V]  = {60, 40},   [PH_DH] = {50, 30},   [PH_Z]  = {75, 40},   [PH_ZH] = {70, 40},
+    [PH_F]  = {100, 80},  [PH_TH] = {90, 60},   [PH_S]  = {105, 60},  [PH_SH] = {105, 80},
+    [PH_HH] = {80, 20},   [PH_CH] = {110, 70},  [PH_JH] = {90, 60},
+    [PH_L]  = {80, 40},   [PH_R]  = {80, 30},   [PH_W]  = {80, 60},   [PH_Y]  = {80, 40},
+    [PH_SIL] = {0, 0},
+};
 
 /* One point of the formant track */
 typedef struct { int t; double f[3], b[3], fnz; } FAnchor;
@@ -823,6 +850,13 @@ static void target(const PItem *it, int n, int i, int end, double f[3], double b
         b[k] = d->b[k];
     }
     *fnz = (d->cls & CL_NASAL) ? 450.0 : 270.0;
+    if (d->cls & CL_VOWEL) {                               /* nasalized next to m/n/ng: the */
+        if (end && i + 1 < n && (PHDEF[it[i + 1].ph].cls & CL_NASAL)) {   /* soft palate opens early */
+            *fnz = 340; b[0] += 30;
+        } else if (!end && i > 0 && (PHDEF[it[i - 1].ph].cls & CL_NASAL)) {
+            *fnz = 320; b[0] += 20;
+        }
+    }
     if (it[i].ph == PH_AH && it[i].stress == 0) {          /* schwa: central */
         f[0] = 500; f[1] = 1400; f[2] = 2450;
     }
@@ -848,7 +882,7 @@ static double trans_ms(const PItem *it, int n, int i, int nb) {
     if (c & CL_VOWEL) {
         if (cn & (CL_STOP | CL_AFFRIC)) return 45;
         if (cn & CL_FRIC) return it[nb].ph == PH_HH ? 0 : 35;
-        if (cn & CL_NASAL) return 35;
+        if (cn & CL_NASAL) return 20;               /* the mouth shape snaps at a nasal's edge */
         if (cn & CL_APPROX) return 40;
         return 40;
     }
@@ -872,29 +906,77 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
     int *start = calloc(n + 1, sizeof(int)), *dur = calloc(n + 1, sizeof(int));
     memset(pl, 0, sizeof *pl);
 
-    /* ── Durations ── */
-    for (int i = 0; i < n; i++) {
-        const PhonDef *d = &PHDEF[it[i].ph];
-        double ms = d->dur_ms;
-        if (it[i].ph == PH_SIL) ms = it[i].pause_ms;
-        else if (it[i].stress == -3) ms = 28;                 /* flap */
-        else if (d->cls & CL_VOWEL) {
-            if (it[i].stress == 0) ms = fmax(45, ms * 0.55);
-            else if (it[i].stress == 2) ms *= 0.8;
-            if (it[i].flags & F_FUNC) ms = fmax(50, ms * 0.7);
-        } else {
-            if (is_cons(it, n, i - 1) || is_cons(it, n, i + 1)) ms *= 0.8;   /* clusters are quicker */
-            if ((d->cls & CL_STOP) && !(d->cls & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) ms += 25;
-        }
-        dur[i] = (int)(MS(ms) * RATE);
+    /* ── Durations: Klatt's rules from MITalk (Allen, Hunnicutt & Klatt
+     *    1987). Each sound has an inherent and a minimum length; rules
+     *    scale the part above the minimum: dur = min + (inh - min) * pct. ── */
+    int *wfirst = calloc(n + 1, sizeof(int)), *wlast = calloc(n + 1, sizeof(int));
+    int *wvowels = calloc(n + 1, sizeof(int)), *pfinal = calloc(n + 1, sizeof(int));
+    for (int i = 0; i < n; i++) {                       /* word extents */
+        if (it[i].ph == PH_SIL) { wfirst[i] = wlast[i] = i; continue; }
+        int a = i;
+        while (a > 0 && !(it[a].flags & F_WORD_START) && it[a - 1].ph != PH_SIL) a--;
+        int b = i;
+        while (b + 1 < n && !(it[b + 1].flags & F_WORD_START) && it[b + 1].ph != PH_SIL) b++;
+        wfirst[i] = a; wlast[i] = b;
     }
-    /* Phrase-final lengthening: the last syllable before a pause */
     for (int i = 0; i < n; i++) {
+        int v = 0;
+        for (int j = wfirst[i]; j <= wlast[i]; j++) v += is_vowel(it, n, j);
+        wvowels[i] = v;
+    }
+    for (int i = 0; i < n; i++) {                       /* the last syllable before a pause */
         if (it[i].ph != PH_SIL || i == 0) continue;
         int j = i - 1;
-        while (j > 0 && !is_vowel(it, n, j) && it[j].ph != PH_SIL) dur[j] = dur[j] * 6 / 5, j--;
-        if (j > 0 && is_vowel(it, n, j)) dur[j] = dur[j] * 7 / 5;
+        while (j > 0 && !is_vowel(it, n, j) && it[j].ph != PH_SIL) pfinal[j--] = 2;   /* its coda */
+        if (j > 0 && is_vowel(it, n, j)) pfinal[j] = 1;
     }
+    for (int i = 0; i < n; i++) {
+        const PhonDef *d = &PHDEF[it[i].ph];
+        int c = d->cls;
+        double inh = DUR[it[i].ph][0], mn = DUR[it[i].ph][1], pct = 1.0, extra = 0;
+        if (it[i].ph == PH_SIL) { dur[i] = MS(it[i].pause_ms); continue; }
+        if (it[i].stress == -3) { dur[i] = (int)(MS(28) * RATE); continue; }      /* flap */
+        if (c & CL_VOWEL) {
+            int last_v = 1, first_v = 1;
+            for (int j = i + 1; j <= wlast[i]; j++) if (is_vowel(it, n, j)) last_v = 0;
+            for (int j = wfirst[i]; j < i; j++) if (is_vowel(it, n, j)) first_v = 0;
+            int unstressed = it[i].stress == 0 || (it[i].flags & F_FUNC);
+            if (pfinal[i]) pct *= 1.4;                        /* phrase-final lengthening   */
+            else pct *= 0.6;                                  /* everything else is quicker */
+            if (!last_v) pct *= 0.85;                         /* not the word's last syllable */
+            if (wvowels[i] > 1) pct *= 0.8;                   /* in a word of several syllables */
+            if (unstressed) {
+                mn /= 2;
+                pct *= (!first_v && !last_v) ? 0.5 : 0.7;
+            } else if (it[i].stress == 2) pct *= 0.85;
+            /* what follows in the word: longer before voiced sounds ("bead" vs "beat") */
+            if (i + 1 <= wlast[i]) {
+                int cn = cls_of(it, n, i + 1);
+                double f = 1.0;
+                if ((cn & CL_FRIC) && (cn & CL_VOICED)) f = 1.6;
+                else if ((cn & (CL_STOP | CL_AFFRIC)) && (cn & CL_VOICED)) f = 1.2;
+                else if (cn & CL_NASAL) f = 0.85;
+                else if (cn & (CL_STOP | CL_AFFRIC)) f = 0.7;
+                pct *= pfinal[i] ? f : 0.7 + 0.3 * f;
+            }
+            if (is_vowel(it, n, i + 1)) pct *= 1.2;
+            if (is_vowel(it, n, i - 1)) pct *= 0.7;
+            /* after an aspirated p/t/k the breath takes the vowel's start: give it back */
+            int pc = i > 0 ? it[i - 1].ph : PH_SIL;
+            if ((pc == PH_P || pc == PH_T || pc == PH_K) && it[i].stress == 1 && !(it[i].flags & F_FUNC)
+                && !(i > 1 && it[i - 2].ph == PH_S))
+                extra = 25;
+        } else {
+            if (!(it[i].flags & F_WORD_START)) pct *= 0.85;  /* not word-initial */
+            int cb = is_cons(it, n, i - 1), ca = is_cons(it, n, i + 1);
+            if (cb && ca) pct *= 0.5;                         /* in clusters */
+            else if (cb || ca) pct *= 0.7;
+            if (pfinal[i] == 2) pct *= 1.2;
+            if ((c & CL_STOP) && !(c & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) extra = 25;
+        }
+        dur[i] = (int)(MS(mn + (inh - mn) * pct + extra) * RATE);
+    }
+    free(wfirst); free(wlast); free(wvowels); free(pfinal);
     int t = 0;
     for (int i = 0; i < n; i++) { start[i] = t; t += dur[i]; }
     start[n] = t;
@@ -999,37 +1081,70 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
         add_event(pl, t0, t1, av, 0, 0, NULL, 0, 0);
     }
 
-    /* ── Pitch: a falling line over each phrase, a rise on stressed
-     *    syllables of content words, a final fall (or a rise for '?') ── */
-    pl->pa = calloc(4 * n + 4, sizeof(PAnchor));
-    int ps = 0;
+    /* ── Pitch: the "hat" pattern of English. Over each phrase the voice
+     *    drifts down; it steps up on the first important word, stays up,
+     *    and on the last important word (the nucleus) peaks and falls to
+     *    the bottom (a statement), or dips and climbs (a question), or
+     *    falls part way and lifts (a comma: more to come). Only stressed
+     *    syllables of content words carry accents; "the", "of", "is"... don't. ── */
+    pl->pa = calloc(4 * n + 8, sizeof(PAnchor));
+    int ps = 0, phrase_start = 0;
     for (int i = 0; i < n; i++) {
         if (it[i].ph != PH_SIL) continue;
+        if (i == 0) { ps = start[i] + dur[i]; phrase_start = 1; continue; }
         int pe = start[i];
-        int last_v = -1;
-        for (int j = i - 1; j >= 0 && it[j].ph != PH_SIL; j--)
-            if (is_vowel(it, n, j)) { last_v = j; break; }
         double span = pe > ps ? pe - ps : 1;
-        pl->pa[pl->npa++] = (PAnchor){ start[i] + dur[i] / 2, PITCH_START };
-        for (int j = 0; j < i; j++) {
-            if (start[j] < ps || !is_vowel(it, n, j)) continue;
-            double a = start[j], b = start[j] + dur[j];
-            double base_a = PITCH_START + (PITCH_END - PITCH_START) * (a - ps) / span;
-            double base_b = PITCH_START + (PITCH_END - PITCH_START) * (b - ps) / span;
-            int accent = it[j].stress == 1 && !(it[j].flags & F_FUNC);
-            if (j == last_v) {
-                char pu = it[i].punct;
-                double endhz = pu == '?' ? PITCH_START * 1.3 : pu == ',' ? base_b + 8 : PITCH_END * 0.82;
-                pl->pa[pl->npa++] = (PAnchor){ (int)a, base_a + (accent ? 10 : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.3 * dur[j]), base_a + (accent && pu != '?' ? PITCH_ACCENT : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)b, endhz };
-            } else {
-                pl->pa[pl->npa++] = (PAnchor){ (int)a, base_a + (accent ? 6 : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.45 * dur[j]), base_a + (accent ? PITCH_ACCENT : 0) };
-                pl->pa[pl->npa++] = (PAnchor){ (int)b, base_b + (accent ? 8 : 0) };
-            }
+        char pu = it[i].punct ? it[i].punct : '.';
+        int acc[MAX_PHONEMES], m = 0, last_v = -1;
+        for (int j = phrase_start; j < i; j++) {
+            if (!is_vowel(it, n, j)) continue;
+            last_v = j;
+            if (it[j].stress == 1 && !(it[j].flags & F_FUNC)) acc[m++] = j;
         }
+        #define BASE(x) (PITCH_START + (PITCH_END - PITCH_START) * ((x) - ps) / span)
+        double low = PITCH_END * 0.82, high = PITCH_START * 1.35;
+        int first = m ? acc[0] : -1, nuc = m ? acc[m - 1] : -1;
+        for (int j = phrase_start; j < i; j++) {
+            if (!is_vowel(it, n, j)) continue;
+            double a = start[j], b = start[j] + dur[j], dj = dur[j];
+            int is_acc = 0;
+            for (int q = 0; q < m; q++) if (acc[q] == j) is_acc = 1;
+            int after_nuc = nuc >= 0 && j > nuc, before_first = first < 0 || j < first;
+            double hat = before_first ? 0 : PITCH_HAT;
+            if (j == nuc) {
+                if (pu == '?') {
+                    pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat * 0.5 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.4 * dj), BASE(a) - 8 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)b, j == last_v ? high : BASE(b) + 4 };
+                } else {
+                    double fall_to = pu == ',' ? BASE(b) - 4 : (j == last_v ? low : BASE(b) - 10);
+                    pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.35 * dj), BASE(a) + PITCH_ACCENT + 8 };
+                    pl->pa[pl->npa++] = (PAnchor){ (int)b, fall_to };
+                }
+            } else if (after_nuc) {                        /* the tail after the nucleus */
+                double u = (b - start[nuc]) / (double)(pe - start[nuc] > 0 ? pe - start[nuc] : 1);
+                double v = pu == '?' ? BASE(b) + 4 + (high - BASE(b) - 4) * u
+                         : pu == ',' ? BASE(b) - 4 + 12 * u
+                         : BASE(b) - 10 + (low - BASE(b) + 10) * u;
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, v };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, v };
+            } else if (is_acc) {                           /* accents on the way */
+                double peak = BASE(a) + (j == first ? PITCH_ACCENT + 6 : PITCH_ACCENT);
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat * 0.6 };
+                pl->pa[pl->npa++] = (PAnchor){ (int)(a + 0.4 * dj), peak };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, BASE(b) + PITCH_HAT };
+            } else {                                       /* unaccented: on the line or the hat */
+                pl->pa[pl->npa++] = (PAnchor){ (int)a, BASE(a) + hat };
+                pl->pa[pl->npa++] = (PAnchor){ (int)b, BASE(b) + hat };
+            }
+            if (j == last_v && pu == '.' && j != nuc && !after_nuc)
+                pl->pa[pl->npa - 1].hz = low;              /* no accent at all: still end low */
+        }
+        #undef BASE
         ps = start[i] + dur[i];
+        phrase_start = i + 1;
+        pl->pa[pl->npa++] = (PAnchor){ start[i] + dur[i] - 1, PITCH_START };   /* reset during the pause */
     }
     /* anchors were added phrase by phrase; sort by time (insertion sort, nearly sorted) */
     for (int i = 1; i < pl->npa; i++) {
