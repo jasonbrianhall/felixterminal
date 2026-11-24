@@ -133,12 +133,12 @@ static const PhonDef PHDEF[PH_COUNT] = {
 [PH_NG]={"NG",CL_NASAL|CL_VOICED, PL_VEL, 80,{280,2000,2700},{100,150,200},{0,0,0},         52,0,{0,0,0,0,0},0},
 
 /* Stops: formants are the locus; dur is closure + burst. */
-[PH_B] ={"B", CL_STOP|CL_VOICED,  PL_LAB, 65,{200, 900,2150},{60,110,130},{0,0,0},          0, 50,{0,0,0,0,0},57},
-[PH_D] ={"D", CL_STOP|CL_VOICED,  PL_ALV, 55,{200,1700,2650},{60,110,150},{0,0,0},          0, 50,{0,0,40,50,52},0},
-[PH_G] ={"G", CL_STOP|CL_VOICED,  PL_VEL, 65,{200,1600,2400},{60,110,150},{0,0,0},          0, 50,{50,50,0,0,0},0},
-[PH_P] ={"P", CL_STOP,            PL_LAB, 80,{200, 900,2150},{60,110,130},{0,0,0},          0, 58,{0,0,0,0,0},60},
-[PH_T] ={"T", CL_STOP,            PL_ALV, 70,{200,1700,2650},{60,110,150},{0,0,0},          0, 58,{0,0,46,56,60},0},
-[PH_K] ={"K", CL_STOP,            PL_VEL, 80,{200,1600,2400},{60,110,150},{0,0,0},          0, 58,{56,56,0,0,0},0},
+[PH_B] ={"B", CL_STOP|CL_VOICED,  PL_LAB, 65,{200, 900,2150},{200,110,130},{0,0,0},          0, 44,{44,38,0,0,0},34},
+[PH_D] ={"D", CL_STOP|CL_VOICED,  PL_ALV, 55,{200,1700,2650},{200,110,150},{0,0,0},          0, 46,{0,0,40,50,52},0},
+[PH_G] ={"G", CL_STOP|CL_VOICED,  PL_VEL, 65,{200,1600,2400},{200,110,150},{0,0,0},          0, 46,{50,50,0,0,0},0},
+[PH_P] ={"P", CL_STOP,            PL_LAB, 80,{200, 900,2150},{200,110,130},{0,0,0},          0, 50,{46,40,0,0,0},38},
+[PH_T] ={"T", CL_STOP,            PL_ALV, 70,{200,1700,2650},{200,110,150},{0,0,0},          0, 52,{0,0,46,56,60},0},
+[PH_K] ={"K", CL_STOP,            PL_VEL, 80,{200,1600,2400},{200,110,150},{0,0,0},          0, 54,{56,56,0,0,0},0},
 
 [PH_V] ={"V", CL_FRIC|CL_VOICED,  PL_LAB, 65,{220,1100,2080},{60,90,120},{0,0,0},           48,52,{0,0,0,0,0},40},
 [PH_DH]={"DH",CL_FRIC|CL_VOICED,  PL_ALV, 50,{270,1290,2540},{60,80,170},{0,0,0},           50,48,{0,0,0,0,30},36},
@@ -739,6 +739,11 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
 
         int func = is_function_word(word);
         const char *dict = dict_lookup(word);
+        if (strcmp(word, "the") == 0) {              /* "thee" before a vowel: "thee only" */
+            const char *q = p;
+            while (*q && !isalpha((unsigned char)*q) && !strchr(".,;:!?", *q)) q++;
+            if (*q && strchr("aeio", *q)) dict = "DH IY0";
+        }
         if (dict) {
             printf("[DICT]  %-20s → %s\n", word, dict);
             n = add_phones(dict, out, n, maxout, func);
@@ -756,6 +761,14 @@ static int text_to_phonemes(const char *text, PItem *out, int maxout) {
             }
         }
     }
+    /* American flap: t/d between a vowel (or r) and an unstressed vowel in
+     * the same word, as in "water", "better", "greetings" */
+    for (int i = 1; i + 1 < n; i++)
+        if ((out[i].ph == PH_T || out[i].ph == PH_D) && !(out[i].flags & F_WORD_START) &&
+            (PHDEF[out[i - 1].ph].cls & CL_VOWEL || out[i - 1].ph == PH_R) &&
+            (PHDEF[out[i + 1].ph].cls & CL_VOWEL) && out[i + 1].stress == 0 &&
+            !(out[i + 1].flags & F_WORD_START))
+            out[i].stress = -3;
     n = add_pause(out, n, maxout, 300, '.');
     if (n > 0 && out[n - 1].ph == PH_SIL && !out[n - 1].punct)
         out[n - 1].punct = '.';
@@ -864,13 +877,14 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
         const PhonDef *d = &PHDEF[it[i].ph];
         double ms = d->dur_ms;
         if (it[i].ph == PH_SIL) ms = it[i].pause_ms;
+        else if (it[i].stress == -3) ms = 28;                 /* flap */
         else if (d->cls & CL_VOWEL) {
             if (it[i].stress == 0) ms = fmax(45, ms * 0.55);
             else if (it[i].stress == 2) ms *= 0.8;
-            if (it[i].flags & F_FUNC) ms *= 0.7;
+            if (it[i].flags & F_FUNC) ms = fmax(50, ms * 0.7);
         } else {
             if (is_cons(it, n, i - 1) || is_cons(it, n, i + 1)) ms *= 0.8;   /* clusters are quicker */
-            if ((d->cls & CL_STOP) && !(d->cls & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) ms += 35;
+            if ((d->cls & CL_STOP) && !(d->cls & CL_VOICED) && (cls_of(it, n, i + 1) & CL_SIL)) ms += 25;
         }
         dur[i] = (int)(MS(ms) * RATE);
     }
@@ -918,6 +932,11 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
 
         if (c & CL_SIL) { add_event(pl, t0, t1, 0, 0, 0, NULL, 0, 0); vot_left = 0; continue; }
 
+        if (it[i].stress == -3) {                          /* flap: a quick voiced tap, no burst */
+            add_event(pl, t0, t1, 46, 0, 0, NULL, 0, 0);
+            vot_left = 0;
+            continue;
+        }
         if (c & CL_STOP) {
             int burst = MS((c & CL_VOICED) ? 8 : 12);
             double voicebar = ((c & CL_VOICED) && cls_of(it, n, i - 1) != CL_SIL) ? 42 : 0;
@@ -931,25 +950,25 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
             double af = d->af, ab = d->ab;
             int asp = 0;
             if (cls_of(it, n, i + 1) & CL_SIL) {        /* before a pause: released, a little breath */
-                if (!(c & CL_VOICED)) asp = MS(35);
+                if (!(c & CL_VOICED)) asp = MS(25);
             } else if (!is_vowel(it, n, i + 1) && !(cls_of(it, n, i + 1) & CL_APPROX))
                 af -= 8;                                /* inside a cluster: a weak release */
-            add_event(pl, t0, t1 - burst - asp, voicebar, 0, 0, NULL, 0, 1);
+            add_event(pl, t0, t1 - burst - asp, voicebar, 0, 0, NULL, 0, 0);   /* voicing fades out, no click */
             add_event(pl, t1 - burst - asp, t1 - asp, voicebar, 0, af, a, ab, 1);
-            if (asp) add_event(pl, t1 - asp, t1, 0, 50, 0, NULL, 0, 1);
+            if (asp) add_event(pl, t1 - asp, t1, 0, 44, 0, NULL, 0, 1);
             vot_left = 0;
             if (!(c & CL_VOICED) && (is_vowel(it, n, i + 1) || (cls_of(it, n, i + 1) & CL_APPROX))
                 && !(i > 0 && it[i - 1].ph == PH_S)) {
-                int stressed = is_vowel(it, n, i + 1) ? it[i + 1].stress == 1 : 1;
-                vot_left = MS(stressed && !(it[i + 1].flags & F_FUNC) ? 55 : 30);
-                vot_db = 56;
+                int stressed = is_vowel(it, n, i + 1) && it[i + 1].stress == 1 && !(it[i + 1].flags & F_FUNC);
+                vot_left = MS(stressed ? 45 : 25);      /* p/t/k + l/r/w/y ("play"): short */
+                vot_db = stressed ? 50 : 46;
             }
             continue;
         }
         if (c & CL_AFFRIC) {
             int clos = dur[i] * 45 / 100;
             double voicebar = (c & CL_VOICED) && cls_of(it, n, i - 1) != CL_SIL ? 42 : 0;
-            add_event(pl, t0, t0 + clos, voicebar, 0, 0, NULL, 0, 1);
+            add_event(pl, t0, t0 + clos, voicebar, 0, 0, NULL, 0, 0);
             add_event(pl, t0 + clos, t1, (c & CL_VOICED) ? d->av : 0, 0, d->af, d->a, d->ab, 1);
             vot_left = 0;
             continue;
@@ -971,6 +990,11 @@ static void make_plan(const PItem *it, int n, Plan *pl) {
             add_event(pl, t0, te, 0, vot_db, 0, NULL, 0, 1);
             vot_left -= te - t0;
             t0 = te;
+        }
+        if ((c & CL_VOWEL) && (it[i].flags & F_WORD_START) && is_vowel(it, n, i - 1)) {
+            int g = MS(35) < dur[i] / 2 ? MS(35) : dur[i] / 2;    /* a brief catch in the voice */
+            add_event(pl, t0, t0 + g, av - 20, 0, 0, NULL, 0, 0);
+            t0 += g;
         }
         add_event(pl, t0, t1, av, 0, 0, NULL, 0, 0);
     }
@@ -1085,7 +1109,7 @@ static Sint16 *render(const Plan *pl, int *out_len) {
     bpf_set(&p[3], 3850, 400);
     bpf_set(&p[4], 5300, 1200);
 
-    double phase = 0, lp_noise = 0, prev_c = 0;
+    double phase = 0, lp_noise = 0, soft_noise = 0, prev_c = 0;
     double av = 0, ah = 0, af = 0, ab = 0, a[5] = { 0 };
     unsigned seed = 12345;
     int fi = 0, ei = 0, pi = 0;
@@ -1093,8 +1117,8 @@ static Sint16 *render(const Plan *pl, int *out_len) {
     double peak = 1e-9;
 
     for (int s = 0; s < N; s++) {
-        /* formants: every 32 samples */
-        if ((s & 31) == 0) {
+        /* formants: every 4 samples */
+        if ((s & 3) == 0) {                       /* small steps: no clicks from sudden filter changes */
             while (fi + 1 < pl->nfa && pl->fa[fi + 1].t <= s) fi++;
             const FAnchor *A = &pl->fa[fi], *B = &pl->fa[fi + 1 < pl->nfa ? fi + 1 : fi];
             double u = (B->t > A->t && s > A->t) ? (double)(s - A->t) / (B->t - A->t) : 0;
@@ -1144,7 +1168,8 @@ static Sint16 *render(const Plan *pl, int *out_len) {
         double noise = (double)(int)seed / 2147483648.0;
         lp_noise += 0.25 * (noise - lp_noise);
         double asp = lp_noise * ah * G_ASP * 4.0;
-        double fric_noise = noise * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
+        soft_noise += 0.8 * (noise - soft_noise);                /* takes the fizz off the top (~6 kHz) */
+        double fric_noise = soft_noise * 1.3 * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
 
         /* cascade: nasal pole/zero pair, then F5..F1 */
         double x = glot + asp;
