@@ -1087,7 +1087,15 @@ static inline double bpf(Bpf *f, double x) {
 static inline double db_amp(double db) { return db <= 0 ? 0.0 : pow(10.0, (db - 60.0) / 20.0); }
 
 /* Relative levels of the three sources */
-#define G_VOICE  1.0
+#ifndef VOICE_MODEL
+#define VOICE_MODEL 1            /* 0: filtered pulses, 1: KLGLOTT88 vocal folds */
+#endif
+#ifndef G_VOICE
+#define G_VOICE  0.25
+#endif
+#define OPEN_QUOTIENT 0.6        /* part of each period the folds are open */
+#define TILT          0.5        /* 0..0.95: higher = softer, darker voice  */
+#define BREATHY       0.06       /* breath noise in the voice              */
 #define G_ASP    0.005
 #define G_FRIC   0.02
 
@@ -1110,6 +1118,7 @@ static Sint16 *render(const Plan *pl, int *out_len) {
     bpf_set(&p[4], 5300, 1200);
 
     double phase = 0, lp_noise = 0, soft_noise = 0, prev_c = 0;
+    double jitter = 1.0, shimmer = 1.0, tilt = 0;
     double av = 0, ah = 0, af = 0, ab = 0, a[5] = { 0 };
     unsigned seed = 12345;
     int fi = 0, ei = 0, pi = 0;
@@ -1158,15 +1167,38 @@ static Sint16 *render(const Plan *pl, int *out_len) {
         double tsec = (double)s / SAMPLE_RATE;
         f0 *= 1.0 + 0.006 * sin(2 * M_PI * 4.7 * tsec) + 0.004 * sin(2 * M_PI * 7.3 * tsec);
 
+        seed = seed * 1664525u + 1013904223u;
+        double noise = (double)(int)seed / 2147483648.0;
+        lp_noise += 0.25 * (noise - lp_noise);
+
+#if VOICE_MODEL == 0
         /* glottal pulses through a low-pass (the voice's -12 dB/octave) */
         double imp = 0;
         phase += f0 / SAMPLE_RATE;
         if (phase >= 1.0) { phase -= 1.0; imp = 1.0; }
         double glot = anti(&rgz, reson(&rgp, imp * 60.0)) * av * G_VOICE;
-
-        seed = seed * 1664525u + 1013904223u;
-        double noise = (double)(int)seed / 2147483648.0;
-        lp_noise += 0.25 * (noise - lp_noise);
+#else
+        /* The vocal folds (KLGLOTT88): each period the airflow rises and
+         * falls smoothly while the folds are open, then stops sharply as
+         * they snap shut. Real voices also wobble a little from one period
+         * to the next (jitter, shimmer) and leak a little breath. */
+        phase += f0 * jitter / SAMPLE_RATE;
+        if (phase >= 1.0) {
+            phase -= 1.0;
+            seed = seed * 1664525u + 1013904223u;
+            jitter = 1.0 + 0.012 * ((double)(int)seed / 2147483648.0);
+            seed = seed * 1664525u + 1013904223u;
+            shimmer = 1.0 + 0.06 * ((double)(int)seed / 2147483648.0);
+        }
+        double flow = 0;
+        if (phase < OPEN_QUOTIENT) {
+            double xq = phase / OPEN_QUOTIENT;
+            flow = 6.75 * xq * xq * (1.0 - xq);           /* peak 1 at 2/3 of the opening */
+        }
+        tilt += (1.0 - TILT) * (flow - tilt);              /* softens the closure a little */
+        double breath = lp_noise * (phase < OPEN_QUOTIENT ? 1.0 : 0.25) * BREATHY;
+        double glot = (tilt + breath) * shimmer * av * G_VOICE;
+#endif
         double asp = lp_noise * ah * G_ASP * 4.0;
         soft_noise += 0.8 * (noise - soft_noise);                /* takes the fizz off the top (~6 kHz) */
         double fric_noise = soft_noise * 1.3 * (av > 0.01 && phase > 0.5 ? 0.6 : 1.0);   /* voiced fricatives buzz */
