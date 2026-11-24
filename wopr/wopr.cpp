@@ -255,41 +255,41 @@ static void launch_game(WoprState *w, WoprGame game) {
     push_line(w, "");
     switch (game) {
         case WoprGame::TIC_TAC_TOE:
-            push_line(w, "INITIATING: TIC-TAC-TOE");
+            say_line(w, "INITIATING: TIC-TAC-TOE");
             set_phase(w, WoprPhase::PLAYING_TTT);
             wopr_ttt_enter(w);
             break;
         case WoprGame::CHESS:
-            push_line(w, "INITIATING: CHESS");
+            say_line(w, "INITIATING: CHESS");
             set_phase(w, WoprPhase::PLAYING_CHESS);
             wopr_chess_enter(w);
             break;
         case WoprGame::CHECKERS:
-            push_line(w, "INITIATING: CHECKERS");
+            say_line(w, "INITIATING: CHECKERS");
             set_phase(w, WoprPhase::PLAYING_CHECKERS);
             wopr_checkers_enter(w);
             break;
         case WoprGame::MINESWEEPER:
-            push_line(w, "INITIATING: MINESWEEPER");
+            say_line(w, "INITIATING: MINESWEEPER");
             set_phase(w, WoprPhase::PLAYING_MINES);
             wopr_mines_enter(w);
             break;
         case WoprGame::FALKEN_MAZE:
-            push_line(w, "INITIATING: FALKEN'S MAZE");
+            say_line(w, "INITIATING: FALKEN'S MAZE");
             set_phase(w, WoprPhase::PLAYING_MAZE);
             wopr_maze_enter(w);
             break;
         case WoprGame::GLOBAL_WAR:
-            push_line(w, "INITIATING: GLOBAL THERMONUCLEAR WAR");
+            say_line(w, "INITIATING: GLOBAL THERMONUCLEAR WAR");
             push_line(w, "");
-            push_line(w, "  WARNING: THIS SIMULATION USES LIVE TARGETING DATA.");
-            push_line(w, "  ESTIMATED CASUALTIES: 4.2 BILLION.");
+            say_line(w, "  WARNING: THIS SIMULATION USES LIVE TARGETING DATA.");
+            say_line(w, "  ESTIMATED CASUALTIES: 4.2 BILLION.");
             push_line(w, "");
             set_phase(w, WoprPhase::PLAYING_WAR);
             wopr_war_enter(w);
             break;
         case WoprGame::ZORK:
-            push_line(w, "INITIATING: ZORK");
+            say_line(w, "INITIATING: ZORK");
             push_line(w, "");
             push_line(w, "  LOADING GREAT UNDERGROUND EMPIRE...");
             push_line(w, "");
@@ -297,7 +297,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_zork_enter(w);
             break;
         case WoprGame::BASIC:
-            push_line(w, "INITIATING: BASIC");
+            say_line(w, "INITIATING: BASIC");
             push_line(w, "");
             push_line(w, "  LOADING ANTIQUATED PROGRAMMING LANGUAGE...");
             push_line(w, "");
@@ -305,7 +305,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_basic_enter(w);
             break;
         case WoprGame::WIZARD:
-            push_line(w, "INITIATING: WIZARD'S CASTLE");
+            say_line(w, "INITIATING: WIZARD'S CASTLE");
             push_line(w, "");
             push_line(w, "  LOADING ADVENTURE SIMULATION...");
             push_line(w, "");
@@ -313,7 +313,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             wopr_wizard_enter(w);
             break;
         case WoprGame::WILLY_WORM:
-            push_line(w, "INITIATING: WILLY THE WORM");
+            say_line(w, "INITIATING: WILLY THE WORM");
             push_line(w, "");
             push_line(w, "  LOADING INVERTEBRATE SIMULATION...");
             push_line(w, "");
@@ -322,7 +322,7 @@ static void launch_game(WoprState *w, WoprGame game) {
             break;
 
         case WoprGame::SDI:
-            push_line(w, "INITIATING: STRATEGIC DEFENSE INITIATIVE");
+            say_line(w, "INITIATING: STRATEGIC DEFENSE INITIATIVE");
             push_line(w, "");
             push_line(w, "  MISSILE DEFENSE NETWORK ONLINE...");
             push_line(w, "  RADAR SYSTEMS ACTIVATED");
@@ -872,8 +872,10 @@ void wopr_update(double dt) {
             push_line(w, "  WARGAMES SYSTEMS DIVISION");
             push_line(w, "  CLASSIFIED -- LEVEL 5 CLEARANCE");
             push_line(w, "");
-            say_line(w, "  HELLO, PROFESSOR FALKEN.");
+            say_line(w, "  GREETINGS, PROFESSOR FALKEN.");
             push_line(w, "  LAST LOGIN: 1983-06-03  03:14:07 MDT");
+            push_line(w, "");
+            say_line(w, "  SHALL WE PLAY A GAME?");
             enter_shell(w);
         }
         break;
@@ -1194,6 +1196,14 @@ bool wopr_keydown(SDL_Keycode sym, const char *text) {
 
     // Login input
     if (w->phase == WoprPhase::LOGIN_INPUT) {
+        // Typing takes over from auto-login: the user logs in by hand from
+        // here on (and can get it wrong, which Joshua has things to say about).
+        if (w->auto_login) {
+            bool typed = (text && text[0] >= 32 && text[0] < 127) || sym == SDLK_BACKSPACE;
+            if (!typed) return true;               // Enter etc. mid-auto-type: ignore
+            w->auto_login = false;
+            w->input_buf.clear();
+        }
         if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) {
             if (!w->username_done) {
                 w->username_entered = to_upper(w->input_buf);

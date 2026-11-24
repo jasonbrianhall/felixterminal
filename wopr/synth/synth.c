@@ -451,6 +451,7 @@ static const DictEntry DICT[] = {
     {"codeword", "K OW1 D W ER2 D"},
     {"uplink",   "AH1 P L IH2 NG K"},
     {"falken",   "F AO1 L K AH0 N"},
+    {"falken's", "F AO1 L K AH0 N Z"},
     {NULL,      NULL}
 };
 
